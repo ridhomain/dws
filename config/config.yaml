@@ -1,0 +1,39 @@
+# Server Configuration
+server:
+  http_port: 8080
+  grpc_port: 50051 # Corresponds to GRPC_PORT ENV
+
+# NATS Configuration
+nats:
+  url: "nats://nats:4222" # Corresponds to NATS_URL ENV
+  stream_name: "wa_stream"
+  consumer_name: "ws_fanout"
+
+# Redis Configuration
+redis:
+  address: "redis:6379" # Corresponds to REDIS_ADDR ENV
+  # password: "" # If needed
+  # db: 0       # If needed
+
+# Logging Configuration
+log:
+  level: "info" # Corresponds to LOG_LEVEL ENV
+
+# Authentication Configuration
+auth:
+  # secret_token: "your_shared_api_key_here" # Corresponds to SECRET_TOKEN ENV - Prefer ENV for secrets
+  # token_aes_key: "your_32_byte_aes_gcm_key_hex_encoded_here" # Corresponds to TOKEN_AES_KEY ENV - Prefer ENV for secrets
+  token_cache_ttl_seconds: 30
+
+# Application Specific
+app:
+  service_name: "daisi-ws-service"
+  ping_interval_seconds: 20
+  max_missed_pongs: 2
+  session_ttl_seconds: 30
+  route_ttl_seconds: 30
+  ttl_refresh_interval_seconds: 10
+  nats_max_ack_pending: 5000
+  session_lock_retry_delay_ms: 250 # Delay in milliseconds for session lock retry
+
+# Config holds all configuration for the application. 

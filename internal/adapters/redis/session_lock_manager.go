@@ -1,0 +1,97 @@
+package redis
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+
+// SessionLockManagerAdapter implements the domain.SessionLockManager interface using Redis.
+// It requires a redis.Client to interact with the Redis server.
+type SessionLockManagerAdapter struct {
+	redisClient *redis.Client
+	logger      domain.Logger // For logging adapter-specific events
+}
+
+// NewSessionLockManagerAdapter creates a new instance of SessionLockManagerAdapter.
+func NewSessionLockManagerAdapter(redisClient *redis.Client, logger domain.Logger) *SessionLockManagerAdapter {
+	if redisClient == nil {
+		// This should ideally not happen if DI is set up correctly, but as a safeguard:
+		logger.Error(context.Background(), "Redis client is nil in NewSessionLockManagerAdapter", "error", "nil_redis_client")
+		// Depending on desired strictness, could panic or return an error
+	}
+	return &SessionLockManagerAdapter{
+		redisClient: redisClient,
+		logger:      logger,
+	}
+}
+
+// AcquireLock attempts to acquire a lock (SETNX behavior) for the given key with a specific value and TTL.
+func (a *SessionLockManagerAdapter) AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	acquired, err := a.redisClient.SetNX(ctx, key, value, ttl).Result()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SETNX failed", "key", key, "error", err.Error())
+		return false, fmt.Errorf("redis SETNX for key '%s' failed: %w", key, err)
+	}
+	a.logger.Info(ctx, "Redis SETNX result", "key", key, "value", value, "ttl", ttl, "acquired", acquired)
+	return acquired, nil
+}
+
+// ReleaseLock attempts to release a lock for the given key, only if the value matches.
+// This uses a Lua script to ensure atomicity of the GET and DEL operations.
+func (a *SessionLockManagerAdapter) ReleaseLock(ctx context.Context, key string, value string) (bool, error) {
+	script := `
+		if redis.call("get", KEYS[1]) == ARGV[1] then
+			return redis.call("del", KEYS[1])
+		else
+			return 0
+		end
+	`
+	result, err := a.redisClient.Eval(ctx, script, []string{key}, value).Int64()
+	if err != nil && !errors.Is(err, redis.Nil) { // redis.Nil is not an error if key simply doesn't exist
+		a.logger.Error(ctx, "Redis EVAL (ReleaseLock script) failed", "key", key, "value", value, "error", err.Error())
+		return false, fmt.Errorf("redis EVAL for ReleaseLock on key '%s' failed: %w", key, err)
+	}
+
+	released := result == 1
+	a.logger.Info(ctx, "Redis ReleaseLock result", "key", key, "value", value, "released_by_script", released, "script_result_val", result)
+	return released, nil
+}
+
+// RefreshLock attempts to extend the TTL of an existing lock, only if the value matches.
+// This uses a Lua script to ensure atomicity.
+func (a *SessionLockManagerAdapter) RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	script := `
+		if redis.call("get", KEYS[1]) == ARGV[1] then
+			return redis.call("expire", KEYS[1], ARGV[2])
+		else
+			return 0
+		end
+	`
+	ttlSeconds := int64(ttl.Seconds())
+	result, err := a.redisClient.Eval(ctx, script, []string{key}, value, ttlSeconds).Int64()
+
+	if err != nil && !errors.Is(err, redis.Nil) { // redis.Nil is not an error if key simply doesn't exist
+		a.logger.Error(ctx, "Redis EVAL (RefreshLock script) failed", "key", key, "value", value, "error", err.Error())
+		return false, fmt.Errorf("redis EVAL for RefreshLock on key '%s' failed: %w", key, err)
+	}
+
+	refreshed := result == 1
+	a.logger.Info(ctx, "Redis RefreshLock result", "key", key, "value", value, "ttl_seconds", ttlSeconds, "refreshed_by_script", refreshed, "script_result_val", result)
+	return refreshed, nil
+}
+
+// ForceAcquireLock forcefully sets the lock for the given key with a specific value and TTL (SET behavior).
+func (a *SessionLockManagerAdapter) ForceAcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	_, err := a.redisClient.Set(ctx, key, value, ttl).Result()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SET failed for ForceAcquireLock", "key", key, "error", err.Error())
+		return false, fmt.Errorf("redis SET for key '%s' in ForceAcquireLock failed: %w", key, err)
+	}
+	a.logger.Info(ctx, "Redis SET successful for ForceAcquireLock", "key", key, "value", value, "ttl", ttl)
+	return true, nil
+}
