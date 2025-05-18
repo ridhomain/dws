@@ -64,7 +64,7 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Warn(appCtx, "ConnectionManager is nil, background services (KillSwitch, SessionRenewal) not started.")
 	}
 
-	a.wsRouter.RegisterRoutes(a.httpServeMux)
+	a.wsRouter.RegisterRoutes(appCtx, a.httpServeMux)
 	a.logger.Info(appCtx, "WebSocket routes registered")
 
 	stopChan := make(chan os.Signal, 1)

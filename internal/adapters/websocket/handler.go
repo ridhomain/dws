@@ -272,28 +272,38 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 			switch baseMsg.Type {
 			case MessageTypeSelectChat:
-				var selectChatPayload SelectChatMessagePayload
-				if err := json.Unmarshal(p, &selectChatPayload); err != nil {
-					h.logger.Error(connCtx, "Failed to unmarshal select_chat payload", "error", err)
-					errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", err.Error())
-					if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
-						h.logger.Error(connCtx, "Failed to send error message to client for select_chat", "error", sendErr.Error())
-					}
-					continue
-				}
-				h.logger.Info(connCtx, "Client selected chat", "chat_id", selectChatPayload.ChatID, "company", companyID, "agent", agentID, "user", userID)
-				// TODO (FR-5): Implement dynamic route registration logic with ConnectionManager/RouteRegistry
-				// e.g., h.connManager.UpdateChatSubscription(ctx, sessionKey, companyID, agentID, userID, selectChatPayload.ChatID)
+				h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID)
 			default:
-				h.logger.Warn(connCtx, "Received unhandled message type from client", "type", baseMsg.Type)
-				errResp := domain.NewErrorResponse(domain.ErrBadRequest, "Unhandled message type", "Type: "+baseMsg.Type)
-				if sendErr := conn.WriteJSON(NewErrorMessage(errResp)); sendErr != nil {
-					h.logger.Error(connCtx, "Failed to send error message to client for unhandled type", "error", sendErr.Error())
-				}
+				h.handleUnknownMessage(connCtx, conn, baseMsg)
 			}
 		} else if msgType == websocket.MessageBinary {
 			h.logger.Info(connCtx, "Received binary message, currently unhandled.")
 			// Handle binary messages if necessary for your protocol
 		}
+	}
+}
+
+// handleSelectChatMessage processes incoming messages of type MessageTypeSelectChat.
+func (h *Handler) handleSelectChatMessage(connCtx context.Context, conn *Connection, rawPayload []byte, companyID, agentID, userID string) {
+	var selectChatPayload SelectChatMessagePayload
+	if err := json.Unmarshal(rawPayload, &selectChatPayload); err != nil {
+		h.logger.Error(connCtx, "Failed to unmarshal select_chat payload", "error", err)
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", err.Error())
+		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
+			h.logger.Error(connCtx, "Failed to send error message to client for select_chat", "error", sendErr.Error())
+		}
+		return // Return from handler, manageConnection loop will continue
+	}
+	h.logger.Info(connCtx, "Client selected chat", "chat_id", selectChatPayload.ChatID, "company", companyID, "agent", agentID, "user", userID)
+	// TODO (FR-5): Implement dynamic route registration logic with ConnectionManager/RouteRegistry
+	// e.g., h.connManager.UpdateChatSubscription(ctx, sessionKey, companyID, agentID, userID, selectChatPayload.ChatID)
+}
+
+// handleUnknownMessage processes incoming messages of an unknown type.
+func (h *Handler) handleUnknownMessage(connCtx context.Context, conn *Connection, baseMsg BaseMessage) {
+	h.logger.Warn(connCtx, "Received unhandled message type from client", "type", baseMsg.Type)
+	errResp := domain.NewErrorResponse(domain.ErrBadRequest, "Unhandled message type", "Type: "+baseMsg.Type)
+	if sendErr := conn.WriteJSON(NewErrorMessage(errResp)); sendErr != nil {
+		h.logger.Error(connCtx, "Failed to send error message to client for unhandled type", "error", sendErr.Error())
 	}
 }

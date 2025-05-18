@@ -1,7 +1,9 @@
 package websocket
 
 import (
+	"context"
 	"net/http"
+
 	// "strings" // Not strictly needed if using r.PathValue directly in handler
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -29,7 +31,7 @@ func NewRouter(logger domain.Logger, cfgProvider config.Provider, wsHandler http
 
 // RegisterRoutes sets up the WebSocket endpoint with the necessary middleware.
 // It registers the handler for paths matching GET /ws/{company}/{agent}.
-func (r *Router) RegisterRoutes(mux *http.ServeMux) {
+func (r *Router) RegisterRoutes(ctx context.Context, mux *http.ServeMux) {
 	// Chain of middleware: APIKeyAuth -> (future CompanyTokenAuth) -> wsHandler
 	// For now, only APIKeyAuth is applied.
 	authedHandler := middleware.APIKeyAuthMiddleware(r.configProvider, r.logger)(r.wsHandler)
@@ -40,6 +42,6 @@ func (r *Router) RegisterRoutes(mux *http.ServeMux) {
 	// within the final handler (wsHandler) or an intermediate middleware if needed.
 	mux.Handle("GET /ws/{company}/{agent}", authedHandler)
 
-	// Using nil context for general info log not tied to a specific request.
-	r.logger.Info(nil, "WebSocket endpoint registered", "pattern", "GET /ws/{company}/{agent}")
+	// Using context.Background() for general info log not tied to a specific request.
+	r.logger.Info(ctx, "WebSocket endpoint registered", "pattern", "GET /ws/{company}/{agent}")
 }
