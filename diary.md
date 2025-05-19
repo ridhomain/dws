@@ -264,7 +264,6 @@ All subtasks for Task 2 are now complete:
 - Added a new configuration field `SessionLockRetryDelayMs` to `AppConfig` in `internal/adapters/config/config.go`.
 - Added a default value for `session_lock_retry_delay_ms` (250ms) in `config/config.yaml`.
 - Updated the `AcquireSessionLockOrNotify` method in `internal/application/connection_manager.go` to use this configurable delay, with a fallback to the default if the configuration is missing or invalid.
-- This change allows for more flexible tuning of the session lock retry behavior without code changes.
 
 ## Task 5.5: Session Lock Renewal and Cleanup - COMPLETED - 2025-05-18 23:30:56 (GMT+7)
 
@@ -666,3 +665,45 @@ All subtasks for Task 7 are complete. The service now dynamically manages route 
 All subtasks for Task 12 are complete. The service now supports an admin WebSocket endpoint for streaming agent table events with proper authentication and session management.
 
 **Next Steps:** Determine the next task based on Task Master.
+
+## Session - 2025-05-20 00:20:59 (GMT+7)
+
+**Implemented Readiness Checks:**
+- Updated `internal/bootstrap/app.go` to perform actual readiness checks for NATS and Redis connections in the `/ready` endpoint.
+- Modified `internal/bootstrap/providers.go` by adding `natsConn` and `redisClient` to the `App` struct and `NewApp` function.
+- Added `NatsConnectionProvider` to `providers.go` and updated `ProviderSet`.
+- Ran `go generate ./...` to update `wire_gen.go`.
+- Ensured necessary imports in `internal/bootstrap/app.go`.
+
+**Hardened HTTP Server Timeouts:**
+- Added `ReadTimeoutSeconds` and `IdleTimeoutSeconds` to `AppConfig` in `internal/adapters/config/config.go`.
+- Updated `config/config.yaml` with default values for these new settings.
+- Modified `HTTPGracefulServerProvider` in `internal/bootstrap/providers.go` to use these new configuration values from `AppConfig`.
+
+**NATS Subscription Logic for WebSocket Handler:**
+- Updated `internal/adapters/websocket/handler.go`:
+  - Implemented initial subscription to the general `wa.<CompanyID>.<AgentID>.chats` NATS topic in `manageConnection`.
+  - Added a new NATS message handler (`generalChatEventsNatsHandler`) for these general chat events.
+  - Refactored `handleSelectChatMessage` and `manageConnection` to handle transitions from the general NATS subscription to a specific `wa.<CompanyID>.<AgentID>.messages.<ChatID>` subscription when a `MessageTypeSelectChat` is received from the client.
+  - Ensured that previous NATS subscriptions (either general or a previous specific one) are drained when switching.
+  - Corrected an issue with `pongWaitDuration` definition scope in `manageConnection`.
+
+**Implemented Redis Token Cache Adapter:**
+- Created `internal/adapters/redis/token_cache_adapter.go` with `NewTokenCacheAdapter` and methods to satisfy `domain.TokenCacheStore` for company user tokens.
+- Updated `TokenCacheStoreProvider` in `internal/bootstrap/providers.go` to use the new `TokenCacheAdapter`.
+
+**Admin Token Generation and Scoping:**
+- Added `GenerateAdminTokenHandler` and associated request/response structs to `internal/adapters/http/admin_handlers.go` to create admin tokens with `SubscribedCompanyID` and `SubscribedAgentID` scopes.
+- Added `GenerateAdminTokenHandlerProvider` to `internal/bootstrap/providers.go` and included it in `ProviderSet`.
+- Updated `App` struct and `NewApp` in `providers.go` to accept distinct handler types (`CompanyUserTokenGenerateHandler`, `AdminUserTokenGenerateHandler`) to resolve Wire ambiguity.
+- Ran `go generate ./...` to update `wire_gen.go`.
+- Registered the `POST /admin/generate-token` endpoint in `internal/bootstrap/app.go`, protected by `TokenGenerationMiddleware`.
+
+**Implemented gRPC Client Connection Pooling:**
+- Added `grpcClientPool (*sync.Map)` to the `Handler` struct in `internal/adapters/websocket/handler.go`.
+- Initialized the pool in `NewHandler`.
+- Implemented pooling logic in `specificChatNatsMessageHandler`: 
+    - Reuse existing connections from the pool.
+    - Create new connections if not found or if a pooled connection fails, and add them to the pool.
+    - Removed `defer grpcConn.Close()` for pooled connections to allow reuse.
+    - If a pooled connection errors during `PushEvent`, it's removed from the pool and closed.

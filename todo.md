@@ -6,12 +6,11 @@
 - Add cleanup for other resources (NATS, Redis, gRPC server) during graceful shutdown.
 
 ## `internal/adapters/websocket/handler.go`
-- TODO: (From code comment) Later, the `AuthenticatedUserContext` from `CompanyTokenAuthMiddleware` should be retrieved and utilized within `ServeHTTP` and `manageConnection` for more detailed logging, context-aware operations, and passing user details to NATS subscription logic.
+- TODO: (From code comment) Later, the `AuthenticatedUserContext` from `CompanyTokenAuthMiddleware` should be retrieved and utilized within `ServeHTTP` and `manageConnection` for more detailed logging, context-aware operations, and passing user details to NATS subscription logic. (Partially addressed, core details are used; further clarification on "more detailed" aspects might be needed).
 - TODO: (FR-9B from code comment) Add WebSocket compression options to `websocket.AcceptOptions` based on application configuration.
 - TODO: (FR-9B from code comment) Consider adding `InsecureSkipVerify` to `websocket.AcceptOptions` for local development if using self-signed certificates, controlled by application configuration.
 - Implement remaining Client Message Processing logic within `manageConnection` for `json.v1` subprotocol. This primarily includes:
-    - For `MessageTypeSelectChat`: **Still TODO**: Updating NATS subscriptions to switch from the general `wa.<C>.<A>.chats` stream to the specific `wa.<C>.<A>.messages.<chatID>` stream, and managing unsubscription from previous specific chat message streams. This is crucial for FR-7 and will likely require refactoring NATS subscription management in `manageConnection` and potentially adding a new subscription method to the NATS adapter for specific message threads.
-    - Defining behavior for other potential client message types or unknown types (e.g., sending `ErrorMessage`). (Partially done, `handleUnknownMessage` exists)
+    - Defining behavior for other potential client message types or unknown types (e.g., sending `ErrorMessage`). (Partially done, `handleUnknownMessage` exists, ongoing as new types may emerge).
 
 ## `internal/adapters/redis/token_cache_adapter.go`
 - **Implement Redis Token Cache Adapter**
@@ -33,7 +32,20 @@
 --- 
 
 # Completed TODO
-## Recently Completed (Task 7 & related from Task 4)
+
+## Recently Addressed from this Session
+- **`cmd/daisi-ws-service/main.go`**: Implemented actual readiness checks for the `/ready` endpoint (NATS, Redis).
+- **`cmd/daisi-ws-service/main.go`**: Added production hardening to HTTP server (ReadTimeout, WriteTimeout, IdleTimeout via config).
+- **`cmd/daisi-ws-service/main.go`**: Verified cleanup for NATS, Redis, gRPC server during graceful shutdown (handled by Wire & provider cleanups).
+- **`internal/adapters/websocket/handler.go`**: Added configurable WebSocket compression options to `websocket.AcceptOptions`.
+- **`internal/adapters/websocket/handler.go`**: Added configurable `InsecureSkipVerify` to `websocket.AcceptOptions` for local development.
+- **`internal/adapters/websocket/handler.go`**: Implemented NATS subscription logic: initial general `wa.C.A.chats` subscription, then switch to specific `wa.C.A.messages.chatID` on `MessageTypeSelectChat`, including draining previous subscriptions.
+- **`internal/adapters/redis/token_cache_adapter.go`**: Implemented Redis Token Cache Adapter (`NewTokenCacheAdapter` and `domain.TokenCacheStore` methods) and updated `TokenCacheStoreProvider`.
+- **Admin Functionality**: Implemented Admin Token Generation & Scoping (`/admin/generate-token` endpoint, `AdminUserContext` population for NATS scoping).
+- **`internal/bootstrap/providers.go`**: Added `ReadTimeoutSeconds` and `IdleTimeoutSeconds` to `config.AppConfig` and used them in `HTTPGracefulServerProvider` (covered by HTTP server hardening).
+- **FR-8C (`websocket/handler.go`)**: Implemented basic gRPC client connection pooling/reuse for inter-pod communication in `specificChatNatsMessageHandler`.
+
+## Previously Completed (Task 7 & related from Task 4)
 - Client Message Processing: Unmarshalling incoming messages into `BaseMessage`. (Completed in Task 4 / Task 7)
 - Handling `MessageTypeSelectChat`:
     - Parsing `SelectChatMessagePayload`. (Completed in Task 7.3)

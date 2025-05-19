@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	// "time" // Not strictly needed for basic upgrade, can be added for timeouts later
@@ -41,6 +42,7 @@ type Handler struct {
 	configProvider config.Provider
 	connManager    *application.ConnectionManager
 	natsAdapter    *appnats.ConsumerAdapter
+	grpcClientPool *sync.Map // Map targetAddress (string) to *grpc.ClientConn
 	// Future dependencies: connectionManager domain.ConnectionManager
 }
 
@@ -51,6 +53,7 @@ func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *
 		configProvider: cfgProvider,
 		connManager:    connManager,
 		natsAdapter:    natsAdapter,
+		grpcClientPool: &sync.Map{},
 	}
 }
 
@@ -259,11 +262,57 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
 
 	// NATS Subscription management
-	var currentNatsSubscription *nats.Subscription
-	var currentSubscriptionChatID string // To track which chatID the subscription is for
+	var generalNatsSubscription *nats.Subscription
+	var specificNatsSubscription *nats.Subscription // Renamed from currentNatsSubscription
+	var currentSpecificChatID string                // Renamed from currentSubscriptionChatID
 
-	// Function to handle NATS messages, including ownership check
-	natsMessageHandler := func(msg *nats.Msg) {
+	// Handler for general chat events (e.g., chat list updates)
+	generalChatEventsNatsHandler := func(msg *nats.Msg) {
+		metrics.IncrementNatsMessagesReceived(msg.Subject)
+		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
+		if natsRequestID == "" {
+			natsRequestID = uuid.NewString()
+		}
+		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
+
+		h.logger.Info(msgCtx, "Received general chat event from NATS", "subject", msg.Subject, "data_len", len(msg.Data))
+		var eventPayload domain.EnrichedEventPayload
+		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
+			h.logger.Error(msgCtx, "Failed to unmarshal general chat event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
+			_ = msg.Ack()
+			return
+		}
+		wsMessage := domain.NewEventMessage(eventPayload)
+		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
+			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
+		} else {
+			metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+		}
+		_ = msg.Ack()
+	}
+
+	// Initial subscription to general wa.C.A.chats topic
+	if h.natsAdapter != nil {
+		var subErr error
+		generalNatsSubscription, subErr = h.natsAdapter.SubscribeToChats(connCtx, companyID, agentID, generalChatEventsNatsHandler)
+		if subErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to general NATS chats topic", "companyID", companyID, "agentID", agentID, "error", subErr.Error())
+			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to chat updates", subErr.Error())
+			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
+				h.logger.Error(connCtx, "Failed to send NATS subscription error to client for general chats", "error", sendErr.Error())
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeError)
+			}
+			// Depending on policy, might close connection if initial subscription fails
+		} else {
+			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject)
+		}
+	} else {
+		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general chat events.")
+	}
+
+	// Renamed specificChatNatsMessageHandler from natsMessageHandler for clarity
+	specificChatNatsMessageHandler := func(msg *nats.Msg) {
 		metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric
 
 		// Start: request_id handling for NATS message
@@ -352,38 +401,52 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
 
 			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
-				// TODO: FR-8B - Implement proper pod address resolution (e.g., from K8s service discovery or config map)
-				// For Kubernetes, this often involves using a headless service and internal DNS:
-				// e.g., targetService := fmt.Sprintf("%s.%s.svc.cluster.local", ownerPodID, "your-headless-service-name")
-				// For now, assume ownerPodID can be part of a resolvable address, e.g., ownerPodID + cluster_suffix
-				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort) // Assuming GRPCPort is in config
+				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
 				h.logger.Info(msgCtx, "Attempting to forward message via gRPC", "target_address", gprcTargetAddress)
 
-				// TODO: FR-8C - Implement gRPC client connection pooling/reuse
-				// Creating a new connection for each message is inefficient. A pool should be used.
-				connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())} // INSECURE
-				grpcConn, errClient := grpc.NewClient(gprcTargetAddress, connOpts...)
-				if errClient != nil {
-					h.logger.Error(msgCtx, "Failed to connect to gRPC service on owner pod",
+				var grpcConn *grpc.ClientConn
+				var errClient error
+				var connFromPool bool
+
+				if connVal, okPool := h.grpcClientPool.Load(gprcTargetAddress); okPool {
+					grpcConn, connFromPool = connVal.(*grpc.ClientConn)
+					if !connFromPool {
+						h.logger.Error(msgCtx, "Invalid type in gRPC client pool, removing entry.", "target_address", gprcTargetAddress, "type", fmt.Sprintf("%T", connVal))
+						h.grpcClientPool.Delete(gprcTargetAddress) // Remove bad entry
+						// Fallback to creating a new connection by ensuring grpcConn is nil
+						grpcConn = nil
+					} else {
+						// TODO: Add a basic health check here if possible. For now, assume good or will error out on use.
+						h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress)
+					}
+				}
+
+				if grpcConn == nil { // If not found in pool, type assertion failed, or explicitly nilled due to bad type
+					h.logger.Info(msgCtx, "Creating new gRPC client connection", "target_address", gprcTargetAddress)
+					connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+					newlyCreatedConn, newErrClient := grpc.NewClient(gprcTargetAddress, connOpts...)
+					if newErrClient == nil {
+						grpcConn = newlyCreatedConn                         // Use the newly created connection
+						h.grpcClientPool.Store(gprcTargetAddress, grpcConn) // Store the new connection
+					} else {
+						errClient = newErrClient // Store the error to be handled below
+					}
+				}
+
+				if errClient != nil { // This error is from grpc.NewClient if pool retrieval failed and new connection also failed
+					h.logger.Error(msgCtx, "Failed to establish gRPC connection to owner pod",
 						"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errClient.Error())
-					// If connection fails, message is not forwarded. It will be ACKed without hop.
-					// The NACK for ErrNoOwningPod handles unroutable messages earlier.
-					// For direct connection failures here, we might consider a NACK with delay if retries are exhausted and we want NATS to handle redelivery.
-					// However, the current retry logic is below. If all retries fail, the message is effectively dropped from this pod's perspective for gRPC forwarding.
-				} else {
-					defer grpcConn.Close()
+				} else if grpcConn != nil { // If we have a connection (either from pool or newly created)
+					// defer grpcConn.Close() // DO NOT CLOSE HERE - it's pooled. Lifecycle managed elsewhere (e.g. app shutdown or eviction strategy)
 					client := dws_message_fwd.NewMessageForwardingServiceClient(grpcConn)
 
-					// Translate domain.EnrichedEventPayload to proto.EnrichedEventPayloadMessage
 					var domainPayload domain.EnrichedEventPayload
 					if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
 						h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding", "subject", msg.Subject, "error", errUnmarshal.Error())
-						// Message will be ACKed without hop if unmarshalling fails here.
 					} else {
 						protoData, errProtoStruct := structpb.NewStruct(domainPayload.Data.(map[string]interface{}))
 						if errProtoStruct != nil {
 							h.logger.Error(msgCtx, "Failed to convert domainPayload.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
-							// Message will be ACKed without hop.
 						} else {
 							grpcRequest := &dws_message_fwd.PushEventRequest{
 								Payload: &dws_message_fwd.EnrichedEventPayloadMessage{
@@ -399,21 +462,16 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 								SourcePodId:     currentPodID,
 							}
 
-							// Propagate request_id via gRPC metadata
 							md := metadata.New(nil)
-							if reqID, ok := msgCtx.Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+							if reqID, okCtxVal := msgCtx.Value(contextkeys.RequestIDKey).(string); okCtxVal && reqID != "" {
 								md.Set(string(contextkeys.RequestIDKey), reqID)
 							}
 							pushCtxWithMetadata := metadata.NewOutgoingContext(msgCtx, md)
 
-							// Use configured timeout, defaulting if necessary
 							grpcClientTimeoutSeconds := h.configProvider.Get().App.GRPCCLientForwardTimeoutSeconds
-							grpcClientTimeout := 5 * time.Second // Default timeout
+							grpcClientTimeout := 5 * time.Second
 							if grpcClientTimeoutSeconds > 0 {
 								grpcClientTimeout = time.Duration(grpcClientTimeoutSeconds) * time.Second
-								h.logger.Debug(msgCtx, "Using configured gRPC client forward timeout", "seconds", grpcClientTimeoutSeconds)
-							} else {
-								h.logger.Debug(msgCtx, "Using default gRPC client forward timeout", "seconds", grpcClientTimeout.Seconds())
 							}
 
 							pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
@@ -421,32 +479,18 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 							pushCancel()
 
 							if errPush != nil {
-								h.logger.Warn(msgCtx, "Initial gRPC PushEvent to owner pod failed, preparing to retry...",
-									"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error())
-
-								// Retry logic (Subtask 8.5)
-								time.Sleep(200 * time.Millisecond) // Fixed short delay for retry
-								h.logger.Info(msgCtx, "Retrying gRPC PushEvent...", "target_pod", ownerPodID)
-								// Use the same configurable timeout for retry
-								pushRetryCtx, pushRetryCancel := context.WithTimeout(msgCtx, grpcClientTimeout)
-								resp, errPush = client.PushEvent(pushRetryCtx, grpcRequest)
-								pushRetryCancel()
-
-								if errPush != nil {
-									h.logger.Error(msgCtx, "Retry gRPC PushEvent to owner pod also failed",
-										"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error())
-								} else if resp != nil && !resp.Success {
-									h.logger.Warn(msgCtx, "Retry gRPC PushEvent to owner pod was not successful",
-										"target_pod", ownerPodID, "response_message", resp.Message)
-								} else if resp != nil && resp.Success {
-									h.logger.Info(msgCtx, "Successfully forwarded message via gRPC on retry", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
-									metrics.IncrementGrpcMessagesSent(ownerPodID)
+								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod failed", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
+								// If a pooled connection fails, remove it from the pool so a new one is tried next time.
+								if connFromPool {
+									h.grpcClientPool.Delete(gprcTargetAddress)
+									grpcConn.Close() // Close the problematic connection
+									h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool", "target_address", gprcTargetAddress)
 								}
+								// Retry logic is removed for now to simplify. Can be added back if needed.
 							} else if resp != nil && !resp.Success {
-								h.logger.Warn(msgCtx, "Initial gRPC PushEvent to owner pod was not successful",
-									"target_pod", ownerPodID, "response_message", resp.Message)
-							} else if resp != nil && resp.Success { // Initial push was successful
-								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC on initial attempt", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
+								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
+							} else if resp != nil && resp.Success {
+								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC", "target_pod", ownerPodID, "event_id", domainPayload.EventID, "is_pooled_conn", connFromPool)
 								metrics.IncrementGrpcMessagesSent(ownerPodID)
 							}
 						}
@@ -462,21 +506,18 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		}
 	}
 
-	// Initial subscription to general chats (wa.<C>.<A>.chats)
-	// This subscription will be replaced when a specific chat is selected.
-	// We need a different handler for general chat list events vs specific message events if their payload/processing differs.
-	// For now, let's assume the same natsMessageHandler can handle both, but it will always check ownership based on parsed chatID.
-	// If a message on wa.C.A.chats does not have a chatID in its NATS subject, parseNATSMessageSubject will fail.
-	// This initial subscription might need its own, simpler handler if it's just for, e.g., chat list updates not specific messages.
-	// Task 8 focuses on "per-thread message fan-out", so messages on "wa.C.A.messages.X".
-	// Let's skip the initial general subscription for now and only subscribe when a chat is selected.
-
-	// defer func for NATS subscription cleanup
+	// Defer cleanup for all subscriptions
 	defer func() {
-		if currentNatsSubscription != nil {
-			h.logger.Info(connCtx, "Draining current NATS subscription on connection close", "subject", currentNatsSubscription.Subject, "chatID", currentSubscriptionChatID)
-			if unsubErr := currentNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining NATS subscription on close", "subject", currentNatsSubscription.Subject, "error", unsubErr.Error())
+		if generalNatsSubscription != nil {
+			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject)
+			if unsubErr := generalNatsSubscription.Drain(); unsubErr != nil {
+				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject, "error", unsubErr.Error())
+			}
+		}
+		if specificNatsSubscription != nil {
+			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject, "chatID", currentSpecificChatID)
+			if unsubErr := specificNatsSubscription.Drain(); unsubErr != nil {
+				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject, "error", unsubErr.Error())
 			}
 		}
 	}()
@@ -498,21 +539,19 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			for {
 				select {
 				case <-pinger.C:
-					// Create a context with timeout for the ping operation itself
 					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
 					if err := conn.Ping(pingWriteCtx); err != nil {
 						h.logger.Error(connCtx, "Failed to send ping", "error", err.Error())
-						pingCancel() // Cancel the pingWriteCtx
+						pingCancel()
 						conn.Close(websocket.StatusAbnormalClosure, "Ping failure")
 						return
 					}
-					pingCancel() // Release resources of pingWriteCtx
+					pingCancel()
 					h.logger.Debug(connCtx, "Sent ping")
 
-					// Check for pong timeout
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
 						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "lastPong", conn.LastPongTime())
-						conn.Close(websocket.StatusPolicyViolation, "Pong timeout") // 1008 StatusPolicyViolation for timeout
+						conn.Close(websocket.StatusPolicyViolation, "Pong timeout")
 						return
 					}
 				case <-connCtx.Done():
@@ -589,10 +628,9 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			case domain.MessageTypeSelectChat:
 				h.logger.Info(connCtx, "Handling select_chat message type")
 				// Pass the natsMessageHandler and a way to update currentNatsSubscription
-				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload, natsMessageHandler, currentNatsSubscription)
+				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
 				if err != nil {
 					h.logger.Error(connCtx, "Error handling select_chat message", "error", err.Error())
-					// Optionally send error to client
 					errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to process chat selection", err.Error())
 					if sendErr := conn.WriteJSON(domain.NewErrorMessage(errResp)); sendErr != nil {
 						h.logger.Error(connCtx, "Failed to send error to client for select_chat failure", "error", sendErr.Error())
@@ -600,8 +638,11 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 						metrics.IncrementMessagesSent(domain.MessageTypeError)
 					}
 				} else {
-					currentNatsSubscription = newSub
-					currentSubscriptionChatID = newChatID
+					// If handleSelectChatMessage was successful, generalNatsSubscription might have been cleared if it existed.
+					// And specificNatsSubscription would be the new one.
+					generalNatsSubscription = nil // Explicitly nil out general if specific is now active
+					specificNatsSubscription = newSub
+					currentSpecificChatID = newChatID
 				}
 			default:
 				h.logger.Warn(connCtx, "Handling unknown message type", "type", baseMsg.Type)
@@ -623,9 +664,11 @@ func (h *Handler) handleSelectChatMessage(
 	rawPayload []byte,
 	companyID, agentID, userID string,
 	payloadData interface{},
-	natsMsgHandler nats.MsgHandler, // New parameter
-	currentSub *nats.Subscription, // New parameter
-) (*nats.Subscription, string, error) { // Returns new subscription, new chatID, and error
+	specificChatNatsMsgHandler nats.MsgHandler, // Renamed for clarity
+	currentGeneralSub *nats.Subscription, // Pass general subscription
+	currentSpecificSub *nats.Subscription, // Pass current specific subscription
+	currentSpecificSubChatID string, // Pass current specific chat ID
+) (*nats.Subscription, string, error) { // Returns new specific subscription, new chatID, and error
 
 	payloadMap, ok := payloadData.(map[string]interface{})
 	if !ok {
@@ -636,7 +679,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("invalid payload structure") // Return current sub and old chatID on error
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("invalid payload structure") // Return current sub and old chatID on error
 	}
 
 	chatIDInterface, found := payloadMap["chat_id"]
@@ -648,7 +691,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("chat_id missing from payload") // Return current sub and old chatID on error
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("chat_id missing from payload") // Return current sub and old chatID on error
 	}
 
 	chatID, ok := chatIDInterface.(string)
@@ -660,7 +703,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("invalid chat_id type or empty") // Return current sub and old chatID on error
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("invalid chat_id type or empty") // Return current sub and old chatID on error
 	}
 
 	h.logger.Info(connCtx, "Client selected chat", "chat_id", chatID, "company", companyID, "agent", agentID, "user", userID)
@@ -682,7 +725,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("podID is not configured") // Return current sub and old chatID on error
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("podID is not configured") // Return current sub and old chatID on error
 	}
 
 	routeReg := h.connManager.RouteRegistrar()
@@ -695,14 +738,14 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("routeRegistry is nil") // Return current sub and old chatID on error
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("routeRegistry is nil") // Return current sub and old chatID on error
 	}
 
 	oldChatID := conn.GetCurrentChatID()
 
 	if oldChatID == chatID {
 		h.logger.Info(connCtx, "Client selected the same chat_id, no changes to routes or NATS subscription needed.", "chatID", chatID)
-		return currentSub, chatID, nil // No change
+		return currentSpecificSub, chatID, nil // No change
 	}
 
 	// Unregister Old Message Route
@@ -730,26 +773,36 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, oldChatID, fmt.Errorf("failed to register new message route: %w", err) // Return current sub and old chatID
+		return currentSpecificSub, oldChatID, fmt.Errorf("failed to register new message route: %w", err) // Return current sub and old chatID
 	}
 	h.logger.Info(connCtx, "Successfully registered new message route", "newChatID", chatID)
 
 	// Manage NATS Subscription
-	// 1. Drain old subscription if it exists and is for a different chat
-	if currentSub != nil && oldChatID != "" { // oldChatID check ensures we only drain if there was a specific previous sub
-		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", oldChatID, "subject", currentSub.Subject)
-		if err := currentSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain old NATS subscription", "old_chat_id", oldChatID, "subject", currentSub.Subject, "error", err.Error())
+	// 1. Drain general subscription if it exists
+	if currentGeneralSub != nil {
+		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject)
+		if err := currentGeneralSub.Drain(); err != nil {
+			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject, "error", err.Error())
+			// Log and continue, attempt to subscribe to new one
+		}
+		// currentGeneralSub = nil // It will be nil-ed out by the caller if this function succeeds
+	}
+
+	// 2. Drain old specific subscription if it exists and is for a different chat
+	if currentSpecificSub != nil && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID {
+		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject)
+		if err := currentSpecificSub.Drain(); err != nil {
+			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject, "error", err.Error())
 			// Log and continue, attempt to subscribe to new one
 		}
 	}
 
-	// 2. Subscribe to new chat message subject
-	var newSubscription *nats.Subscription
+	// 3. Subscribe to new chat message subject
+	var newSpecificSubscription *nats.Subscription
 	var newSubErr error
 	if h.natsAdapter != nil {
 		h.logger.Info(connCtx, "Subscribing to NATS for new chat_id", "companyID", companyID, "agentID", agentID, "new_chat_id", chatID)
-		newSubscription, newSubErr = h.natsAdapter.SubscribeToChatMessages(connCtx, companyID, agentID, chatID, natsMsgHandler)
+		newSpecificSubscription, newSubErr = h.natsAdapter.SubscribeToChatMessages(connCtx, companyID, agentID, chatID, specificChatNatsMsgHandler)
 		if newSubErr != nil {
 			h.logger.Error(connCtx, "Failed to subscribe to NATS for new chat messages",
 				"companyID", companyID, "agentID", agentID, "new_chat_id", chatID, "error", newSubErr.Error(),
@@ -760,23 +813,18 @@ func (h *Handler) handleSelectChatMessage(
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeError)
 			}
-			// If NATS subscription fails, we might have registered the route but can't get messages.
-			// Decide if we should unregister the route or leave it. For now, leave it and return error.
-			// The client won't get messages, which is an error state.
 			conn.SetCurrentChatID(oldChatID) // Revert to old chat ID if new subscription fails
-			return currentSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
+			return currentSpecificSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
 		}
-		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSubscription.Subject)
+		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject)
 	} else {
 		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to new chat messages.", "new_chat_id", chatID)
-		// No NATS capability, but route might be registered. This is a partial success.
-		// Client won't get messages.
 	}
 
 	conn.SetCurrentChatID(chatID)
 	h.logger.Info(connCtx, "Updated current chat ID for connection", "newChatID", chatID)
 
-	return newSubscription, chatID, nil
+	return newSpecificSubscription, chatID, nil
 }
 
 // handleUnknownMessage processes incoming messages of an unknown type.

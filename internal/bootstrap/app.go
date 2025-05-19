@@ -122,7 +122,9 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	if a.generateTokenHandler != nil && a.tokenGenerationMiddleware != nil {
-		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(a.generateTokenHandler))
+		// Cast the specific handler type to http.HandlerFunc, which implements http.Handler
+		handlerToWrap := http.HandlerFunc(a.generateTokenHandler)
+		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(handlerToWrap))
 		a.httpServeMux.Handle("POST /generate-token", finalGenerateTokenHandler)
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {

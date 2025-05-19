@@ -34,6 +34,10 @@ import (
 type TokenGenerationMiddleware func(http.Handler) http.Handler
 type AdminAuthMiddleware func(http.Handler) http.Handler // New type for AdminAuthMiddleware
 
+// Define distinct types for specific http.HandlerFunc roles
+type CompanyUserTokenGenerateHandler http.HandlerFunc
+type AdminUserTokenGenerateHandler http.HandlerFunc
+
 // InitialZapLoggerProvider provides a basic *zap.Logger instance, primarily for config initialization.
 // It returns the logger, a cleanup function (for syncing), and an error if creation fails.
 func InitialZapLoggerProvider() (*zap.Logger, func(), error) {
@@ -70,9 +74,10 @@ type App struct {
 	logger                    domain.Logger
 	httpServeMux              *http.ServeMux
 	httpServer                *http.Server
-	grpcServer                *appgrpc.Server // Added gRPC Server
-	generateTokenHandler      http.HandlerFunc
-	tokenGenerationMiddleware func(http.Handler) http.Handler // Specific middleware for /generate-token
+	grpcServer                *appgrpc.Server                 // Added gRPC Server
+	generateTokenHandler      CompanyUserTokenGenerateHandler // Updated type
+	generateAdminTokenHandler AdminUserTokenGenerateHandler   // Updated type
+	tokenGenerationMiddleware TokenGenerationMiddleware       // This is a type alias already func(http.Handler) http.Handler
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
 	natsConsumerAdapter       *appnats.ConsumerAdapter // Added NATS Consumer Adapter
@@ -90,24 +95,26 @@ func NewApp(
 	appLogger domain.Logger,
 	mux *http.ServeMux,
 	server *http.Server,
-	grpcSrv *appgrpc.Server, // Added gRPC Server
-	genTokenHandler http.HandlerFunc,
+	grpcSrv *appgrpc.Server,                            // Added gRPC Server
+	genTokenHandler CompanyUserTokenGenerateHandler,    // Updated type
+	genAdminTokenHandler AdminUserTokenGenerateHandler, // Updated type
 	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
 	natsAdapter *appnats.ConsumerAdapter, // Added NATS Consumer Adapter
-	adminAuthMid AdminAuthMiddleware, // Added AdminAuthMiddleware
+	adminAuthMid AdminAuthMiddleware,     // Added AdminAuthMiddleware
 	adminHandler *wsadapter.AdminHandler, // Added AdminHandler
-	natsConn *nats.Conn, // Added for readiness check
-	redisClient *redis.Client, // Added for readiness check
+	natsConn *nats.Conn,                  // Added for readiness check
+	redisClient *redis.Client,            // Added for readiness check
 ) (*App, func(), error) { // Assuming a top-level cleanup for App
 	app := &App{
 		configProvider:            cfgProvider,
 		logger:                    appLogger,
 		httpServeMux:              mux,
 		httpServer:                server,
-		grpcServer:                grpcSrv, // Added gRPC Server
-		generateTokenHandler:      genTokenHandler,
+		grpcServer:                grpcSrv,              // Added gRPC Server
+		generateTokenHandler:      genTokenHandler,      // Use updated type
+		generateAdminTokenHandler: genAdminTokenHandler, // Use updated type
 		tokenGenerationMiddleware: tokenGenMiddleware,
 		wsRouter:                  wsRouter,
 		connectionManager:         connManager,
@@ -182,8 +189,13 @@ func HTTPGracefulServerProvider(cfgProvider config.Provider, mux *http.ServeMux)
 }
 
 // GenerateTokenHandlerProvider provider
-func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
-	return apphttp.GenerateTokenHandler(cfgProvider, logger)
+func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) CompanyUserTokenGenerateHandler {
+	return CompanyUserTokenGenerateHandler(apphttp.GenerateTokenHandler(cfgProvider, logger))
+}
+
+// GenerateAdminTokenHandlerProvider provider
+func GenerateAdminTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) AdminUserTokenGenerateHandler {
+	return AdminUserTokenGenerateHandler(apphttp.GenerateAdminTokenHandler(cfgProvider, logger))
 }
 
 // TokenGenerationAuthMiddlewareProvider Provider
@@ -264,9 +276,7 @@ func ConnectionManagerProvider(
 
 // TokenCacheStoreProvider provides a TokenCacheStore.
 func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.TokenCacheStore {
-	logger.Warn(context.Background(), "TokenCacheStoreProvider is using a placeholder nil implementation. Actual Redis-backed cache store needs to be implemented.")
-	// TODO: Replace with actual appredis.NewTokenCacheAdapter(redisClient, logger) once implemented
-	return nil
+	return appredis.NewTokenCacheAdapter(redisClient, logger)
 }
 
 // AdminTokenCacheStoreProvider provides an AdminTokenCacheStore.
@@ -312,6 +322,7 @@ var ProviderSet = wire.NewSet(
 
 	// HTTP Handlers and Middleware
 	GenerateTokenHandlerProvider,
+	GenerateAdminTokenHandlerProvider,
 	TokenGenerationAuthMiddlewareProvider,
 
 	// WebSocket Components

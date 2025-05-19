@@ -70,6 +70,7 @@ internal/
       kill_switch_pubsub.go
       route_registry.go
       session_lock_manager.go
+      token_cache_adapter.go
     websocket/
       admin_handler.go
       conn.go
@@ -114,6 +115,68 @@ go.mod
 ```
 
 # Files
+
+## File: internal/adapters/redis/token_cache_adapter.go
+```go
+package redis
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type TokenCacheAdapter struct {
+	redisClient *redis.Client
+	logger      domain.Logger
+}
+func NewTokenCacheAdapter(redisClient *redis.Client, logger domain.Logger) *TokenCacheAdapter {
+	if redisClient == nil {
+		panic("redisClient cannot be nil in NewTokenCacheAdapter")
+	}
+	if logger == nil {
+		panic("logger cannot be nil in NewTokenCacheAdapter")
+	}
+	return &TokenCacheAdapter{
+		redisClient: redisClient,
+		logger:      logger,
+	}
+}
+func (a *TokenCacheAdapter) Get(ctx context.Context, key string) (*domain.AuthenticatedUserContext, error) {
+	val, err := a.redisClient.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		a.logger.Debug(ctx, "Company token cache miss", "key", key)
+		return nil, application.ErrCacheMiss
+	}
+	if err != nil {
+		a.logger.Error(ctx, "Failed to get company token from Redis cache", "key", key, "error", err.Error())
+		return nil, fmt.Errorf("redis GET for company token key '%s' failed: %w", key, err)
+	}
+	var userCtx domain.AuthenticatedUserContext
+	if err = json.Unmarshal([]byte(val), &userCtx); err != nil {
+		a.logger.Error(ctx, "Failed to unmarshal cached company token data", "key", key, "error", err.Error())
+		return nil, fmt.Errorf("failed to unmarshal company token data for key '%s': %w", key, err)
+	}
+	a.logger.Debug(ctx, "Company token cache hit", "key", key, "user_id", userCtx.UserID)
+	return &userCtx, nil
+}
+func (a *TokenCacheAdapter) Set(ctx context.Context, key string, value *domain.AuthenticatedUserContext, ttl time.Duration) error {
+	payloadBytes, err := json.Marshal(value)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to marshal company token for caching", "key", key, "user_id", value.UserID, "error", err.Error())
+		return fmt.Errorf("failed to marshal company token for key '%s': %w", key, err)
+	}
+	if err = a.redisClient.Set(ctx, key, string(payloadBytes), ttl).Err(); err != nil {
+		a.logger.Error(ctx, "Failed to set company token in Redis cache", "key", key, "user_id", value.UserID, "error", err.Error())
+		return fmt.Errorf("redis SET for company token key '%s' failed: %w", key, err)
+	}
+	a.logger.Debug(ctx, "Successfully cached company token", "key", key, "user_id", value.UserID, "ttl", ttl.String())
+	return nil
+}
+```
 
 ## File: internal/adapters/grpc/proto/dws_message_fwd.proto
 ```protobuf
@@ -220,6 +283,68 @@ func GenerateTokenHandler(cfgProvider config.Provider, logger domain.Logger) htt
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			logger.Error(r.Context(), "Failed to encode /generate-token response", "error", err.Error())
+		}
+	}
+}
+type GenerateAdminTokenRequest struct {
+	AdminID              string `json:"admin_id"`
+	ExpiresInSeconds     int    `json:"expires_in_seconds"`
+	SubscribedCompanyID  string `json:"subscribed_company_id,omitempty"`
+	SubscribedAgentID    string `json:"subscribed_agent_id,omitempty"`
+	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
+}
+type GenerateAdminTokenResponse struct {
+	Token string `json:"token"`
+}
+func GenerateAdminTokenHandler(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			logger.Warn(r.Context(), "Invalid method for /admin/generate-token", "method", r.Method)
+			domain.NewErrorResponse(domain.ErrMethodNotAllowed, "Method not allowed", "Only POST method is allowed.").WriteJSON(w, http.StatusMethodNotAllowed)
+			return
+		}
+		var reqPayload GenerateAdminTokenRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
+			logger.Warn(r.Context(), "Failed to decode /admin/generate-token payload", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid request payload", err.Error()).WriteJSON(w, http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+		if reqPayload.AdminID == "" || reqPayload.ExpiresInSeconds <= 0 {
+			logger.Warn(r.Context(), "Invalid payload for /admin/generate-token", "payload", reqPayload)
+			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid payload", "admin_id and positive expires_in_seconds are required.").WriteJSON(w, http.StatusBadRequest)
+			return
+		}
+		appAuthCfg := cfgProvider.Get().Auth
+		if appAuthCfg.AdminTokenAESKey == "" {
+			logger.Error(r.Context(), "AdminTokenAESKey not configured for /admin/generate-token")
+			domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Admin token encryption key not configured.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		adminTokenContext := domain.AdminUserContext{
+			AdminID:              reqPayload.AdminID,
+			ExpiresAt:            time.Now().Add(time.Duration(reqPayload.ExpiresInSeconds) * time.Second),
+			SubscribedCompanyID:  reqPayload.SubscribedCompanyID,
+			SubscribedAgentID:    reqPayload.SubscribedAgentID,
+			CompanyIDRestriction: reqPayload.CompanyIDRestriction,
+		}
+		plaintextTokenPayload, err := json.Marshal(adminTokenContext)
+		if err != nil {
+			logger.Error(r.Context(), "Failed to marshal admin token context for /admin/generate-token", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrInternal, "Failed to create admin token", "Internal error during token generation.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		encryptedToken, err := crypto.EncryptAESGCM(appAuthCfg.AdminTokenAESKey, plaintextTokenPayload)
+		if err != nil {
+			logger.Error(r.Context(), "Failed to encrypt admin token for /admin/generate-token", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrInternal, "Failed to create admin token", "Internal error during token encryption.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		resp := GenerateAdminTokenResponse{Token: encryptedToken}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			logger.Error(r.Context(), "Failed to encode /admin/generate-token response", "error", err.Error())
 		}
 	}
 }
@@ -3142,52 +3267,6 @@ func (cm *ConnectionManager) StopResourceRenewalLoop() {
 }
 ```
 
-## File: config/config.yaml
-```yaml
-server:
-  http_port: 8080
-  grpc_port: 50051
-  pod_id: "" # This should be set via ENV (e.g., POD_IP via Downward API)
-  enable_reflection: false # Default to false for production
-# NATS Configuration
-nats:
-  url: "nats://nats:4222"
-  stream_name: "wa_stream"
-  consumer_name: "ws_fanout"
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5
-redis:
-  address: "redis:6379"
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5
-log:
-  level: "info"
-auth:
-  secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE"
-  token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE"
-  token_generation_admin_key: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE"
-  token_cache_ttl_seconds: 30
-  admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
-  admin_token_cache_ttl_seconds: 60
-app:
-  service_name: "daisi-ws-service"
-  version: "1.0.0"
-  ping_interval_seconds: 20
-  shutdown_timeout_seconds: 30
-  pong_wait_seconds: 60
-  write_timeout_seconds: 10
-  max_missed_pongs: 2
-  session_ttl_seconds: 30
-  route_ttl_seconds: 30
-  ttl_refresh_interval_seconds: 10
-  nats_max_ack_pending: 5000
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5
-```
-
 ## File: internal/application/connection_registry.go
 ```go
 package application
@@ -3278,6 +3357,57 @@ func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.S
 }
 ```
 
+## File: config/config.yaml
+```yaml
+server:
+  http_port: 8080
+  grpc_port: 50051
+  pod_id: "" # This should be set via ENV (e.g., POD_IP via Downward API)
+  enable_reflection: false # Default to false for production
+# NATS Configuration
+nats:
+  url: "nats://nats:4222"
+  stream_name: "wa_stream"
+  consumer_name: "ws_fanout"
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5
+redis:
+  address: "redis:6379"
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5
+log:
+  level: "info"
+auth:
+  secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE"
+  token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE"
+  token_generation_admin_key: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE"
+  token_cache_ttl_seconds: 30
+  admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
+  admin_token_cache_ttl_seconds: 60
+app:
+  service_name: "daisi-ws-service"
+  version: "1.0.0"
+  ping_interval_seconds: 20
+  shutdown_timeout_seconds: 30
+  pong_wait_seconds: 60
+  write_timeout_seconds: 10
+  max_missed_pongs: 2
+  session_ttl_seconds: 30
+  route_ttl_seconds: 30
+  ttl_refresh_interval_seconds: 10
+  nats_max_ack_pending: 5000
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5
+  read_timeout_seconds: 10
+  idle_timeout_seconds: 60
+  websocket_compression_mode: "disabled"
+  websocket_compression_threshold: 1024
+  websocket_development_insecure_skip_verify: false
+```
+
 ## File: internal/adapters/config/config.go
 ```go
 package config
@@ -3322,20 +3452,25 @@ type AuthConfig struct {
 	AdminTokenCacheTTLSeconds int    `mapstructure:"admin_token_cache_ttl_seconds"`
 }
 type AppConfig struct {
-	ServiceName                     string `mapstructure:"service_name"`
-	Version                         string `mapstructure:"version"`
-	PingIntervalSeconds             int    `mapstructure:"ping_interval_seconds"`
-	ShutdownTimeoutSeconds          int    `mapstructure:"shutdown_timeout_seconds"`
-	PongWaitSeconds                 int    `mapstructure:"pong_wait_seconds"`
-	WriteTimeoutSeconds             int    `mapstructure:"write_timeout_seconds"`
-	MaxMissedPongs                  int    `mapstructure:"max_missed_pongs"`
-	SessionTTLSeconds               int    `mapstructure:"session_ttl_seconds"`
-	RouteTTLSeconds                 int    `mapstructure:"route_ttl_seconds"`
-	TTLRefreshIntervalSeconds       int    `mapstructure:"ttl_refresh_interval_seconds"`
-	NATSMaxAckPending               int    `mapstructure:"nats_max_ack_pending"`
-	SessionLockRetryDelayMs         int    `mapstructure:"session_lock_retry_delay_ms"`
-	NatsAckWaitSeconds              int    `mapstructure:"nats_ack_wait_seconds"`
-	GRPCCLientForwardTimeoutSeconds int    `mapstructure:"grpc_client_forward_timeout_seconds"`
+	ServiceName                            string `mapstructure:"service_name"`
+	Version                                string `mapstructure:"version"`
+	PingIntervalSeconds                    int    `mapstructure:"ping_interval_seconds"`
+	ShutdownTimeoutSeconds                 int    `mapstructure:"shutdown_timeout_seconds"`
+	PongWaitSeconds                        int    `mapstructure:"pong_wait_seconds"`
+	WriteTimeoutSeconds                    int    `mapstructure:"write_timeout_seconds"`
+	MaxMissedPongs                         int    `mapstructure:"max_missed_pongs"`
+	SessionTTLSeconds                      int    `mapstructure:"session_ttl_seconds"`
+	RouteTTLSeconds                        int    `mapstructure:"route_ttl_seconds"`
+	TTLRefreshIntervalSeconds              int    `mapstructure:"ttl_refresh_interval_seconds"`
+	NATSMaxAckPending                      int    `mapstructure:"nats_max_ack_pending"`
+	SessionLockRetryDelayMs                int    `mapstructure:"session_lock_retry_delay_ms"`
+	NatsAckWaitSeconds                     int    `mapstructure:"nats_ack_wait_seconds"`
+	GRPCCLientForwardTimeoutSeconds        int    `mapstructure:"grpc_client_forward_timeout_seconds"`
+	ReadTimeoutSeconds                     int    `mapstructure:"read_timeout_seconds"`
+	IdleTimeoutSeconds                     int    `mapstructure:"idle_timeout_seconds"`
+	WebsocketCompressionMode               string `mapstructure:"websocket_compression_mode"`
+	WebsocketCompressionThreshold          int    `mapstructure:"websocket_compression_threshold"`
+	WebsocketDevelopmentInsecureSkipVerify bool   `mapstructure:"websocket_development_insecure_skip_verify"`
 }
 type Config struct {
 	Server ServerConfig `mapstructure:"server"`
@@ -3502,7 +3637,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 		cleanup()
 		return nil, nil, err
 	}
-	handlerFunc := GenerateTokenHandlerProvider(provider, domainLogger)
+	companyUserTokenGenerateHandler := GenerateTokenHandlerProvider(provider, domainLogger)
+	adminUserTokenGenerateHandler := GenerateAdminTokenHandlerProvider(provider, domainLogger)
 	tokenGenerationMiddleware := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
@@ -3517,7 +3653,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler)
+	conn := NatsConnectionProvider(consumerAdapter)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()
@@ -3538,6 +3675,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 package bootstrap
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -3545,6 +3683,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
@@ -3573,8 +3712,50 @@ func (a *App) Run(ctx context.Context) error {
 	readyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.logger.Info(r.Context(), "Readiness check endpoint hit")
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, `{"status":"READY"}`)
+		ready := true
+		dependenciesStatus := make(map[string]string)
+		if a.natsConn != nil {
+			if a.natsConn.Status() == nats.CONNECTED {
+				dependenciesStatus["nats"] = "connected"
+			} else {
+				dependenciesStatus["nats"] = "disconnected"
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check failed: NATS disconnected", "status", a.natsConn.Status().String())
+			}
+		} else {
+			dependenciesStatus["nats"] = "not_configured"
+			ready = false
+			a.logger.Warn(r.Context(), "Readiness check failed: NATS client not configured in App struct")
+		}
+		if a.redisClient != nil {
+			if err := a.redisClient.Ping(r.Context()).Err(); err == nil {
+				dependenciesStatus["redis"] = "connected"
+			} else {
+				dependenciesStatus["redis"] = "disconnected"
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check failed: Redis ping failed", "error", err.Error())
+			}
+		} else {
+			dependenciesStatus["redis"] = "not_configured"
+			ready = false
+			a.logger.Warn(r.Context(), "Readiness check failed: Redis client not configured in App struct")
+		}
+		response := struct {
+			Status       string            `json:"status"`
+			Dependencies map[string]string `json:"dependencies"`
+		}{
+			Dependencies: dependenciesStatus,
+		}
+		if ready {
+			response.Status = "READY"
+			w.WriteHeader(http.StatusOK)
+		} else {
+			response.Status = "NOT_READY"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			a.logger.Error(r.Context(), "Failed to encode readiness response", "error", err)
+		}
 	})
 	a.httpServeMux.Handle("GET /ready", middleware.RequestIDMiddleware(readyHandler))
 	a.httpServeMux.Handle("GET /metrics", middleware.RequestIDMiddleware(promhttp.Handler()))
@@ -3585,7 +3766,8 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Warn(ctx, "WebSocket router is not initialized. WebSocket routes will not be available.")
 	}
 	if a.generateTokenHandler != nil && a.tokenGenerationMiddleware != nil {
-		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(a.generateTokenHandler))
+		handlerToWrap := http.HandlerFunc(a.generateTokenHandler)
+		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(handlerToWrap))
 		a.httpServeMux.Handle("POST /generate-token", finalGenerateTokenHandler)
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {
@@ -3685,9 +3867,12 @@ import (
 	wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"github.com/nats-io/nats.go"
 )
 type TokenGenerationMiddleware func(http.Handler) http.Handler
 type AdminAuthMiddleware func(http.Handler) http.Handler
+type CompanyUserTokenGenerateHandler http.HandlerFunc
+type AdminUserTokenGenerateHandler http.HandlerFunc
 func InitialZapLoggerProvider() (*zap.Logger, func(), error) {
 	logger, err := zap.NewProduction()
 	if err != nil {
@@ -3710,13 +3895,16 @@ type App struct {
 	httpServeMux              *http.ServeMux
 	httpServer                *http.Server
 	grpcServer                *appgrpc.Server
-	generateTokenHandler      http.HandlerFunc
-	tokenGenerationMiddleware func(http.Handler) http.Handler
+	generateTokenHandler      CompanyUserTokenGenerateHandler
+	generateAdminTokenHandler AdminUserTokenGenerateHandler
+	tokenGenerationMiddleware TokenGenerationMiddleware
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
 	natsConsumerAdapter       *appnats.ConsumerAdapter
 	adminAuthMiddleware       AdminAuthMiddleware
 	adminWsHandler            *wsadapter.AdminHandler
+	natsConn                  *nats.Conn
+	redisClient               *redis.Client
 }
 func NewApp(
 	cfgProvider config.Provider,
@@ -3724,13 +3912,16 @@ func NewApp(
 	mux *http.ServeMux,
 	server *http.Server,
 	grpcSrv *appgrpc.Server,
-	genTokenHandler http.HandlerFunc,
+	genTokenHandler CompanyUserTokenGenerateHandler,
+	genAdminTokenHandler AdminUserTokenGenerateHandler,
 	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
 	natsAdapter *appnats.ConsumerAdapter,
 	adminAuthMid AdminAuthMiddleware,
 	adminHandler *wsadapter.AdminHandler,
+	natsConn *nats.Conn,
+	redisClient *redis.Client,
 ) (*App, func(), error) {
 	app := &App{
 		configProvider:            cfgProvider,
@@ -3739,12 +3930,15 @@ func NewApp(
 		httpServer:                server,
 		grpcServer:                grpcSrv,
 		generateTokenHandler:      genTokenHandler,
+		generateAdminTokenHandler: genAdminTokenHandler,
 		tokenGenerationMiddleware: tokenGenMiddleware,
 		wsRouter:                  wsRouter,
 		connectionManager:         connManager,
 		natsConsumerAdapter:       natsAdapter,
 		adminAuthMiddleware:       adminAuthMid,
 		adminWsHandler:            adminHandler,
+		natsConn:                  natsConn,
+		redisClient:               redisClient,
 	}
 	cleanup := func() {
 		app.logger.Info(context.Background(), "Running app cleanup...")
@@ -3771,11 +3965,18 @@ func HTTPServeMuxProvider() *http.ServeMux {
 }
 func HTTPGracefulServerProvider(cfgProvider config.Provider, mux *http.ServeMux) *http.Server {
 	appCfg := cfgProvider.Get()
+	appServerCfg := appCfg.App
 	readTimeout := 10 * time.Second
 	writeTimeout := 10 * time.Second
 	idleTimeout := 60 * time.Second
-	if appCfg.App.WriteTimeoutSeconds > 0 {
-		writeTimeout = time.Duration(appCfg.App.WriteTimeoutSeconds) * time.Second
+	if appServerCfg.ReadTimeoutSeconds > 0 {
+		readTimeout = time.Duration(appServerCfg.ReadTimeoutSeconds) * time.Second
+	}
+	if appServerCfg.WriteTimeoutSeconds > 0 {
+		writeTimeout = time.Duration(appServerCfg.WriteTimeoutSeconds) * time.Second
+	}
+	if appServerCfg.IdleTimeoutSeconds > 0 {
+		idleTimeout = time.Duration(appServerCfg.IdleTimeoutSeconds) * time.Second
 	}
 	return &http.Server{
 		Addr:         fmt.Sprintf(":%d", appCfg.Server.HTTPPort),
@@ -3785,8 +3986,11 @@ func HTTPGracefulServerProvider(cfgProvider config.Provider, mux *http.ServeMux)
 		IdleTimeout:  idleTimeout,
 	}
 }
-func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
-	return apphttp.GenerateTokenHandler(cfgProvider, logger)
+func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) CompanyUserTokenGenerateHandler {
+	return CompanyUserTokenGenerateHandler(apphttp.GenerateTokenHandler(cfgProvider, logger))
+}
+func GenerateAdminTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) AdminUserTokenGenerateHandler {
+	return AdminUserTokenGenerateHandler(apphttp.GenerateAdminTokenHandler(cfgProvider, logger))
 }
 func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) TokenGenerationMiddleware {
 	return middleware.TokenGenerationAuthMiddleware(cfgProvider, logger)
@@ -3842,8 +4046,7 @@ func ConnectionManagerProvider(
 	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub, routeRegistry)
 }
 func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.TokenCacheStore {
-	logger.Warn(context.Background(), "TokenCacheStoreProvider is using a placeholder nil implementation. Actual Redis-backed cache store needs to be implemented.")
-	return nil
+	return appredis.NewTokenCacheAdapter(redisClient, logger)
 }
 func AdminTokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.AdminTokenCacheStore {
 	return appredis.NewAdminTokenCacheAdapter(redisClient, logger)
@@ -3860,6 +4063,12 @@ func GRPCMessageHandlerProvider(logger domain.Logger, connManager *application.C
 func GRPCServerProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider, grpcHandler *application.GRPCMessageHandler) (*appgrpc.Server, error) {
 	return appgrpc.NewServer(appCtx, logger, cfgProvider, grpcHandler)
 }
+func NatsConnectionProvider(adapter *appnats.ConsumerAdapter) *nats.Conn {
+	if adapter == nil {
+		return nil
+	}
+	return adapter.NatsConn()
+}
 var ProviderSet = wire.NewSet(
 	ConfigProvider,
 	LoggerProvider,
@@ -3867,6 +4076,7 @@ var ProviderSet = wire.NewSet(
 	HTTPGracefulServerProvider,
 	InitialZapLoggerProvider,
 	GenerateTokenHandlerProvider,
+	GenerateAdminTokenHandlerProvider,
 	TokenGenerationAuthMiddlewareProvider,
 	WebsocketHandlerProvider,
 	WebsocketRouterProvider,
@@ -3886,6 +4096,7 @@ var ProviderSet = wire.NewSet(
 	RouteRegistryProvider,
 	NewApp,
 	NatsConsumerAdapterProvider,
+	NatsConnectionProvider,
 )
 ```
 
@@ -3899,6 +4110,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
@@ -3925,6 +4137,7 @@ type Handler struct {
 	configProvider config.Provider
 	connManager    *application.ConnectionManager
 	natsAdapter    *appnats.ConsumerAdapter
+	grpcClientPool *sync.Map
 }
 func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *Handler {
 	return &Handler{
@@ -3932,6 +4145,7 @@ func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *
 		configProvider: cfgProvider,
 		connManager:    connManager,
 		natsAdapter:    natsAdapter,
+		grpcClientPool: &sync.Map{},
 	}
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -3988,6 +4202,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger.Info(r.Context(), "Session lock successfully acquired, proceeding to WebSocket upgrade", "sessionKey", sessionKey)
 	var wrappedConn *Connection
 	startTime := time.Now()
+	appSpecificConfig := h.configProvider.Get().App
 	opts := websocket.AcceptOptions{
 		Subprotocols: []string{"json.v1"},
 		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
@@ -3996,6 +4211,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				wrappedConn.UpdateLastPongTime()
 			}
 		},
+	}
+	switch strings.ToLower(appSpecificConfig.WebsocketCompressionMode) {
+	case "context_takeover":
+		opts.CompressionMode = websocket.CompressionContextTakeover
+		h.logger.Info(r.Context(), "WebSocket compression enabled: context_takeover")
+	case "no_context_takeover":
+		opts.CompressionMode = websocket.CompressionNoContextTakeover
+		h.logger.Info(r.Context(), "WebSocket compression enabled: no_context_takeover")
+	case "disabled":
+		opts.CompressionMode = websocket.CompressionDisabled
+		h.logger.Info(r.Context(), "WebSocket compression disabled by configuration.")
+	default:
+		opts.CompressionMode = websocket.CompressionDisabled
+		h.logger.Warn(r.Context(), "Invalid WebSocket compression mode in config, defaulting to disabled.", "configured_mode", appSpecificConfig.WebsocketCompressionMode)
+	}
+	if opts.CompressionMode != websocket.CompressionDisabled {
+		opts.CompressionThreshold = appSpecificConfig.WebsocketCompressionThreshold
+		h.logger.Info(r.Context(), "WebSocket compression threshold set", "threshold_bytes", opts.CompressionThreshold)
+	}
+	if appSpecificConfig.WebsocketDevelopmentInsecureSkipVerify {
+		opts.InsecureSkipVerify = true
+		h.logger.Warn(r.Context(), "WebSocket InsecureSkipVerify ENABLED for development. DO NOT USE IN PRODUCTION.")
 	}
 	c, err := websocket.Accept(w, r, &opts)
 	if err != nil {
@@ -4061,9 +4298,49 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	}
 	metrics.IncrementMessagesSent(domain.MessageTypeReady)
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
-	var currentNatsSubscription *nats.Subscription
-	var currentSubscriptionChatID string
-	natsMessageHandler := func(msg *nats.Msg) {
+	var generalNatsSubscription *nats.Subscription
+	var specificNatsSubscription *nats.Subscription
+	var currentSpecificChatID string
+	generalChatEventsNatsHandler := func(msg *nats.Msg) {
+		metrics.IncrementNatsMessagesReceived(msg.Subject)
+		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
+		if natsRequestID == "" {
+			natsRequestID = uuid.NewString()
+		}
+		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
+		h.logger.Info(msgCtx, "Received general chat event from NATS", "subject", msg.Subject, "data_len", len(msg.Data))
+		var eventPayload domain.EnrichedEventPayload
+		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
+			h.logger.Error(msgCtx, "Failed to unmarshal general chat event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
+			_ = msg.Ack()
+			return
+		}
+		wsMessage := domain.NewEventMessage(eventPayload)
+		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
+			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
+		} else {
+			metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+		}
+		_ = msg.Ack()
+	}
+	if h.natsAdapter != nil {
+		var subErr error
+		generalNatsSubscription, subErr = h.natsAdapter.SubscribeToChats(connCtx, companyID, agentID, generalChatEventsNatsHandler)
+		if subErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to general NATS chats topic", "companyID", companyID, "agentID", agentID, "error", subErr.Error())
+			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to chat updates", subErr.Error())
+			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
+				h.logger.Error(connCtx, "Failed to send NATS subscription error to client for general chats", "error", sendErr.Error())
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeError)
+			}
+		} else {
+			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject)
+		}
+	} else {
+		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general chat events.")
+	}
+	specificChatNatsMessageHandler := func(msg *nats.Msg) {
 		metrics.IncrementNatsMessagesReceived(msg.Subject)
 		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
 		if natsRequestID == "" {
@@ -4130,18 +4407,36 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop.",
 				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
 			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
-				// TODO: FR-8B - Implement proper pod address resolution (e.g., from K8s service discovery or config map)
-				// For Kubernetes, this often involves using a headless service and internal DNS:
-				// e.g., targetService := fmt.Sprintf("%s.%s.svc.cluster.local", ownerPodID, "your-headless-service-name")
 				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
 				h.logger.Info(msgCtx, "Attempting to forward message via gRPC", "target_address", gprcTargetAddress)
-				connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-				grpcConn, errClient := grpc.NewClient(gprcTargetAddress, connOpts...)
+				var grpcConn *grpc.ClientConn
+				var errClient error
+				var connFromPool bool
+				if connVal, okPool := h.grpcClientPool.Load(gprcTargetAddress); okPool {
+					grpcConn, connFromPool = connVal.(*grpc.ClientConn)
+					if !connFromPool {
+						h.logger.Error(msgCtx, "Invalid type in gRPC client pool, removing entry.", "target_address", gprcTargetAddress, "type", fmt.Sprintf("%T", connVal))
+						h.grpcClientPool.Delete(gprcTargetAddress)
+						grpcConn = nil
+					} else {
+						h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress)
+					}
+				}
+				if grpcConn == nil {
+					h.logger.Info(msgCtx, "Creating new gRPC client connection", "target_address", gprcTargetAddress)
+					connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+					newlyCreatedConn, newErrClient := grpc.NewClient(gprcTargetAddress, connOpts...)
+					if newErrClient == nil {
+						grpcConn = newlyCreatedConn
+						h.grpcClientPool.Store(gprcTargetAddress, grpcConn)
+					} else {
+						errClient = newErrClient
+					}
+				}
 				if errClient != nil {
-					h.logger.Error(msgCtx, "Failed to connect to gRPC service on owner pod",
+					h.logger.Error(msgCtx, "Failed to establish gRPC connection to owner pod",
 						"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errClient.Error())
-				} else {
-					defer grpcConn.Close()
+				} else if grpcConn != nil {
 					client := dws_message_fwd.NewMessageForwardingServiceClient(grpcConn)
 					var domainPayload domain.EnrichedEventPayload
 					if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
@@ -4165,45 +4460,29 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 								SourcePodId:     currentPodID,
 							}
 							md := metadata.New(nil)
-							if reqID, ok := msgCtx.Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+							if reqID, okCtxVal := msgCtx.Value(contextkeys.RequestIDKey).(string); okCtxVal && reqID != "" {
 								md.Set(string(contextkeys.RequestIDKey), reqID)
 							}
 							pushCtxWithMetadata := metadata.NewOutgoingContext(msgCtx, md)
-							// Use configured timeout, defaulting if necessary
 							grpcClientTimeoutSeconds := h.configProvider.Get().App.GRPCCLientForwardTimeoutSeconds
-							grpcClientTimeout := 5 * time.Second // Default timeout
+							grpcClientTimeout := 5 * time.Second
 							if grpcClientTimeoutSeconds > 0 {
 								grpcClientTimeout = time.Duration(grpcClientTimeoutSeconds) * time.Second
-								h.logger.Debug(msgCtx, "Using configured gRPC client forward timeout", "seconds", grpcClientTimeoutSeconds)
-							} else {
-								h.logger.Debug(msgCtx, "Using default gRPC client forward timeout", "seconds", grpcClientTimeout.Seconds())
 							}
 							pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
 							resp, errPush := client.PushEvent(pushCtx, grpcRequest)
 							pushCancel()
 							if errPush != nil {
-								h.logger.Warn(msgCtx, "Initial gRPC PushEvent to owner pod failed, preparing to retry...",
-									"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error())
-								time.Sleep(200 * time.Millisecond)
-								h.logger.Info(msgCtx, "Retrying gRPC PushEvent...", "target_pod", ownerPodID)
-								pushRetryCtx, pushRetryCancel := context.WithTimeout(msgCtx, grpcClientTimeout)
-								resp, errPush = client.PushEvent(pushRetryCtx, grpcRequest)
-								pushRetryCancel()
-								if errPush != nil {
-									h.logger.Error(msgCtx, "Retry gRPC PushEvent to owner pod also failed",
-										"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error())
-								} else if resp != nil && !resp.Success {
-									h.logger.Warn(msgCtx, "Retry gRPC PushEvent to owner pod was not successful",
-										"target_pod", ownerPodID, "response_message", resp.Message)
-								} else if resp != nil && resp.Success {
-									h.logger.Info(msgCtx, "Successfully forwarded message via gRPC on retry", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
-									metrics.IncrementGrpcMessagesSent(ownerPodID)
+								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod failed", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
+								if connFromPool {
+									h.grpcClientPool.Delete(gprcTargetAddress)
+									grpcConn.Close()
+									h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool", "target_address", gprcTargetAddress)
 								}
 							} else if resp != nil && !resp.Success {
-								h.logger.Warn(msgCtx, "Initial gRPC PushEvent to owner pod was not successful",
-									"target_pod", ownerPodID, "response_message", resp.Message)
+								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
 							} else if resp != nil && resp.Success {
-								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC on initial attempt", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
+								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC", "target_pod", ownerPodID, "event_id", domainPayload.EventID, "is_pooled_conn", connFromPool)
 								metrics.IncrementGrpcMessagesSent(ownerPodID)
 							}
 						}
@@ -4218,10 +4497,16 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		}
 	}
 	defer func() {
-		if currentNatsSubscription != nil {
-			h.logger.Info(connCtx, "Draining current NATS subscription on connection close", "subject", currentNatsSubscription.Subject, "chatID", currentSubscriptionChatID)
-			if unsubErr := currentNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining NATS subscription on close", "subject", currentNatsSubscription.Subject, "error", unsubErr.Error())
+		if generalNatsSubscription != nil {
+			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject)
+			if unsubErr := generalNatsSubscription.Drain(); unsubErr != nil {
+				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject, "error", unsubErr.Error())
+			}
+		}
+		if specificNatsSubscription != nil {
+			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject, "chatID", currentSpecificChatID)
+			if unsubErr := specificNatsSubscription.Drain(); unsubErr != nil {
+				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject, "error", unsubErr.Error())
 			}
 		}
 	}()
@@ -4313,7 +4598,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			switch baseMsg.Type {
 			case domain.MessageTypeSelectChat:
 				h.logger.Info(connCtx, "Handling select_chat message type")
-				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload, natsMessageHandler, currentNatsSubscription)
+				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
 				if err != nil {
 					h.logger.Error(connCtx, "Error handling select_chat message", "error", err.Error())
 					errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to process chat selection", err.Error())
@@ -4323,8 +4608,9 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 						metrics.IncrementMessagesSent(domain.MessageTypeError)
 					}
 				} else {
-					currentNatsSubscription = newSub
-					currentSubscriptionChatID = newChatID
+					generalNatsSubscription = nil
+					specificNatsSubscription = newSub
+					currentSpecificChatID = newChatID
 				}
 			default:
 				h.logger.Warn(connCtx, "Handling unknown message type", "type", baseMsg.Type)
@@ -4341,8 +4627,10 @@ func (h *Handler) handleSelectChatMessage(
 	rawPayload []byte,
 	companyID, agentID, userID string,
 	payloadData interface{},
-	natsMsgHandler nats.MsgHandler,
-	currentSub *nats.Subscription,
+	specificChatNatsMsgHandler nats.MsgHandler,
+	currentGeneralSub *nats.Subscription,
+	currentSpecificSub *nats.Subscription,
+	currentSpecificSubChatID string,
 ) (*nats.Subscription, string, error) {
 	payloadMap, ok := payloadData.(map[string]interface{})
 	if !ok {
@@ -4353,7 +4641,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("invalid payload structure")
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("invalid payload structure")
 	}
 	chatIDInterface, found := payloadMap["chat_id"]
 	if !found {
@@ -4364,7 +4652,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("chat_id missing from payload")
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("chat_id missing from payload")
 	}
 	chatID, ok := chatIDInterface.(string)
 	if !ok || chatID == "" {
@@ -4375,7 +4663,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("invalid chat_id type or empty")
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("invalid chat_id type or empty")
 	}
 	h.logger.Info(connCtx, "Client selected chat", "chat_id", chatID, "company", companyID, "agent", agentID, "user", userID)
 	cfg := h.configProvider.Get()
@@ -4393,7 +4681,7 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("podID is not configured")
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("podID is not configured")
 	}
 	routeReg := h.connManager.RouteRegistrar()
 	if routeReg == nil {
@@ -4404,12 +4692,12 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, conn.GetCurrentChatID(), fmt.Errorf("routeRegistry is nil")
+		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("routeRegistry is nil")
 	}
 	oldChatID := conn.GetCurrentChatID()
 	if oldChatID == chatID {
 		h.logger.Info(connCtx, "Client selected the same chat_id, no changes to routes or NATS subscription needed.", "chatID", chatID)
-		return currentSub, chatID, nil
+		return currentSpecificSub, chatID, nil
 	}
 	if oldChatID != "" {
 		h.logger.Info(connCtx, "Unregistering old message route", "oldChatID", oldChatID, "podID", podID)
@@ -4432,20 +4720,26 @@ func (h *Handler) handleSelectChatMessage(
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSub, oldChatID, fmt.Errorf("failed to register new message route: %w", err)
+		return currentSpecificSub, oldChatID, fmt.Errorf("failed to register new message route: %w", err)
 	}
 	h.logger.Info(connCtx, "Successfully registered new message route", "newChatID", chatID)
-	if currentSub != nil && oldChatID != "" { // oldChatID check ensures we only drain if there was a specific previous sub
-		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", oldChatID, "subject", currentSub.Subject)
-		if err := currentSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain old NATS subscription", "old_chat_id", oldChatID, "subject", currentSub.Subject, "error", err.Error())
+	if currentGeneralSub != nil {
+		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject)
+		if err := currentGeneralSub.Drain(); err != nil {
+			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject, "error", err.Error())
 		}
 	}
-	var newSubscription *nats.Subscription
+	if currentSpecificSub != nil && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID {
+		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject)
+		if err := currentSpecificSub.Drain(); err != nil {
+			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject, "error", err.Error())
+		}
+	}
+	var newSpecificSubscription *nats.Subscription
 	var newSubErr error
 	if h.natsAdapter != nil {
 		h.logger.Info(connCtx, "Subscribing to NATS for new chat_id", "companyID", companyID, "agentID", agentID, "new_chat_id", chatID)
-		newSubscription, newSubErr = h.natsAdapter.SubscribeToChatMessages(connCtx, companyID, agentID, chatID, natsMsgHandler)
+		newSpecificSubscription, newSubErr = h.natsAdapter.SubscribeToChatMessages(connCtx, companyID, agentID, chatID, specificChatNatsMsgHandler)
 		if newSubErr != nil {
 			h.logger.Error(connCtx, "Failed to subscribe to NATS for new chat messages",
 				"companyID", companyID, "agentID", agentID, "new_chat_id", chatID, "error", newSubErr.Error(),
@@ -4457,15 +4751,15 @@ func (h *Handler) handleSelectChatMessage(
 				metrics.IncrementMessagesSent(domain.MessageTypeError)
 			}
 			conn.SetCurrentChatID(oldChatID)
-			return currentSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
+			return currentSpecificSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
 		}
-		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSubscription.Subject)
+		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject)
 	} else {
 		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to new chat messages.", "new_chat_id", chatID)
 	}
 	conn.SetCurrentChatID(chatID)
 	h.logger.Info(connCtx, "Updated current chat ID for connection", "newChatID", chatID)
-	return newSubscription, chatID, nil
+	return newSpecificSubscription, chatID, nil
 }
 func (h *Handler) handleUnknownMessage(connCtx context.Context, conn *Connection, baseMsg domain.BaseMessage) {
 	h.logger.Warn(connCtx, "Received unhandled message type from client", "type", baseMsg.Type)
