@@ -19,6 +19,8 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 
 	"github.com/coder/websocket"
+	"github.com/nats-io/nats.go"
+	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 )
 
 // Handler handles WebSocket connection upgrades and subsequent communication.
@@ -26,15 +28,17 @@ type Handler struct {
 	logger         domain.Logger
 	configProvider config.Provider
 	connManager    *application.ConnectionManager
+	natsAdapter    *appnats.ConsumerAdapter
 	// Future dependencies: connectionManager domain.ConnectionManager
 }
 
 // NewHandler creates a new WebSocket Handler.
-func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager) *Handler {
+func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *Handler {
 	return &Handler{
 		logger:         logger,
 		configProvider: cfgProvider,
 		connManager:    connManager,
+		natsAdapter:    natsAdapter,
 	}
 }
 
@@ -213,6 +217,73 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		return // Close connection via defer
 	}
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
+
+	// NATS Subscription (Subtask 6.2)
+	var natsSubscription *nats.Subscription
+	if h.natsAdapter != nil {
+		// Define the message handler for NATS messages
+		natsMsgHandler := func(msg *nats.Msg) {
+			// Implement Subtask 6.3: Parse EnrichedEventPayload and forward to WebSocket client
+			h.logger.Info(connCtx, "Received NATS message", "subject", msg.Subject, "data_len", len(msg.Data))
+
+			var eventPayload domain.EnrichedEventPayload // Using placeholder from domain/nats_payloads.go
+			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
+				h.logger.Error(connCtx, "Failed to unmarshal NATS message into EnrichedEventPayload",
+					"subject", msg.Subject, "error", err.Error(), "raw_data", string(msg.Data)) // Log raw data for debugging
+				// Ack message even if unmarshalling fails to prevent redelivery of bad messages.
+				// Alternatively, could Nack or let it timeout if redelivery of malformed messages is desired for some reason.
+				if ackErr := msg.Ack(); ackErr != nil {
+					h.logger.Error(connCtx, "Failed to ACK NATS message after unmarshal error", "subject", msg.Subject, "error", ackErr.Error())
+				}
+				return
+			}
+
+			// Construct the WebSocket message
+			wsMessage := NewEventMessage(eventPayload) // NewEventMessage is in websocket/protocol.go
+
+			if err := conn.WriteJSON(wsMessage); err != nil {
+				h.logger.Error(connCtx, "Failed to forward NATS message to WebSocket client",
+					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", err.Error(),
+				)
+				// If writing to WebSocket fails, the connection might be dead.
+				// The NATS message should probably not be acked here, to allow redelivery if the consumer (this pod/ws connection)
+				// dies before processing. However, if the message is "processed" by attempting a send,
+				// and the failure is WS-specific, acking might be okay to prevent re-processing by a *new* session for this user.
+				// For now, let's try to ack. If the issue is persistent, the message might be acked without reaching client.
+				// A more robust solution might involve dead-letter queues or more sophisticated retry logic.
+			}
+
+			// Ack the NATS message after processing (or attempting to process)
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(connCtx, "Failed to ACK NATS message after processing", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", ackErr.Error())
+			}
+		}
+
+		var subErr error
+		natsSubscription, subErr = h.natsAdapter.SubscribeToChats(connCtx, companyID, agentID, natsMsgHandler)
+		if subErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to NATS chat subject",
+				"companyID", companyID, "agentID", agentID, "error", subErr.Error(),
+			)
+			// Decide if this is fatal for the WS connection. For now, log and continue without NATS.
+			// Alternatively, close the WS connection with an error.
+			// conn.WriteJSON(NewErrorMessage(domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to backend events.", subErr.Error())))
+			// conn.Close(websocket.StatusInternalError, "Subscription failure")
+			// return
+		} else {
+			h.logger.Info(connCtx, "Successfully subscribed to NATS chat subject", "companyID", companyID, "agentID", agentID)
+			defer func() {
+				if natsSubscription != nil {
+					h.logger.Info(connCtx, "Unsubscribing from NATS chat subject", "subject", natsSubscription.Subject)
+					if unsubErr := natsSubscription.Drain(); unsubErr != nil { // Drain is preferred for graceful unsubscribe
+						h.logger.Error(connCtx, "Error draining NATS subscription", "subject", natsSubscription.Subject, "error", unsubErr.Error())
+					}
+				}
+			}()
+		}
+	} else {
+		h.logger.Warn(connCtx, "NATS adapter is not available, cannot subscribe to chat events.")
+	}
 
 	appCfg := conn.config
 	pingInterval := time.Duration(appCfg.PingIntervalSeconds) * time.Second

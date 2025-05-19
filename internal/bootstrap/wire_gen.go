@@ -33,7 +33,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	serveMux := HTTPServeMuxProvider()
 	server := HTTPGracefulServerProvider(provider, serveMux)
 	handlerFunc := GenerateTokenHandlerProvider(provider, domainLogger)
-	v := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
+	tokenGenerationMiddleware := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
 	client, cleanup2, err := RedisClientProvider(provider, domainLogger)
 	if err != nil {
 		cleanup()
@@ -44,15 +44,23 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
 	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
 	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager)
-	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
-	app, cleanup3, err := NewApp(provider, domainLogger, serveMux, server, handlerFunc, v, router, connectionManager)
+	consumerAdapter, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger)
 	if err != nil {
 		cleanup2()
 		cleanup()
 		return nil, nil, err
 	}
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
+	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter)
+	if err != nil {
+		cleanup3()
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
 	return app, func() {
+		cleanup4()
 		cleanup3()
 		cleanup2()
 		cleanup()

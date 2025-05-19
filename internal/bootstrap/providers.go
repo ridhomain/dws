@@ -19,13 +19,16 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/logger"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 
-	// appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats" // Temporarily commented out
+	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 	wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	// "gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys" // Not directly used in this file
 )
+
+// Define distinct types for middlewares to help Wire differentiate them
+type TokenGenerationMiddleware func(http.Handler) http.Handler
 
 // InitialZapLoggerProvider provides a basic *zap.Logger instance, primarily for config initialization.
 // It returns the logger, a cleanup function (for syncing), and an error if creation fails.
@@ -67,6 +70,7 @@ type App struct {
 	tokenGenerationMiddleware func(http.Handler) http.Handler // Specific middleware for /generate-token
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
+	natsConsumerAdapter       *appnats.ConsumerAdapter // Added NATS Consumer Adapter
 	// natsCleanup            func() // Temporarily commented out
 }
 
@@ -78,10 +82,10 @@ func NewApp(
 	mux *http.ServeMux,
 	server *http.Server,
 	genTokenHandler http.HandlerFunc,
-	tokenGenMiddleware func(http.Handler) http.Handler,
+	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
-	// natsCleanup func(), // Temporarily commented out if NATS provider returns it
+	natsAdapter *appnats.ConsumerAdapter, // Added NATS Consumer Adapter
 ) (*App, func(), error) { // Assuming a top-level cleanup for App
 	app := &App{
 		configProvider:            cfgProvider,
@@ -92,20 +96,18 @@ func NewApp(
 		tokenGenerationMiddleware: tokenGenMiddleware,
 		wsRouter:                  wsRouter,
 		connectionManager:         connManager,
-		// natsCleanup:            natsCleanup,
+		natsConsumerAdapter:       natsAdapter,
 	}
 
 	// Consolidated cleanup function for the App
+	// Wire will aggregate cleanup functions from providers like NatsConsumerAdapterProvider.
+	// This explicit cleanup can be simplified or removed if all cleanups are provider-based.
 	cleanup := func() {
 		app.logger.Info(context.Background(), "Running app cleanup...")
-		// if app.natsCleanup != nil {
-		// 	app.natsCleanup()
-		// }
 		if app.connectionManager != nil {
 			app.connectionManager.StopKillSwitchListener()
 			app.connectionManager.StopSessionRenewalLoop()
 		}
-		// Add other cleanup tasks from providers if they return them directly to NewApp
 	}
 	return app, cleanup, nil
 }
@@ -158,14 +160,15 @@ func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Log
 }
 
 // TokenGenerationAuthMiddlewareProvider Provider
-func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
+func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) TokenGenerationMiddleware {
 	// Corrected: Pass the cfgProvider directly, the middleware will extract the key.
 	return middleware.TokenGenerationAuthMiddleware(cfgProvider, logger)
 }
 
 // WebsocketHandlerProvider provides the websocket handler.
-func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager) *wsadapter.Handler {
-	return wsadapter.NewHandler(logger, cfgProvider, connManager)
+// Now also takes NatsConsumerAdapter as a dependency.
+func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *wsadapter.Handler {
+	return wsadapter.NewHandler(logger, cfgProvider, connManager, natsAdapter)
 }
 
 // WebsocketRouterProvider provides the websocket router.
@@ -228,6 +231,11 @@ func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) do
 	return nil
 }
 
+// NatsConsumerAdapterProvider provides the NATS ConsumerAdapter.
+func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (*appnats.ConsumerAdapter, func(), error) {
+	return appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger)
+}
+
 // ProviderSet is the Wire provider set for the entire application.
 var ProviderSet = wire.NewSet(
 	ConfigProvider,
@@ -266,4 +274,5 @@ var ProviderSet = wire.NewSet(
 	ConnectionManagerProvider,
 
 	NewApp,
+	NatsConsumerAdapterProvider,
 )

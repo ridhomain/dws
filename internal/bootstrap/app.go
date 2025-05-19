@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	// Imports for App struct fields if defined here, but App struct is in providers.go
 	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -50,6 +51,10 @@ func (a *App) Run(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, `{"status":"READY"}`)
 	})
+
+	// Register Prometheus metrics handler
+	a.httpServeMux.Handle("GET /metrics", promhttp.Handler())
+	a.logger.Info(ctx, "Prometheus metrics endpoint registered at /metrics")
 
 	if a.wsRouter != nil {
 		a.wsRouter.RegisterRoutes(ctx, a.httpServeMux)
@@ -101,6 +106,14 @@ func (a *App) Run(ctx context.Context) error {
 			a.connectionManager.StopKillSwitchListener()
 			a.connectionManager.StopSessionRenewalLoop()
 		}
+
+		// Call NATS cleanup if available - This is now handled by Wire's aggregated cleanup.
+		// if a.natsCleanup != nil { // natsCleanup is no longer part of App struct
+		// 	a.logger.Info(context.Background(), "Calling NATS cleanup...")
+		// 	a.natsCleanup()
+		// } else {
+		// 	a.logger.Info(context.Background(), "NATS cleanup function not available.")
+		// }
 
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
 			a.logger.Error(context.Background(), "HTTP server graceful shutdown failed", "error", err.Error())

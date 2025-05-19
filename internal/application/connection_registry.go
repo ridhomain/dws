@@ -3,12 +3,14 @@ package application
 import (
 	"context"
 
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 )
 
 // RegisterConnection stores an active connection associated with a session key.
 func (cm *ConnectionManager) RegisterConnection(sessionKey string, conn domain.ManagedConnection) {
 	cm.activeConnections.Store(sessionKey, conn)
+	metrics.IncrementActiveConnections()
 	cm.logger.Info(conn.Context(), "WebSocket connection registered with ConnectionManager", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr())
 }
 
@@ -18,6 +20,7 @@ func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 	logCtx := context.Background() // Base context if connection-specific context is not available
 
 	if loaded {
+		metrics.DecrementActiveConnections()
 		if managedConn, ok := connVal.(domain.ManagedConnection); ok {
 			logCtx = managedConn.Context() // Use connection's context if available
 			cm.logger.Info(logCtx, "WebSocket connection deregistered from ConnectionManager", "sessionKey", sessionKey, "remoteAddr", managedConn.RemoteAddr())
