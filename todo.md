@@ -5,10 +5,6 @@
 - Add production hardening to HTTP server (ReadTimeout, WriteTimeout, IdleTimeout).
 - Add cleanup for other resources (NATS, Redis, gRPC server) during graceful shutdown.
 
-## General
-- Build and run Docker image to test `Dockerfile` and application execution (deferred from Subtask 1.2).
-- Test `/health` and `/ready` endpoints and log output (deferred from Subtask 1.4).
-
 ## `internal/adapters/websocket/handler.go`
 - TODO: (From code comment) Later, the `AuthenticatedUserContext` from `CompanyTokenAuthMiddleware` should be retrieved and utilized within `ServeHTTP` and `manageConnection` for more detailed logging, context-aware operations, and passing user details to NATS subscription logic.
 - TODO: (FR-9B from code comment) Add WebSocket compression options to `websocket.AcceptOptions` based on application configuration.

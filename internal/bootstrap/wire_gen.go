@@ -63,7 +63,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler)
+	conn := NatsConnectionProvider(consumerAdapter)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()

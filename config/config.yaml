@@ -52,5 +52,10 @@ app:
   session_lock_retry_delay_ms: 250
   nats_ack_wait_seconds: 30
   grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
+  read_timeout_seconds: 10    # Added for HTTP server
+  idle_timeout_seconds: 60    # Added for HTTP server
+  websocket_compression_mode: "disabled"  # Options: disabled, context_takeover, no_context_takeover
+  websocket_compression_threshold: 1024   # Bytes, applies if mode is not disabled. 0 means no threshold.
+  websocket_development_insecure_skip_verify: false # Set to true for local dev with self-signed certs ONLY
 
 # Config holds all configuration for the application. 

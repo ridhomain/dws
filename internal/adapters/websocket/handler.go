@@ -135,9 +135,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var wrappedConn *Connection // Declare wrappedConn here to be accessible for OnPongReceived
 	startTime := time.Now()     // For connection duration metric
 
+	appSpecificConfig := h.configProvider.Get().App
+
 	opts := websocket.AcceptOptions{
 		Subprotocols: []string{"json.v1"},
-		// TODO (FR-9B): Add Compression options if defined in config
 		// TODO (FR-9B): Consider InsecureSkipVerify for local dev if using self-signed certs, controlled by config.
 		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
 			if wrappedConn != nil {
@@ -145,6 +146,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				wrappedConn.UpdateLastPongTime()
 			}
 		},
+	}
+
+	switch strings.ToLower(appSpecificConfig.WebsocketCompressionMode) {
+	case "context_takeover":
+		opts.CompressionMode = websocket.CompressionContextTakeover
+		h.logger.Info(r.Context(), "WebSocket compression enabled: context_takeover")
+	case "no_context_takeover":
+		opts.CompressionMode = websocket.CompressionNoContextTakeover
+		h.logger.Info(r.Context(), "WebSocket compression enabled: no_context_takeover")
+	case "disabled":
+		opts.CompressionMode = websocket.CompressionDisabled
+		h.logger.Info(r.Context(), "WebSocket compression disabled by configuration.")
+	default:
+		opts.CompressionMode = websocket.CompressionDisabled // Default to disabled if invalid config value
+		h.logger.Warn(r.Context(), "Invalid WebSocket compression mode in config, defaulting to disabled.", "configured_mode", appSpecificConfig.WebsocketCompressionMode)
+	}
+
+	if opts.CompressionMode != websocket.CompressionDisabled {
+		opts.CompressionThreshold = appSpecificConfig.WebsocketCompressionThreshold
+		h.logger.Info(r.Context(), "WebSocket compression threshold set", "threshold_bytes", opts.CompressionThreshold)
+	}
+
+	if appSpecificConfig.WebsocketDevelopmentInsecureSkipVerify {
+		opts.InsecureSkipVerify = true
+		h.logger.Warn(r.Context(), "WebSocket InsecureSkipVerify ENABLED for development. DO NOT USE IN PRODUCTION.")
 	}
 
 	c, err := websocket.Accept(w, r, &opts)

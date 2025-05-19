@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
@@ -52,8 +54,60 @@ func (a *App) Run(ctx context.Context) error {
 	readyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.logger.Info(r.Context(), "Readiness check endpoint hit")
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, `{"status":"READY"}`)
+
+		ready := true
+		dependenciesStatus := make(map[string]string)
+
+		// Check NATS connection
+		if a.natsConn != nil {
+			if a.natsConn.Status() == nats.CONNECTED {
+				dependenciesStatus["nats"] = "connected"
+			} else {
+				dependenciesStatus["nats"] = "disconnected"
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check failed: NATS disconnected", "status", a.natsConn.Status().String())
+			}
+		} else {
+			dependenciesStatus["nats"] = "not_configured"
+			ready = false
+			a.logger.Warn(r.Context(), "Readiness check failed: NATS client not configured in App struct")
+		}
+
+		// Check Redis connection
+		if a.redisClient != nil {
+			if err := a.redisClient.Ping(r.Context()).Err(); err == nil {
+				dependenciesStatus["redis"] = "connected"
+			} else {
+				dependenciesStatus["redis"] = "disconnected"
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check failed: Redis ping failed", "error", err.Error())
+			}
+		} else {
+			dependenciesStatus["redis"] = "not_configured"
+			ready = false
+			a.logger.Warn(r.Context(), "Readiness check failed: Redis client not configured in App struct")
+		}
+
+		// TODO: Add other checks like gRPC server health if applicable in the future
+
+		response := struct {
+			Status       string            `json:"status"`
+			Dependencies map[string]string `json:"dependencies"`
+		}{
+			Dependencies: dependenciesStatus,
+		}
+
+		if ready {
+			response.Status = "READY"
+			w.WriteHeader(http.StatusOK)
+		} else {
+			response.Status = "NOT_READY"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			a.logger.Error(r.Context(), "Failed to encode readiness response", "error", err)
+		}
 	})
 	a.httpServeMux.Handle("GET /ready", middleware.RequestIDMiddleware(readyHandler))
 

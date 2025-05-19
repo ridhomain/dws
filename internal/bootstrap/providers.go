@@ -25,7 +25,9 @@ import (
 	wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+
 	// "gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys" // Not directly used in this file
+	"github.com/nats-io/nats.go"
 )
 
 // Define distinct types for middlewares to help Wire differentiate them
@@ -76,6 +78,8 @@ type App struct {
 	natsConsumerAdapter       *appnats.ConsumerAdapter // Added NATS Consumer Adapter
 	adminAuthMiddleware       AdminAuthMiddleware      // Middleware for /ws/admin
 	adminWsHandler            *wsadapter.AdminHandler  // Handler for /ws/admin
+	natsConn                  *nats.Conn               // Added for readiness check
+	redisClient               *redis.Client            // Added for readiness check
 	// natsCleanup            func() // Temporarily commented out
 }
 
@@ -94,6 +98,8 @@ func NewApp(
 	natsAdapter *appnats.ConsumerAdapter, // Added NATS Consumer Adapter
 	adminAuthMid AdminAuthMiddleware, // Added AdminAuthMiddleware
 	adminHandler *wsadapter.AdminHandler, // Added AdminHandler
+	natsConn *nats.Conn, // Added for readiness check
+	redisClient *redis.Client, // Added for readiness check
 ) (*App, func(), error) { // Assuming a top-level cleanup for App
 	app := &App{
 		configProvider:            cfgProvider,
@@ -108,6 +114,8 @@ func NewApp(
 		natsConsumerAdapter:       natsAdapter,
 		adminAuthMiddleware:       adminAuthMid,
 		adminWsHandler:            adminHandler,
+		natsConn:                  natsConn,    // Initialize
+		redisClient:               redisClient, // Initialize
 	}
 
 	// Consolidated cleanup function for the App
@@ -148,20 +156,24 @@ func HTTPServeMuxProvider() *http.ServeMux {
 // HTTPGracefulServerProvider provides a new HTTP server configured for graceful shutdown.
 func HTTPGracefulServerProvider(cfgProvider config.Provider, mux *http.ServeMux) *http.Server {
 	appCfg := cfgProvider.Get()
+	appServerCfg := appCfg.App // Corrected to use App struct for these values
 
-	// TODO: Add ReadTimeoutSeconds and IdleTimeoutSeconds to config.AppConfig and use them here.
-	// Using hardcoded defaults for Read and Idle timeouts as they are not in AppConfig.
-	// WriteTimeoutSeconds is available in AppConfig.
-	readTimeout := 10 * time.Second  // Default read timeout
-	writeTimeout := 10 * time.Second // Default write timeout (fallback)
-	idleTimeout := 60 * time.Second  // Default idle timeout
+	readTimeout := 10 * time.Second
+	writeTimeout := 10 * time.Second
+	idleTimeout := 60 * time.Second
 
-	if appCfg.App.WriteTimeoutSeconds > 0 {
-		writeTimeout = time.Duration(appCfg.App.WriteTimeoutSeconds) * time.Second
+	if appServerCfg.ReadTimeoutSeconds > 0 {
+		readTimeout = time.Duration(appServerCfg.ReadTimeoutSeconds) * time.Second
+	}
+	if appServerCfg.WriteTimeoutSeconds > 0 {
+		writeTimeout = time.Duration(appServerCfg.WriteTimeoutSeconds) * time.Second
+	}
+	if appServerCfg.IdleTimeoutSeconds > 0 {
+		idleTimeout = time.Duration(appServerCfg.IdleTimeoutSeconds) * time.Second
 	}
 
 	return &http.Server{
-		Addr:         fmt.Sprintf(":%d", appCfg.Server.HTTPPort), // Use HTTPPort from ServerConfig
+		Addr:         fmt.Sprintf(":%d", appCfg.Server.HTTPPort),
 		Handler:      mux,
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
@@ -282,6 +294,14 @@ func GRPCServerProvider(appCtx context.Context, logger domain.Logger, cfgProvide
 	return appgrpc.NewServer(appCtx, logger, cfgProvider, grpcHandler)
 }
 
+// Provider for *nats.Conn from NatsConsumerAdapter
+func NatsConnectionProvider(adapter *appnats.ConsumerAdapter) *nats.Conn {
+	if adapter == nil {
+		return nil
+	}
+	return adapter.NatsConn()
+}
+
 // ProviderSet is the Wire provider set for the entire application.
 var ProviderSet = wire.NewSet(
 	ConfigProvider,
@@ -326,4 +346,5 @@ var ProviderSet = wire.NewSet(
 	RouteRegistryProvider,         // Added RouteRegistryProvider
 	NewApp,
 	NatsConsumerAdapterProvider,
+	NatsConnectionProvider, // Added NatsConnectionProvider
 )

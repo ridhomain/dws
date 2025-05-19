@@ -56,20 +56,25 @@ type AuthConfig struct {
 
 // AppConfig holds application-specific configurations.
 type AppConfig struct {
-	ServiceName                     string `mapstructure:"service_name"`
-	Version                         string `mapstructure:"version"`
-	PingIntervalSeconds             int    `mapstructure:"ping_interval_seconds"`
-	ShutdownTimeoutSeconds          int    `mapstructure:"shutdown_timeout_seconds"`
-	PongWaitSeconds                 int    `mapstructure:"pong_wait_seconds"`
-	WriteTimeoutSeconds             int    `mapstructure:"write_timeout_seconds"`
-	MaxMissedPongs                  int    `mapstructure:"max_missed_pongs"`
-	SessionTTLSeconds               int    `mapstructure:"session_ttl_seconds"`
-	RouteTTLSeconds                 int    `mapstructure:"route_ttl_seconds"`
-	TTLRefreshIntervalSeconds       int    `mapstructure:"ttl_refresh_interval_seconds"`
-	NATSMaxAckPending               int    `mapstructure:"nats_max_ack_pending"`
-	SessionLockRetryDelayMs         int    `mapstructure:"session_lock_retry_delay_ms"`
-	NatsAckWaitSeconds              int    `mapstructure:"nats_ack_wait_seconds"`
-	GRPCCLientForwardTimeoutSeconds int    `mapstructure:"grpc_client_forward_timeout_seconds"`
+	ServiceName                            string `mapstructure:"service_name"`
+	Version                                string `mapstructure:"version"`
+	PingIntervalSeconds                    int    `mapstructure:"ping_interval_seconds"`
+	ShutdownTimeoutSeconds                 int    `mapstructure:"shutdown_timeout_seconds"`
+	PongWaitSeconds                        int    `mapstructure:"pong_wait_seconds"`
+	WriteTimeoutSeconds                    int    `mapstructure:"write_timeout_seconds"`
+	MaxMissedPongs                         int    `mapstructure:"max_missed_pongs"`
+	SessionTTLSeconds                      int    `mapstructure:"session_ttl_seconds"`
+	RouteTTLSeconds                        int    `mapstructure:"route_ttl_seconds"`
+	TTLRefreshIntervalSeconds              int    `mapstructure:"ttl_refresh_interval_seconds"`
+	NATSMaxAckPending                      int    `mapstructure:"nats_max_ack_pending"`
+	SessionLockRetryDelayMs                int    `mapstructure:"session_lock_retry_delay_ms"`
+	NatsAckWaitSeconds                     int    `mapstructure:"nats_ack_wait_seconds"`
+	GRPCCLientForwardTimeoutSeconds        int    `mapstructure:"grpc_client_forward_timeout_seconds"`
+	ReadTimeoutSeconds                     int    `mapstructure:"read_timeout_seconds"`
+	IdleTimeoutSeconds                     int    `mapstructure:"idle_timeout_seconds"`
+	WebsocketCompressionMode               string `mapstructure:"websocket_compression_mode"`                 // Added for WebSocket compression
+	WebsocketCompressionThreshold          int    `mapstructure:"websocket_compression_threshold"`            // Added for WebSocket compression (bytes)
+	WebsocketDevelopmentInsecureSkipVerify bool   `mapstructure:"websocket_development_insecure_skip_verify"` // Added for local dev with self-signed certs
 }
 
 // Config holds all configuration for the application.
