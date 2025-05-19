@@ -38,13 +38,14 @@ func (r *Router) RegisterRoutes(ctx context.Context, mux *http.ServeMux) {
 	// Chain of middleware: APIKeyAuth -> CompanyTokenAuth -> wsHandler
 	apiKeyAuthedHandler := middleware.APIKeyAuthMiddleware(r.configProvider, r.logger)(r.wsHandler)
 	companyTokenAuthedHandler := middleware.CompanyTokenAuthMiddleware(r.authService, r.logger)(apiKeyAuthedHandler)
+	finalHandlerWithRequestID := middleware.RequestIDMiddleware(companyTokenAuthedHandler)
 
 	// Go 1.22+ http.ServeMux supports path parameters.
 	// The pattern "GET /ws/{company}/{agent}" will match GET requests to /ws/somecompany/someagent
 	// The path parameters {company} and {agent} can be accessed via r.PathValue("company") and r.PathValue("agent")
 	// within the final handler (wsHandler) or an intermediate middleware if needed.
-	mux.Handle("GET /ws/{company}/{agent}", companyTokenAuthedHandler)
+	mux.Handle("GET /ws/{company}/{agent}", finalHandlerWithRequestID)
 
 	// Using context.Background() for general info log not tied to a specific request.
-	r.logger.Info(ctx, "WebSocket endpoint registered with API Key and Company Token authentication", "pattern", "GET /ws/{company}/{agent}")
+	r.logger.Info(ctx, "WebSocket endpoint registered with RequestID, API Key and Company Token authentication", "pattern", "GET /ws/{company}/{agent}")
 }

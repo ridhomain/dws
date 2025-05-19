@@ -15,6 +15,7 @@ import (
 	// "github.com/nats-io/nats.go" // Temporarily commented out
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	appgrpc "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc" // Added for gRPC Server
 	apphttp "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/http"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/logger"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
@@ -67,6 +68,7 @@ type App struct {
 	logger                    domain.Logger
 	httpServeMux              *http.ServeMux
 	httpServer                *http.Server
+	grpcServer                *appgrpc.Server // Added gRPC Server
 	generateTokenHandler      http.HandlerFunc
 	tokenGenerationMiddleware func(http.Handler) http.Handler // Specific middleware for /generate-token
 	wsRouter                  *wsadapter.Router
@@ -84,6 +86,7 @@ func NewApp(
 	appLogger domain.Logger,
 	mux *http.ServeMux,
 	server *http.Server,
+	grpcSrv *appgrpc.Server, // Added gRPC Server
 	genTokenHandler http.HandlerFunc,
 	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
@@ -97,6 +100,7 @@ func NewApp(
 		logger:                    appLogger,
 		httpServeMux:              mux,
 		httpServer:                server,
+		grpcServer:                grpcSrv, // Added gRPC Server
 		generateTokenHandler:      genTokenHandler,
 		tokenGenerationMiddleware: tokenGenMiddleware,
 		wsRouter:                  wsRouter,
@@ -113,7 +117,11 @@ func NewApp(
 		app.logger.Info(context.Background(), "Running app cleanup...")
 		if app.connectionManager != nil {
 			app.connectionManager.StopKillSwitchListener()
-			app.connectionManager.StopSessionRenewalLoop()
+			app.connectionManager.StopResourceRenewalLoop()
+		}
+		if app.grpcServer != nil {
+			app.logger.Info(context.Background(), "Stopping gRPC server during app cleanup...")
+			app.grpcServer.GracefulStop() // Or app.grpcServer.Stop() if immediate is needed
 		}
 	}
 	return app, cleanup, nil
@@ -255,13 +263,23 @@ func AdminTokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logge
 }
 
 // NatsConsumerAdapterProvider provides the NATS ConsumerAdapter.
-func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (*appnats.ConsumerAdapter, func(), error) {
-	return appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger)
+func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger, routeRegistry domain.RouteRegistry) (*appnats.ConsumerAdapter, func(), error) {
+	return appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger, routeRegistry)
 }
 
 // Provider for RouteRegistry
 func RouteRegistryProvider(redisClient *redis.Client, logger domain.Logger) domain.RouteRegistry {
 	return appredis.NewRouteRegistryAdapter(redisClient, logger)
+}
+
+// Provider for GRPCMessageHandler
+func GRPCMessageHandlerProvider(logger domain.Logger, connManager *application.ConnectionManager) *application.GRPCMessageHandler {
+	return application.NewGRPCMessageHandler(logger, connManager)
+}
+
+// Provider for gRPC Server
+func GRPCServerProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider, grpcHandler *application.GRPCMessageHandler) (*appgrpc.Server, error) {
+	return appgrpc.NewServer(appCtx, logger, cfgProvider, grpcHandler)
 }
 
 // ProviderSet is the Wire provider set for the entire application.
@@ -300,6 +318,8 @@ var ProviderSet = wire.NewSet(
 	// Application Services
 	AuthServiceProvider, // This is the one to keep
 	ConnectionManagerProvider,
+	GRPCMessageHandlerProvider,    // Added gRPC Message Handler Provider
+	GRPCServerProvider,            // Added gRPC Server Provider
 	AdminAuthMiddlewareProvider,   // Added for admin auth
 	AdminWebsocketHandlerProvider, // Added for admin websocket
 	AdminTokenCacheStoreProvider,  // Added for admin token caching

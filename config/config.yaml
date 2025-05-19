@@ -40,5 +40,6 @@ app:
   ttl_refresh_interval_seconds: 10
   nats_max_ack_pending: 5000
   session_lock_retry_delay_ms: 250 # Delay in milliseconds for session lock retry
+  nats_ack_wait_seconds: 30 # Default NATS AckWait in seconds
 
 # Config holds all configuration for the application. 

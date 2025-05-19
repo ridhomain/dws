@@ -32,20 +32,28 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	serveMux := HTTPServeMuxProvider()
 	server := HTTPGracefulServerProvider(provider, serveMux)
-	handlerFunc := GenerateTokenHandlerProvider(provider, domainLogger)
-	tokenGenerationMiddleware := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
 	client, cleanup2, err := RedisClientProvider(provider, domainLogger)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
+	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
+	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
+	routeRegistry := RouteRegistryProvider(client, domainLogger)
+	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter, routeRegistry)
+	grpcMessageHandler := GRPCMessageHandlerProvider(domainLogger, connectionManager)
+	grpcServer, err := GRPCServerProvider(ctx, domainLogger, provider, grpcMessageHandler)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	handlerFunc := GenerateTokenHandlerProvider(provider, domainLogger)
+	tokenGenerationMiddleware := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
-	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
-	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
-	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
-	consumerAdapter, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger)
+	consumerAdapter, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger, routeRegistry)
 	if err != nil {
 		cleanup2()
 		cleanup()
@@ -55,7 +63,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler)
 	if err != nil {
 		cleanup3()
 		cleanup2()

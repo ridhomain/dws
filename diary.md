@@ -515,6 +515,120 @@ All subtasks for Task 6 are now complete.
 
 All subtasks for Task 7 are complete. The service now dynamically manages route registrations in Redis based on client chat selections and connection lifecycle, with periodic TTL refresh.
 
+## Task 11: Implement Graceful Drain and NATS Back-pressure - COMPLETED - 2025-05-19 22:49:06 (GMT+7)
+
+- **Subtask 11.1: Implement SIGTERM Signal Handler - COMPLETED**
+    - Verified existing signal listener in `internal/bootstrap/app.go` handles SIGTERM and initiates graceful shutdown.
+- **Subtask 11.2: Implement WebSocket Connection Management (for shutdown) - COMPLETED**
+    - Added `GracefullyCloseAllConnections(closeCode websocket.StatusCode, reason string)` method to `ConnectionManager` (`internal/application/connection_registry.go`).
+    - This method is called from `App.Run` shutdown sequence in `internal/bootstrap/app.go` to send a specific close code (1001 - StatusGoingAway) to all active WebSocket connections.
+    - `StatusGoingAway` constant defined in `internal/domain/websocket_protocol.go`.
+- **Subtask 11.3: Implement NATS JetStream Consumer Drain - COMPLETED**
+    - Verified that `NatsConsumerAdapterProvider`'s cleanup function calls `NatsConsumerAdapter.Close()`, which performs `nc.Drain()`. This is managed by Wire's aggregated cleanup during application shutdown.
+- **Subtask 11.4: Configure NATS Consumer for Explicit ACKs and Back-pressure - COMPLETED**
+    - Added `NatsAckWaitSeconds` to `AppConfig` and `config.yaml`.
+    - Updated `internal/adapters/nats/consumer.go` to use this configurable `AckWait` duration in all `QueueSubscribe` calls.
+    - Confirmed `ManualAck` and `MaxAckPending` are already in use and configurable.
+- **Subtask 11.5: Implement Resource Cleanup and Monitoring - COMPLETED (partially, monitoring pending)**
+    - HTTP server shutdown and Redis client closure are handled by existing logic and Wire cleanups.
+    - JetStream lag monitoring aspect is covered by a TODO from Task 10.5, pending clarification.
+
+**Overall Task 11 Status:** Graceful shutdown mechanisms for SIGTERM, WebSocket connections, and NATS consumers are implemented or verified. NATS consumer configuration for ACKs and back-pressure is enhanced.
+
+## Task 10: Implement Comprehensive Prometheus Metrics & Tracing - COMPLETED - 2025-05-19 22:44:17 (GMT+7)
+
+- **Subtask 10.1: Implement Connection Metrics - COMPLETED**
+    - Added to `internal/adapters/metrics/prometheus_adapter.go`:
+        - `dws_connections_total`: Counter for successful WebSocket handshakes.
+        - `dws_connection_duration_seconds`: Histogram for WebSocket connection durations.
+        - `dws_messages_received_total`: CounterVec for messages from clients (partitioned by type).
+        - `dws_messages_sent_total`: CounterVec for messages to clients (partitioned by type).
+    - Integrated these metrics into `internal/adapters/websocket/handler.go` and `admin_handler.go` at appropriate points (connection setup/teardown, message read/write).
+
+- **Subtask 10.2: Implement Authentication and Session Metrics - COMPLETED**
+    - Added to `internal/adapters/metrics/prometheus_adapter.go`:
+        - `dws_auth_success_total`: CounterVec for successful token validations (partitioned by token_type: company, admin).
+        - `dws_auth_failure_total`: CounterVec for failed token validations (partitioned by token_type, reason).
+        - `dws_session_conflicts_total`: CounterVec for session conflicts (partitioned by user_type: user, admin).
+    - Integrated these metrics into:
+        - `internal/adapters/middleware/auth.go` (CompanyTokenAuthMiddleware) for company token auth success/failure.
+        - `internal/adapters/middleware/admin_auth.go` (AdminAuthMiddleware) for admin token auth success/failure.
+        - `internal/adapters/websocket/handler.go` and `admin_handler.go` for session conflicts.
+
+- **Subtask 10.3: Implement Fanout Metrics - COMPLETED**
+    - Added to `internal/adapters/metrics/prometheus_adapter.go`:
+        - `dws_nats_messages_received_total`: CounterVec for messages received from NATS (partitioned by NATS subject).
+        - `dws_grpc_messages_sent_total`: CounterVec for messages forwarded via gRPC (partitioned by target_pod_id).
+        - `dws_grpc_messages_received_total`: CounterVec for messages received via gRPC (partitioned by source_pod_id).
+    - Modified `internal/adapters/grpc/proto/dws_message_fwd.proto` to include `source_pod_id` in `PushEventRequest` and regenerated gRPC code.
+    - Integrated these metrics into:
+        - `internal/adapters/websocket/handler.go` (`natsMessageHandler`): Increments NATS received and gRPC sent metrics. Includes `source_pod_id` in gRPC requests.
+        - `internal/adapters/websocket/admin_handler.go` (`natsMsgHandler`): Increments NATS received metrics.
+        - `internal/application/grpc_handler.go` (`PushEvent`): Increments gRPC received metrics using `source_pod_id` from request.
+
+- **Subtask 10.4: Implement Request ID Propagation - PARTIALLY COMPLETED**
+    - Created `RequestIDMiddleware` in `internal/adapters/middleware/context.go` to inject/generate `request_id` for HTTP requests.
+    - Applied `RequestIDMiddleware` to HTTP handlers in `internal/bootstrap/app.go`.
+    - Updated `internal/adapters/websocket/router.go` to ensure `RequestIDMiddleware` wraps the main WebSocket endpoint handler chain.
+    - Modified gRPC client call in `websocket/handler.go` to send `request_id` from context via gRPC metadata.
+    - Modified gRPC server handler in `application/grpc_handler.go` to extract `request_id` from metadata and add to its logging context.
+    - TODO: Still need to implement `request_id` extraction/generation for NATS messages consumed and ensure it's used in the context for subsequent operations (like gRPC calls triggered by NATS).
+
+- **Subtask 10.5: Configure JetStream Lag Awareness - NOT IMPLEMENTED (Clarification Needed)**
+    - The requirement for this service to be "aware" of `jetstream_lag_seconds` needs clarification. It typically means the HPA scales based on this metric (exposed by NATS or a NATS exporter), not that this service must produce it.
+    - Added a TODO to clarify if this service needs to expose a custom metric for NATS lag.
+
+**Overall Task 10 Status:** Core metrics for connections, auth, sessions, and basic fanout are implemented. Request ID propagation is enhanced for HTTP and gRPC flows. NATS request ID handling and JetStream lag metric responsibility require further clarification/implementation.
+
+## Task 9: Implement TTL Refresh Loop - COMPLETED (Covered by Task 5 & 7) - 2025-05-19 22:32:35 (GMT+7)
+
+- Verified that the functionality described in Task 9 ("Implement TTL Refresh Loop for Session and Route Keys") was already implemented as part of Task 5.5 and Task 7.5.
+- The `StartResourceRenewalLoop` method in `internal/application/session_renewal.go` periodically iterates through active connections (user and admin), refreshes their session locks, general chat route keys, and specific message route keys in Redis using the current `podID` and configured TTLs.
+- This existing implementation covers all subtasks of Task 9.
+- Marked Task 9 as 'done' in Task Master.
+
+## Task 8: Per-Thread Message Fan-Out & gRPC Hop - COMPLETED - 2025-05-19 22:31:15 (GMT+7)
+
+- **Subtask 8.1: Update NATS Consumer to Route Messages by Ownership - COMPLETED**
+    - `internal/adapters/nats/consumer.go`:
+        - Added `RouteRegistry` and `config.Provider` dependencies to `ConsumerAdapter` and exported them.
+        - Implemented `SubscribeToChatMessages` for specific message threads (`wa.<C>.<A>.messages.<chatID>`).
+        - Exported `ParseNATSMessageSubject` helper.
+    - `internal/bootstrap/providers.go`: Updated `NatsConsumerAdapterProvider`.
+    - `internal/adapters/websocket/handler.go` (`manageConnection`, `handleSelectChatMessage`):
+        - Integrated logic to switch NATS subscriptions to specific chat message threads.
+        - `natsMessageHandler` now uses `appnats.ParseNATSMessageSubject` and `h.natsAdapter.RouteRegistry.GetOwningPodForMessageRoute` for ownership checks.
+    - Moved WebSocket protocol definitions from `adapters/websocket/protocol.go` to `domain/websocket_protocol.go` to resolve import cycles. Updated all references.
+    - Ensured `go generate ./...` runs successfully after DI changes.
+
+- **Subtask 8.2: Implement Local Message Delivery for Owner Pod - COMPLETED**
+    - In `internal/adapters/websocket/handler.go` (`natsMessageHandler`):
+        - If the current pod is the owner, the NATS message (`EnrichedEventPayload`) is unmarshalled and forwarded to the local WebSocket client.
+        - Refined ownership check logic, particularly for `ErrNoOwningPod` scenarios (with a TODO FR-8A for further review).
+
+- **Subtask 8.3: Forward Messages via gRPC to Owner Pod(s) When Not Owner - COMPLETED**
+    - `internal/adapters/grpc/proto/dws_message_fwd.proto`: Defined `MessageForwardingService` with `PushEvent` RPC and associated messages.
+    - Generated Go code from the `.proto` file (user confirmed `protoc` setup).
+    - `internal/adapters/websocket/handler.go` (`natsMessageHandler`):
+        - Added gRPC client logic to forward `EnrichedEventPayload` to the owner pod via `PushEvent` RPC if the current pod is not the owner.
+        - Includes translation from `domain.EnrichedEventPayload` to `proto.EnrichedEventPayloadMessage`.
+        - Added TODOs for pod address resolution (FR-8B), gRPC client pooling/reuse, and mTLS (FR-8C).
+
+- **Subtask 8.4: Develop gRPC Server for Receiving Forwarded Messages - COMPLETED**
+    - `internal/application/grpc_handler.go`: Implemented `GRPCMessageHandler` with `PushEvent` method to receive forwarded messages. This handler finds the local WebSocket connection based on target identifiers and forwards the message.
+    - `internal/adapters/grpc/server.go`: Created gRPC server setup, which registers `GRPCMessageHandler` and starts listening on the configured gRPC port. Includes basic graceful shutdown logic tied to context cancellation.
+    - `internal/bootstrap/providers.go`: Added DI providers for `GRPCMessageHandler` and `appgrpc.Server`.
+    - `internal/bootstrap/app.go`: Integrated gRPC server startup into `App.Run()`.
+    - Ensured `go generate ./...` runs successfully after DI changes.
+    - Added TODOs for mTLS (FR-8D) and gRPC reflection in `server.go`.
+
+- **Subtask 8.5: Implement Retry and Logging for gRPC Forwarding Failures - COMPLETED**
+    - `internal/adapters/websocket/handler.go` (`natsMessageHandler`):
+        - Added logic to retry gRPC `PushEvent` once after a short delay if the initial attempt fails.
+        - Ensured relevant logging for gRPC forwarding attempts, successes, and failures (leveraging existing logger context propagation).
+
+**Overall Task 8 Status:** All subtasks are addressed. The core fan-out logic (local delivery or gRPC hop based on Redis ownership) is in place. Key areas for future enhancement are marked with TODOs (mTLS, pod discovery, gRPC client pooling, robust error handling for orphaned NATS messages).
+
 ## Task 12: Admin WebSocket & Agent Event Streaming - COMPLETED - 2025-05-19 20:24:26 (GMT+7)
 
 **Task 12: Implement Admin WebSocket for Agent Table Events - COMPLETED**

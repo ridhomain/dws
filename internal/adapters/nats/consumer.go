@@ -3,11 +3,13 @@ package nats
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 )
 
 // ConsumerAdapter handles connections and subscriptions to NATS JetStream.
@@ -15,18 +17,24 @@ type ConsumerAdapter struct {
 	nc                *nats.Conn
 	js                nats.JetStreamContext
 	logger            domain.Logger
-	cfg               *config.NATSConfig
+	cfgProvider       config.Provider
+	RouteRegistry     domain.RouteRegistry
 	appName           string
 	natsMaxAckPending int // Added to store this specific config value
 }
 
 // NewConsumerAdapter creates a new NATS ConsumerAdapter.
 // It establishes a connection to the NATS server and gets a JetStream context.
-func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (*ConsumerAdapter, func(), error) {
+func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger, routeRegistry domain.RouteRegistry) (*ConsumerAdapter, func(), error) {
 	appFullCfg := cfgProvider.Get()
 	natsCfg := appFullCfg.NATS
 	appName := appFullCfg.App.ServiceName
 	natsMaxAckPending := appFullCfg.App.NATSMaxAckPending // Get from AppConfig
+	natsAckWaitSeconds := appFullCfg.App.NatsAckWaitSeconds
+	if natsAckWaitSeconds <= 0 {
+		natsAckWaitSeconds = 30 // Default if not configured or invalid
+		appLogger.Warn(ctx, "NatsAckWaitSeconds not configured or invalid, defaulting to 30s")
+	}
 
 	appLogger.Info(ctx, "Attempting to connect to NATS server", "url", natsCfg.URL)
 
@@ -70,7 +78,8 @@ func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLog
 		nc:                nc,
 		js:                js,
 		logger:            appLogger,
-		cfg:               &natsCfg,
+		cfgProvider:       cfgProvider,
+		RouteRegistry:     routeRegistry,
 		appName:           appName,
 		natsMaxAckPending: natsMaxAckPending, // Store it
 	}
@@ -121,8 +130,8 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"stream_name", a.cfg.StreamName,
-		"consumer_name", a.cfg.ConsumerName,
+		"stream_name", a.cfgProvider.Get().NATS.StreamName,
+		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName,
 	)
 
 	// Durable name for the consumer, incorporating company and agent to make it unique per subscription instance if needed,
@@ -131,22 +140,21 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	// might want its own consumer state if not purely for load balancing. Given the task description suggests
 	// "ws_fanout" as the group, it implies load balancing or shared consumption. Let's use a durable name based on group.
 	// The PRD (FR-5) specifies a consumer `ws_fanout` for stream `wa_stream`.
-	durableName := a.cfg.ConsumerName // From config, e.g., "ws_fanout_consumer"
+	durableName := a.cfgProvider.Get().NATS.ConsumerName // From config, e.g., "ws_fanout_consumer"
+	ackWait := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second // Fallback default
+	}
 
 	sub, err := a.js.QueueSubscribe(
 		subject,
 		queueGroup,
 		handler, // The message handler function passed in
 		nats.Durable(durableName),
-		nats.DeliverAll(),            // DeliverPolicy=All
-		nats.ManualAck(),             // We will manually ack messages
-		nats.AckWait(30*time.Second), // Example: Ack wait time, should be configurable
-		// TODO: Add MaxAckPending from config (a.cfg.NATSMaxAckPending)
-		// nats.MaxAckPending(a.cfg.NATSMaxAckPending) -> This config is for App, not NATSConfig directly.
-		// It should be in appFullCfg.App.NATSMaxAckPending
-		// For now, let's use a default or retrieve it correctly.
+		nats.DeliverAll(), // DeliverPolicy=All
+		nats.ManualAck(),  // We will manually ack messages
+		nats.AckWait(ackWait),
 		nats.MaxAckPending(a.natsMaxAckPending), // Use the stored value
-		// nats.MaxDeliver(), // Consider setting max redeliveries
 	)
 
 	if err != nil {
@@ -168,6 +176,80 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	return sub, nil
 }
 
+// SubscribeToChatMessages subscribes to specific chat message subjects (e.g., wa.<company>.<agent>.messages.<chat_id>).
+// The provided handler is responsible for processing messages, including ownership checks.
+func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler nats.MsgHandler) (*nats.Subscription, error) {
+	if a.js == nil {
+		return nil, fmt.Errorf("JetStream context is not initialized")
+	}
+
+	subject := rediskeys.RouteKeyMessages(companyID, agentID, chatID) // This generates "route:..." which is not a NATS subject
+	// Correct NATS subject format:
+	subject = fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
+
+	// Use the same queue group and consumer name as SubscribeToChats for now,
+	// as these messages are part of the overall fanout strategy.
+	queueGroup := "ws_fanout"
+	durableName := a.cfgProvider.Get().NATS.ConsumerName // ws_fanout_consumer or similar
+	ackWaitMessages := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
+	if ackWaitMessages <= 0 {
+		ackWaitMessages = 30 * time.Second // Fallback default
+	}
+
+	a.logger.Info(ctx, "Attempting to subscribe to NATS chat messages subject",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName,
+	)
+
+	sub, err := a.js.QueueSubscribe(
+		subject,
+		queueGroup,
+		handler,
+		nats.Durable(durableName+"_messages"), // Ensure durable name is unique per type of subscription if needed or managed carefully
+		nats.DeliverAll(),
+		nats.ManualAck(),
+		nats.AckWait(ackWaitMessages),
+		nats.MaxAckPending(a.natsMaxAckPending),
+	)
+
+	if err != nil {
+		a.logger.Error(ctx, "Failed to subscribe to NATS chat messages subject",
+			"subject", subject,
+			"queue_group", queueGroup,
+			"durable_name", durableName+"_messages",
+			"error", err.Error(),
+		)
+		return nil, fmt.Errorf("failed to subscribe to NATS chat messages subject %s: %w", subject, err)
+	}
+
+	a.logger.Info(ctx, "Successfully subscribed to NATS chat messages subject",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName+"_messages",
+	)
+	return sub, nil
+}
+
+// Helper function to parse NATS subject for message streams
+// Example subject: wa.comp1.agentA.messages.chatXYZ
+func ParseNATSMessageSubject(subject string) (companyID, agentID, chatID string, err error) {
+	parts := strings.Split(subject, ".")
+	// Expected: "wa", "<companyID>", "<agentID>", "messages", "<chatID>"
+	if len(parts) != 5 || parts[0] != "wa" || parts[3] != "messages" {
+		err = fmt.Errorf("invalid NATS message subject format: %s", subject)
+		return
+	}
+	companyID = parts[1]
+	agentID = parts[2]
+	chatID = parts[4]
+	if companyID == "" || agentID == "" || chatID == "" {
+		err = fmt.Errorf("empty companyID, agentID, or chatID in NATS subject: %s", subject)
+		return
+	}
+	return
+}
+
 // SubscribeToAgentEvents subscribes to the agent events for a specific company and agent pattern.
 // It uses QueueSubscribe with DeliverAllPolicy and ManualAckPolicy.
 // The provided nats.MsgHandler will be called for each received message.
@@ -187,12 +269,16 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"stream_name", a.cfg.StreamName,
-		"consumer_name", a.cfg.ConsumerName, // Assuming same consumer config base name
+		"stream_name", a.cfgProvider.Get().NATS.StreamName,
+		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName, // Assuming same consumer config base name
 	)
 
-	durableName := a.cfg.ConsumerName // Re-using the main consumer name for durability configuration.
+	durableName := a.cfgProvider.Get().NATS.ConsumerName // Re-using the main consumer name for durability configuration.
 	// If admin subscriptions need a different durable name strategy, this needs adjustment.
+	ackWaitAdmin := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
+	if ackWaitAdmin <= 0 {
+		ackWaitAdmin = 30 * time.Second // Fallback default
+	}
 
 	sub, err := a.js.QueueSubscribe(
 		subject,
@@ -201,7 +287,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		nats.Durable(durableName+"_admin_agents"), // Make durable name distinct for this type of subscription to avoid conflicts if same base consumer name is used.
 		nats.DeliverAll(),
 		nats.ManualAck(),
-		nats.AckWait(30*time.Second),            // TODO: Make configurable if different from main chats
+		nats.AckWait(ackWaitAdmin),
 		nats.MaxAckPending(a.natsMaxAckPending), // Reuse existing config for MaxAckPending
 	)
 

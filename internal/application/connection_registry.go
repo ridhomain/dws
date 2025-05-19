@@ -2,8 +2,10 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 )
@@ -76,4 +78,29 @@ func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 	} else {
 		cm.logger.Debug(logCtx, "Attempted to deregister a connection not found in map", "sessionKey", sessionKey)
 	}
+}
+
+// GracefullyCloseAllConnections iterates over all active connections, sends a close frame,
+// and logs the action. It's intended to be called during graceful server shutdown.
+func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.StatusCode, reason string) {
+	cm.logger.Info(context.Background(), "Initiating graceful closure of all active WebSocket connections...", "code", closeCode, "reason", reason)
+	closedCount := 0
+	cm.activeConnections.Range(func(key, value interface{}) bool {
+		sessionKey, okSessionKey := key.(string)
+		conn, okConn := value.(domain.ManagedConnection)
+		if !okSessionKey || !okConn {
+			cm.logger.Error(context.Background(), "Invalid type in activeConnections map during graceful shutdown", "key_type", fmt.Sprintf("%T", key), "value_type", fmt.Sprintf("%T", value))
+			return true // Continue to next item
+		}
+
+		cm.logger.Info(conn.Context(), "Sending close frame to WebSocket connection", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+		if err := conn.Close(closeCode, reason); err != nil {
+			// Log error, but underlying connection context cancellation should ensure cleanup via DeregisterConnection later if not already.
+			cm.logger.Warn(conn.Context(), "Error sending close frame during graceful shutdown (will be forcibly closed)", "sessionKey", sessionKey, "error", err.Error())
+		}
+		closedCount++
+		return true // Continue to next item
+	})
+	cm.logger.Info(context.Background(), "Graceful close frames sent to active connections", "count", closedCount)
+	// The actual deregistration and lock release happens when each connection's manageConnection goroutine exits due to context cancellation from conn.Close().
 }

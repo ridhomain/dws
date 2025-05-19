@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
@@ -80,45 +81,44 @@ func CompanyTokenAuthMiddleware(authService *application.AuthService, logger dom
 
 				var errCode domain.ErrorCode
 				var errMsg string
-				// Default to the original error message for details, but can be overridden for client response.
 				var errDetails string = err.Error()
-				httpStatus := http.StatusForbidden // Default for token issues as per FR-3
+				httpStatus := http.StatusForbidden
+				var reasonForMetric string = "unknown_error"
 
 				switch {
 				case errors.Is(err, application.ErrTokenExpired):
-					errCode = domain.ErrInvalidToken // As per Arch MD 10.3, ErrInvalidToken maps to 403/4403
+					errCode = domain.ErrInvalidToken
 					errMsg = "Company token has expired."
+					reasonForMetric = "expired"
 				case errors.Is(err, crypto.ErrTokenDecryptionFailed),
 					errors.Is(err, application.ErrTokenPayloadInvalid),
 					errors.Is(err, crypto.ErrInvalidTokenFormat),
 					errors.Is(err, crypto.ErrCiphertextTooShort):
 					errCode = domain.ErrInvalidToken
 					errMsg = "Company token is invalid or malformed."
-					// For security, don't leak crypto details to client in errDetails.
-					// The logged err.Error() will have specifics.
 					errDetails = "Token format or content error."
-				case errors.Is(err, crypto.ErrInvalidAESKeySize), // This is a server config issue
-					errors.New("application not configured for token decryption").Error() == err.Error(): // Check for specific string from AuthService
+					reasonForMetric = "invalid_format_or_content"
+				case errors.Is(err, crypto.ErrInvalidAESKeySize),
+					errors.New("application not configured for token decryption").Error() == err.Error():
 					errCode = domain.ErrInternal
 					errMsg = "Server configuration error processing token."
 					httpStatus = http.StatusInternalServerError
 					errDetails = "Internal server error."
+					reasonForMetric = "config_error_aes_key"
 				default:
-					// For other unexpected errors from AuthService
-					// (e.g. unhandled cache errors not ErrCacheMiss)
 					logger.Error(r.Context(), "Unexpected internal error during token processing", "path", r.URL.Path, "detailed_error", err.Error())
 					errCode = domain.ErrInternal
 					errMsg = "An unexpected error occurred."
 					httpStatus = http.StatusInternalServerError
 					errDetails = "Internal server error."
+					reasonForMetric = "internal_server_error"
 				}
-
+				metrics.IncrementAuthFailure("company", reasonForMetric)
 				errResp := domain.NewErrorResponse(errCode, errMsg, errDetails)
 				errResp.WriteJSON(w, httpStatus)
 				return
 			}
-
-			// Inject AuthenticatedUserContext into request context
+			metrics.IncrementAuthSuccess("company")
 			newReqCtx := context.WithValue(r.Context(), contextkeys.AuthUserContextKey, authCtx)
 			newReqCtx = context.WithValue(newReqCtx, contextkeys.CompanyIDKey, authCtx.CompanyID)
 			newReqCtx = context.WithValue(newReqCtx, contextkeys.AgentIDKey, authCtx.AgentID)

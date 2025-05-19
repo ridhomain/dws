@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
@@ -75,11 +76,13 @@ func AdminAuthMiddleware(authService *application.AuthService, logger domain.Log
 				var errMsg string
 				var errDetails string = err.Error()
 				httpStatus := http.StatusForbidden
+				var reasonForMetric string = "unknown_error"
 
 				switch {
 				case errors.Is(err, application.ErrTokenExpired):
 					errCode = domain.ErrInvalidToken
 					errMsg = "Admin token has expired."
+					reasonForMetric = "expired"
 				case errors.Is(err, crypto.ErrTokenDecryptionFailed),
 					errors.Is(err, application.ErrTokenPayloadInvalid),
 					errors.Is(err, crypto.ErrInvalidTokenFormat),
@@ -87,23 +90,27 @@ func AdminAuthMiddleware(authService *application.AuthService, logger domain.Log
 					errCode = domain.ErrInvalidToken
 					errMsg = "Admin token is invalid or malformed."
 					errDetails = "Token format or content error."
+					reasonForMetric = "invalid_format_or_content"
 				case errors.Is(err, crypto.ErrInvalidAESKeySize),
 					strings.Contains(err.Error(), "application not configured for admin token decryption"):
 					errCode = domain.ErrInternal
 					errMsg = "Server configuration error processing admin token."
 					httpStatus = http.StatusInternalServerError
 					errDetails = "Internal server error."
+					reasonForMetric = "config_error_aes_key"
 				default:
 					logger.Error(r.Context(), "Unexpected internal error during admin token processing", "path", r.URL.Path, "detailed_error", err.Error())
 					errCode = domain.ErrInternal
 					errMsg = "An unexpected error occurred while processing admin token."
 					httpStatus = http.StatusInternalServerError
 					errDetails = "Internal server error."
+					reasonForMetric = "internal_server_error"
 				}
+				metrics.IncrementAuthFailure("admin", reasonForMetric)
 				domain.NewErrorResponse(errCode, errMsg, errDetails).WriteJSON(w, httpStatus)
 				return
 			}
-
+			metrics.IncrementAuthSuccess("admin")
 			newReqCtx := context.WithValue(r.Context(), contextkeys.AdminUserContextKey, adminCtx)
 			newReqCtx = context.WithValue(newReqCtx, contextkeys.UserIDKey, adminCtx.AdminID) // For consistent logging if UserIDKey is used generally
 			logger.Debug(r.Context(), "Admin token authentication successful",

@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/nats-io/nats.go"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
@@ -69,6 +70,7 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !acquired {
 		h.logger.Warn(r.Context(), "Admin session lock not acquired (conflict)", "admin_id", adminCtx.AdminID)
+		metrics.IncrementSessionConflicts("admin") // Admin session conflict
 		domain.NewErrorResponse(domain.ErrSessionConflict, "Admin session already active elsewhere.", "").WriteJSON(w, http.StatusConflict)
 		return
 	}
@@ -76,6 +78,7 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(r.Context())
 	var wrappedConn *Connection
+	startTime := time.Now() // For connection duration metric
 
 	opts := websocket.AcceptOptions{
 		Subprotocols: []string{"json.v1"},
@@ -105,6 +108,8 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	metrics.IncrementConnectionsTotal() // Increment for admin connections too
+
 	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
 	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
 		"remoteAddr", wrappedConn.RemoteAddr(),
@@ -113,11 +118,12 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"admin_session_key", adminSessionKey,
 	)
 
-	// Register the admin connection with the ConnectionManager
-	h.connManager.RegisterConnection(adminSessionKey, wrappedConn)
+	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "") // Pass empty strings for company/agent for admin conns
 
 	defer func() {
 		h.logger.Info(wrappedConn.Context(), "Admin connection management goroutine finished. Deregistering admin connection.", "admin_session_key", adminSessionKey)
+		duration := time.Since(startTime).Seconds()
+		metrics.ObserveConnectionDuration(duration)         // Observe for admin connections
 		h.connManager.DeregisterConnection(adminSessionKey) // Uses generic deregister for now
 		// Release lock on clean disconnect
 		if currentPodID != "" {
@@ -148,11 +154,12 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 	)
 
 	// Send "ready" message
-	readyMessage := NewReadyMessage()
+	readyMessage := domain.NewReadyMessage()
 	if err := conn.WriteJSON(readyMessage); err != nil {
 		h.logger.Error(connCtx, "Failed to send 'ready' message to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
 		return
 	}
+	metrics.IncrementMessagesSent(domain.MessageTypeReady) // Sent to admin
 	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
 
 	// NATS Subscription for Agent Events (FR-ADMIN-2)
@@ -169,20 +176,22 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		} // Default to wildcard if not specified
 
 		natsMsgHandler := func(msg *nats.Msg) {
+			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
+
 			h.logger.Info(connCtx, "Admin NATS: Received message on agent events subject",
 				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
 			)
 			var eventPayload domain.EnrichedEventPayload
 			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
 				h.logger.Error(connCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-				_ = msg.Ack() // Ack malformed messages
+				_ = msg.Ack()
 				return
 			}
-			wsMessage := NewEventMessage(eventPayload)
+			wsMessage := domain.NewEventMessage(eventPayload)
 			if err := conn.WriteJSON(wsMessage); err != nil {
 				h.logger.Error(connCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-				// Consider not acking if WS write fails, to allow redelivery.
-				// For now, acking to prevent loop if WS is permanently broken for this client.
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeEvent) // Event sent to admin
 			}
 			_ = msg.Ack()
 		}
@@ -195,7 +204,11 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 			)
 			// Optionally send error to client and close
 			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to agent events", subErr.Error())
-			conn.WriteJSON(NewErrorMessage(errorMsg))
+			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
+				h.logger.Error(connCtx, "Failed to send NATS subscription error to admin client", "error", sendErr.Error())
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeError) // Error sent to admin
+			}
 			// conn.Close(websocket.StatusInternalError, "NATS subscription failure")
 			// return // For now, let it run without NATS if sub fails, but log error.
 		} else {
@@ -288,11 +301,14 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		}
 
 		h.logger.Debug(connCtx, "Received message from admin WebSocket", "type", msgType.String(), "payload_len", len(p), "admin_id", adminInfo.AdminID)
-		// Admin clients might not send messages, or they might have specific commands.
-		// For now, just log. If admin client can send messages, add unmarshalling and handling here.
-		// Example:
-		// var baseMsg BaseMessage
-		// if err := json.Unmarshal(p, &baseMsg); err != nil { /* handle error */ }
-		// switch baseMsg.Type { /* handle types */ }
+		// Admin interface might not expect many client-sent messages other than control messages (if any defined later).
+		// For now, increment a generic received metric if it's a text message.
+		if msgType == websocket.MessageText {
+			metrics.IncrementMessagesReceived("admin_text_message") // Generic type for admin messages
+			// Optionally unmarshal if there's a defined admin protocol, otherwise just log receipt for now.
+			h.logger.Info(connCtx, "Admin client sent a text message.", "payload", string(p))
+		} else if msgType == websocket.MessageBinary {
+			metrics.IncrementMessagesReceived("admin_binary_message")
+		}
 	}
 }

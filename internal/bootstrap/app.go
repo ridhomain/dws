@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	// Imports for App struct fields if defined here, but App struct is in providers.go
 	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -40,21 +41,24 @@ func (a *App) Run(ctx context.Context) error {
 	a.logger.Info(ctx, "Starting application", "service_name", serviceName, "version", version)
 
 	// Setup HTTP routes
-	a.httpServeMux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.logger.Info(r.Context(), "Health check endpoint hit")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, `{"status":"OK"}`)
 	})
-	a.httpServeMux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+	a.httpServeMux.Handle("GET /health", middleware.RequestIDMiddleware(healthHandler))
+
+	readyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		a.logger.Info(r.Context(), "Readiness check endpoint hit")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, `{"status":"READY"}`)
 	})
+	a.httpServeMux.Handle("GET /ready", middleware.RequestIDMiddleware(readyHandler))
 
 	// Register Prometheus metrics handler
-	a.httpServeMux.Handle("GET /metrics", promhttp.Handler())
+	a.httpServeMux.Handle("GET /metrics", middleware.RequestIDMiddleware(promhttp.Handler()))
 	a.logger.Info(ctx, "Prometheus metrics endpoint registered at /metrics")
 
 	if a.wsRouter != nil {
@@ -63,24 +67,38 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Warn(ctx, "WebSocket router is not initialized. WebSocket routes will not be available.")
 	}
 
-	// Register /generate-token endpoint
-	// Assumes a.generateTokenHandler and a.tokenGenerationMiddleware are injected into App by Wire from providers.go
 	if a.generateTokenHandler != nil && a.tokenGenerationMiddleware != nil {
-		a.httpServeMux.Handle("POST /generate-token", a.tokenGenerationMiddleware(a.generateTokenHandler))
+		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(a.generateTokenHandler))
+		a.httpServeMux.Handle("POST /generate-token", finalGenerateTokenHandler)
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {
 		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
 	}
 
-	// Register /ws/admin endpoint
 	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil { // Check configProvider for APIKeyAuth
 		apiKeyAuth := middleware.APIKeyAuthMiddleware(a.configProvider, a.logger)
 		adminAuthedHandler := a.adminAuthMiddleware(a.adminWsHandler)
-		finalAdminWsHandler := apiKeyAuth(adminAuthedHandler)
+		chainedAdminHandler := apiKeyAuth(adminAuthedHandler)
+		finalAdminWsHandler := middleware.RequestIDMiddleware(chainedAdminHandler)
 		a.httpServeMux.Handle("GET /ws/admin", finalAdminWsHandler)
 		a.logger.Info(ctx, "Admin WebSocket endpoint /ws/admin registered")
 	} else {
 		a.logger.Error(ctx, "AdminWsHandler, AdminAuthMiddleware, or ConfigProvider not initialized. /ws/admin endpoint will not be available.")
+	}
+
+	// NATS related providers in `providers.go` were temporarily commented out to isolate and resolve DI issues for the HTTP endpoint. These will need to be revisited.
+
+	// Start gRPC Server if available
+	if a.grpcServer != nil {
+		if err := a.grpcServer.Start(); err != nil {
+			a.logger.Error(ctx, "Failed to start gRPC server", "error", err.Error())
+			// Depending on policy, this might be a fatal error for the app
+			// For now, log and continue HTTP server startup
+		} else {
+			a.logger.Info(ctx, "gRPC server started successfully.")
+		}
+	} else {
+		a.logger.Warn(ctx, "gRPC server is not initialized. gRPC services will not be available.")
 	}
 
 	if a.connectionManager != nil {
@@ -118,6 +136,10 @@ func (a *App) Run(ctx context.Context) error {
 		defer cancel()
 
 		if a.connectionManager != nil {
+			a.logger.Info(context.Background(), "Closing all WebSocket connections gracefully...")
+			a.connectionManager.GracefullyCloseAllConnections(domain.StatusGoingAway, "Server is shutting down")
+			time.Sleep(1 * time.Second) // TODO: Make this configurable if needed
+
 			a.connectionManager.StopKillSwitchListener()
 			a.connectionManager.StopResourceRenewalLoop()
 		}
@@ -133,6 +155,8 @@ func (a *App) Run(ctx context.Context) error {
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
 			a.logger.Error(context.Background(), "HTTP server graceful shutdown failed", "error", err.Error())
 		}
+		// gRPC server shutdown is handled by its own context watcher initiated in its Start method
+		// or can be explicitly called if needed: if a.grpcServer != nil { a.grpcServer.GracefulStop() }
 		a.logger.Info(context.Background(), "HTTP server shut down.")
 	})
 

@@ -67,6 +67,7 @@ type AppConfig struct {
 	TTLRefreshIntervalSeconds int    `mapstructure:"ttl_refresh_interval_seconds"`
 	NATSMaxAckPending         int    `mapstructure:"nats_max_ack_pending"`
 	SessionLockRetryDelayMs   int    `mapstructure:"session_lock_retry_delay_ms"` // Delay in milliseconds for session lock retry
+	NatsAckWaitSeconds        int    `mapstructure:"nats_ack_wait_seconds"`       // Added for NATS AckWait
 }
 
 // Config holds all configuration for the application.
