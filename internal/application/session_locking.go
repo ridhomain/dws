@@ -107,3 +107,87 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 	cm.logger.Error(ctx, "All attempts to acquire session lock failed, including ForceAcquireLock.", "sessionKey", sessionKey)
 	return false, fmt.Errorf("all attempts to acquire session lock failed for key %s", sessionKey)
 }
+
+// AcquireAdminSessionLockOrNotify attempts to acquire a distributed lock for a new admin session.
+// If the lock is already held, it publishes a notification to the admin kill switch channel.
+func (cm *ConnectionManager) AcquireAdminSessionLockOrNotify(ctx context.Context, adminID string) (bool, error) {
+	cfg := cm.configProvider.Get()
+	podID := cfg.Server.PodID
+	if podID == "" {
+		cm.logger.Error(ctx, "PodID is not configured. Admin session locking will not work correctly.", "operation", "AcquireAdminSessionLockOrNotify")
+		return false, fmt.Errorf("podID is not configured")
+	}
+
+	adminSessionKey := rediskeys.AdminSessionKey(adminID)
+	sessionTTL := time.Duration(cfg.App.SessionTTLSeconds) * time.Second // Reuse same session TTL config for now
+
+	cm.logger.Info(ctx, "Attempting to acquire admin session lock",
+		"adminSessionKey", adminSessionKey,
+		"podID", podID,
+		"ttlSeconds", sessionTTL.Seconds(),
+	)
+
+	acquired, err := cm.sessionLocker.AcquireLock(ctx, adminSessionKey, podID, sessionTTL)
+	if err != nil {
+		cm.logger.Error(ctx, "Failed to acquire admin session lock from store", "error", err.Error(), "adminSessionKey", adminSessionKey)
+		return false, fmt.Errorf("failed to acquire admin session lock: %w", err)
+	}
+
+	if acquired {
+		cm.logger.Info(ctx, "Admin session lock acquired successfully", "adminSessionKey", adminSessionKey, "podID", podID)
+		return true, nil
+	}
+
+	cm.logger.Warn(ctx, "Failed to acquire admin session lock (already held). Publishing admin kill message.",
+		"adminSessionKey", adminSessionKey,
+		"newPodIDAttempting", podID,
+	)
+
+	killChannel := rediskeys.AdminSessionKillChannelKey(adminID)
+	killMsg := domain.KillSwitchMessage{NewPodID: podID} // Same message structure
+	if pubErr := cm.killSwitchPublisher.PublishSessionKill(ctx, killChannel, killMsg); pubErr != nil {
+		cm.logger.Error(ctx, "Failed to publish admin session kill message", "channel", killChannel, "error", pubErr.Error())
+		// Non-fatal for the current attempt, but log it.
+	}
+
+	cm.logger.Info(ctx, "Attempting retry for admin session lock acquisition after kill message", "adminSessionKey", adminSessionKey)
+	retryDelayMs := cfg.App.SessionLockRetryDelayMs
+	if retryDelayMs <= 0 {
+		retryDelayMs = 250 // Default
+		cm.logger.Warn(ctx, "SessionLockRetryDelayMs not configured or invalid for admin, defaulting", "default_ms", retryDelayMs, "adminSessionKey", adminSessionKey)
+	}
+	retryDelayDuration := time.Duration(retryDelayMs) * time.Millisecond
+
+	select {
+	case <-time.After(retryDelayDuration):
+		cm.logger.Debug(ctx, "Admin retry delay completed", "adminSessionKey", adminSessionKey, "delay", retryDelayDuration)
+	case <-ctx.Done():
+		cm.logger.Warn(ctx, "Context cancelled during retry delay for admin session lock", "adminSessionKey", adminSessionKey, "error", ctx.Err())
+		return false, ctx.Err()
+	}
+
+	cm.logger.Info(ctx, "Retrying AcquireLock (SETNX) for admin session", "adminSessionKey", adminSessionKey, "podID", podID)
+	acquired, err = cm.sessionLocker.AcquireLock(ctx, adminSessionKey, podID, sessionTTL)
+	if err != nil {
+		cm.logger.Error(ctx, "Failed to retry AcquireLock (SETNX) for admin session", "adminSessionKey", adminSessionKey, "error", err.Error())
+		return false, fmt.Errorf("failed to retry AcquireLock (SETNX) for admin: %w", err)
+	}
+	if acquired {
+		cm.logger.Info(ctx, "Admin session lock acquired successfully on SETNX retry", "adminSessionKey", adminSessionKey, "podID", podID)
+		return true, nil
+	}
+
+	cm.logger.Warn(ctx, "Admin SETNX retry failed. Attempting ForceAcquireLock (SET) for admin session.", "adminSessionKey", adminSessionKey, "podID", podID)
+	acquired, err = cm.sessionLocker.ForceAcquireLock(ctx, adminSessionKey, podID, sessionTTL)
+	if err != nil {
+		cm.logger.Error(ctx, "Failed to ForceAcquireLock (SET) for admin session", "adminSessionKey", adminSessionKey, "error", err.Error())
+		return false, fmt.Errorf("failed to ForceAcquireLock (SET) for admin: %w", err)
+	}
+	if acquired {
+		cm.logger.Info(ctx, "Admin session lock acquired successfully using ForceAcquireLock (SET)", "adminSessionKey", adminSessionKey, "podID", podID)
+		return true, nil
+	}
+
+	cm.logger.Error(ctx, "All attempts to acquire admin session lock failed, including ForceAcquireLock.", "adminSessionKey", adminSessionKey)
+	return false, fmt.Errorf("all attempts to acquire admin session lock failed for key %s", adminSessionKey)
+}

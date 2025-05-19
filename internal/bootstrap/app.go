@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	// Imports for App struct fields if defined here, but App struct is in providers.go
 	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -71,9 +72,23 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
 	}
 
+	// Register /ws/admin endpoint
+	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil { // Check configProvider for APIKeyAuth
+		apiKeyAuth := middleware.APIKeyAuthMiddleware(a.configProvider, a.logger)
+		adminAuthedHandler := a.adminAuthMiddleware(a.adminWsHandler)
+		finalAdminWsHandler := apiKeyAuth(adminAuthedHandler)
+		a.httpServeMux.Handle("GET /ws/admin", finalAdminWsHandler)
+		a.logger.Info(ctx, "Admin WebSocket endpoint /ws/admin registered")
+	} else {
+		a.logger.Error(ctx, "AdminWsHandler, AdminAuthMiddleware, or ConfigProvider not initialized. /ws/admin endpoint will not be available.")
+	}
+
 	if a.connectionManager != nil {
 		safego.Execute(ctx, a.logger, "ConnectionManagerKillSwitchListener", func() {
 			a.connectionManager.StartKillSwitchListener(ctx)
+		})
+		safego.Execute(ctx, a.logger, "ConnectionManagerAdminKillSwitchListener", func() {
+			a.connectionManager.StartAdminKillSwitchListener(ctx)
 		})
 		safego.Execute(ctx, a.logger, "ConnectionManagerSessionRenewalLoop", func() {
 			a.connectionManager.StartSessionRenewalLoop(ctx)

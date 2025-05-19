@@ -25,6 +25,9 @@ const (
 	// AuthUserContextKey is the context key for storing the entire AuthenticatedUserContext struct.
 	AuthUserContextKey contextKey = "auth_user_context"
 
+	// AdminUserContextKey is the context key for storing the authenticated admin user context.
+	AdminUserContextKey contextKey = "admin_user_context"
+
 	// Add other common context keys here as needed, for example:
 	// TableNameKey contextKey = "table_name"
 	// TraceIDKey contextKey = "trace_id"

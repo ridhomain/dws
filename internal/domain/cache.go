@@ -15,5 +15,11 @@ type TokenCacheStore interface {
 	Set(ctx context.Context, key string, value *AuthenticatedUserContext, ttl time.Duration) error
 }
 
+// AdminTokenCacheStore defines the interface for caching validated admin user contexts.
+type AdminTokenCacheStore interface {
+	Get(ctx context.Context, key string) (*AdminUserContext, error)
+	Set(ctx context.Context, key string, value *AdminUserContext, ttl time.Duration) error
+}
+
 // Consider adding a specific error for cache miss if not relying on (nil, nil)
 // var ErrCacheMiss = errors.New("item not found in cache")

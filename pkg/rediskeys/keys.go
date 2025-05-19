@@ -32,3 +32,13 @@ func RouteKeyMessages(company, agent, chatID string) string {
 func SessionKillChannelKey(company, agent, user string) string {
 	return fmt.Sprintf("session_kill:%s:%s:%s", company, agent, user)
 }
+
+// AdminSessionKey generates the Redis key for an admin user session.
+func AdminSessionKey(adminID string) string {
+	return fmt.Sprintf("session:admin:%s", adminID)
+}
+
+// AdminSessionKillChannelKey generates the Redis key for the admin session kill pub/sub channel.
+func AdminSessionKillChannelKey(adminID string) string {
+	return fmt.Sprintf("session_kill:admin:%s", adminID)
+}

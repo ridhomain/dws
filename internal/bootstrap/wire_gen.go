@@ -40,7 +40,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 		return nil, nil, err
 	}
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
-	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore)
+	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
+	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
 	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
 	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
 	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
@@ -52,7 +53,9 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter)
+	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
+	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, handlerFunc, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler)
 	if err != nil {
 		cleanup3()
 		cleanup2()

@@ -1,10 +1,17 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
+	"strings"
+
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
 )
 
 // TokenGenerationAuthMiddleware creates a middleware for the /generate-token endpoint.
@@ -38,6 +45,72 @@ func TokenGenerationAuthMiddleware(cfgProvider config.Provider, logger domain.Lo
 
 			logger.Debug(r.Context(), "Token generation admin key authentication successful", "path", r.URL.Path)
 			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+const (
+	adminTokenQueryParam = "token" // Using "token" as per FR-ADMIN-1. Consistent with company token.
+)
+
+// AdminAuthMiddleware creates a middleware for admin token authentication for WebSocket connections.
+// It extracts the 'token' query parameter, decrypts/validates it using AuthService.ProcessAdminToken,
+// and injects AdminUserContext into the request context.
+// This middleware should run AFTER APIKeyAuthMiddleware.
+func AdminAuthMiddleware(authService *application.AuthService, logger domain.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tokenValue := r.URL.Query().Get(adminTokenQueryParam)
+			if tokenValue == "" {
+				logger.Warn(r.Context(), "Admin token authentication failed: 'token' query parameter missing", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrInvalidToken, "Admin token is required", "Provide 'token' in query parameter.")
+				errResp.WriteJSON(w, http.StatusForbidden) // FR-ADMIN-1 implies pre-upgrade failures return appropriate HTTP error
+				return
+			}
+
+			adminCtx, err := authService.ProcessAdminToken(r.Context(), tokenValue)
+			if err != nil {
+				logger.Warn(r.Context(), "Admin token processing failed", "path", r.URL.Path, "error", err.Error())
+				var errCode domain.ErrorCode
+				var errMsg string
+				var errDetails string = err.Error()
+				httpStatus := http.StatusForbidden
+
+				switch {
+				case errors.Is(err, application.ErrTokenExpired):
+					errCode = domain.ErrInvalidToken
+					errMsg = "Admin token has expired."
+				case errors.Is(err, crypto.ErrTokenDecryptionFailed),
+					errors.Is(err, application.ErrTokenPayloadInvalid),
+					errors.Is(err, crypto.ErrInvalidTokenFormat),
+					errors.Is(err, crypto.ErrCiphertextTooShort):
+					errCode = domain.ErrInvalidToken
+					errMsg = "Admin token is invalid or malformed."
+					errDetails = "Token format or content error."
+				case errors.Is(err, crypto.ErrInvalidAESKeySize),
+					strings.Contains(err.Error(), "application not configured for admin token decryption"):
+					errCode = domain.ErrInternal
+					errMsg = "Server configuration error processing admin token."
+					httpStatus = http.StatusInternalServerError
+					errDetails = "Internal server error."
+				default:
+					logger.Error(r.Context(), "Unexpected internal error during admin token processing", "path", r.URL.Path, "detailed_error", err.Error())
+					errCode = domain.ErrInternal
+					errMsg = "An unexpected error occurred while processing admin token."
+					httpStatus = http.StatusInternalServerError
+					errDetails = "Internal server error."
+				}
+				domain.NewErrorResponse(errCode, errMsg, errDetails).WriteJSON(w, httpStatus)
+				return
+			}
+
+			newReqCtx := context.WithValue(r.Context(), contextkeys.AdminUserContextKey, adminCtx)
+			newReqCtx = context.WithValue(newReqCtx, contextkeys.UserIDKey, adminCtx.AdminID) // For consistent logging if UserIDKey is used generally
+			logger.Debug(r.Context(), "Admin token authentication successful",
+				"path", r.URL.Path,
+				"admin_id", adminCtx.AdminID,
+				"company_restriction", adminCtx.CompanyIDRestriction)
+			next.ServeHTTP(w, r.WithContext(newReqCtx))
 		})
 	}
 }

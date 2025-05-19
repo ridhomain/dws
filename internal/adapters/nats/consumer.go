@@ -168,6 +168,61 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	return sub, nil
 }
 
+// SubscribeToAgentEvents subscribes to the agent events for a specific company and agent pattern.
+// It uses QueueSubscribe with DeliverAllPolicy and ManualAckPolicy.
+// The provided nats.MsgHandler will be called for each received message.
+func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler nats.MsgHandler) (*nats.Subscription, error) {
+	if a.js == nil {
+		return nil, fmt.Errorf("JetStream context is not initialized")
+	}
+	// Subject pattern: wa.<companyIDPattern>.<agentIDPattern>.agents
+	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
+	queueGroup := "ws_fanout_admin" // Potentially a different queue group for admin, or reuse existing if appropriate.
+	// For now, using a distinct queue group to isolate admin agent event consumption if needed.
+	// If it should share the same pool as user chat events, this can be changed to "ws_fanout".
+	// The PRD states "existing JetStream consumer logic (e.g., ws_fanout consumer configuration adapted...)"
+	// This implies we might reuse `ws_fanout` or use a similar config. Let's stick to `ws_fanout` to align with that.
+	queueGroup = "ws_fanout"
+
+	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"stream_name", a.cfg.StreamName,
+		"consumer_name", a.cfg.ConsumerName, // Assuming same consumer config base name
+	)
+
+	durableName := a.cfg.ConsumerName // Re-using the main consumer name for durability configuration.
+	// If admin subscriptions need a different durable name strategy, this needs adjustment.
+
+	sub, err := a.js.QueueSubscribe(
+		subject,
+		queueGroup,
+		handler,
+		nats.Durable(durableName+"_admin_agents"), // Make durable name distinct for this type of subscription to avoid conflicts if same base consumer name is used.
+		nats.DeliverAll(),
+		nats.ManualAck(),
+		nats.AckWait(30*time.Second),            // TODO: Make configurable if different from main chats
+		nats.MaxAckPending(a.natsMaxAckPending), // Reuse existing config for MaxAckPending
+	)
+
+	if err != nil {
+		a.logger.Error(ctx, "Failed to subscribe to NATS agent events subject",
+			"subject", subject,
+			"queue_group", queueGroup,
+			"durable_name", durableName+"_admin_agents",
+			"error", err.Error(),
+		)
+		return nil, fmt.Errorf("failed to subscribe to NATS agent events subject %s: %w", subject, err)
+	}
+
+	a.logger.Info(ctx, "Successfully subscribed to NATS agent events subject with queue group",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName+"_admin_agents",
+	)
+	return sub, nil
+}
+
 // TODO: Implement logic for Subtask 6.3 (Parse and Forward EnrichedEventPayload)
 // This will involve creating a message handler function that uses the domain.Connection
 // to write messages to the WebSocket client.

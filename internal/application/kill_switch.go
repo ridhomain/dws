@@ -11,99 +11,173 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 
-const sessionKillChannelPrefix = "session_kill:"
+const (
+	sessionKillChannelPrefix      = "session_kill:"       // For user sessions: session_kill:<company>:<agent>:<user>
+	adminSessionKillChannelPrefix = "session_kill:admin:" // New prefix for admin kill messages: session_kill:admin:<adminID>
+)
 
-// handleKillSwitchMessage is called when a message is received on a session_kill channel.
+// handleKillSwitchMessage is called when a message is received on a session_kill channel for regular users.
 func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background() // Base context for this handler
-	cm.logger.Info(ctx, "Received kill switch message via pub/sub",
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
 		"channel", channel,
 		"newPodIDInMessage", message.NewPodID,
 	)
-
 	currentPodID := cm.configProvider.Get().Server.PodID
 	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "Kill message originated from this pod or is for a session this pod just acquired. No action needed on local connections.",
-			"channel", channel,
-			"currentPodID", currentPodID,
-		)
+		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
 		return nil
 	}
 
-	if !strings.HasPrefix(channel, sessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "Received kill switch message on unexpected channel format", "channel", channel)
-		return fmt.Errorf("invalid channel format: %s", channel)
+	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
+		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
 	}
-
 	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
 	parts := strings.Split(partsStr, ":")
 	if len(parts) != 3 {
-		cm.logger.Error(ctx, "Could not parse company/agent/user from kill switch channel", "channel", channel, "parsedParts", partsStr)
-		return fmt.Errorf("could not parse identifiers from channel: %s", channel)
+		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
+		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
 	}
+
 	companyID, agentID, userID := parts[0], parts[1], parts[2]
 	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-
-	cm.logger.Info(ctx, "Processing kill message for potential local connection termination",
+	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
 		"sessionKey", sessionKey,
 		"messageNewPodID", message.NewPodID,
 		"currentPodID", currentPodID)
-
 	val, exists := cm.activeConnections.Load(sessionKey)
 	if !exists {
-		cm.logger.Info(ctx, "No active local connection found for session key, no action needed.", "sessionKey", sessionKey)
+		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
 		return nil
 	}
-
 	managedConn, ok := val.(domain.ManagedConnection)
 	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for session key", "sessionKey", sessionKey)
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
 		cm.DeregisterConnection(sessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for key %s", sessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
 	}
-
 	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local WebSocket connection due to session conflict (taken over by another pod)",
+	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
 		"sessionKey", sessionKey,
 		"remoteAddr", managedConn.RemoteAddr(),
 		"conflictingPodID", message.NewPodID,
 	)
-
 	if err := managedConn.Close(websocket.StatusCode(4402), "SessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing WebSocket connection after session conflict",
+		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
 			"sessionKey", sessionKey,
 			"remoteAddr", managedConn.RemoteAddr(),
 			"error", err.Error(),
 		)
 	}
-
 	cm.DeregisterConnection(sessionKey)
 	return nil
 }
 
-// StartKillSwitchListener starts the Redis Pub/Sub listener for session kill messages.
+// handleAdminKillSwitchMessage is called when a message is received on an admin_session_kill channel.
+func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+
+	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
+		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
+	}
+	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
+	adminSessionKey := rediskeys.AdminSessionKey(adminID)
+
+	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
+		"adminSessionKey", adminSessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+
+	val, exists := cm.activeConnections.Load(adminSessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
+		return nil
+	}
+
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
+		cm.DeregisterConnection(adminSessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
+	}
+
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
+		"adminSessionKey", adminSessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	if err := managedConn.Close(websocket.StatusCode(4402), "AdminSessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
+			"adminSessionKey", adminSessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(adminSessionKey)
+	return nil
+}
+
+// StartKillSwitchListener starts the Redis Pub/Sub listener for session kill messages for regular users.
 func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "KillSwitchSubscriberLoop", func() {
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, rediskeys.SessionKillChannelKey("*", "*", "*"), cm.handleKillSwitchMessage)
+	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.SessionKillChannelKey("*", "*", "*") // e.g., session_kill:*:*:*
+		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
 		if err != nil {
-			// Check if the context was cancelled, which might be a normal shutdown scenario
 			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "KillSwitch subscriber stopped due to context cancellation.")
+				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
 			} else {
-				cm.logger.Error(ctx, "KillSwitch subscriber failed or terminated", "error", err.Error())
+				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
 			}
 		}
-		// This log is reached when the SubscribeToSessionKillPattern function returns, either due to error or graceful stop.
-		cm.logger.Info(ctx, "ConnectionManager KillSwitch listener goroutine finished.")
+		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
 	})
 }
 
-// StopKillSwitchListener gracefully stops the subscriber.
+// StartAdminKillSwitchListener starts the Redis Pub/Sub listener for admin session kill messages.
+func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.AdminSessionKillChannelKey("*") // e.g., session_kill:admin:*
+		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
+	})
+}
+
+// StopKillSwitchListener gracefully stops all subscriptions made by the KillSwitchSubscriber.
+// This assumes the underlying KillSwitchSubscriber.Close() handles all its active subscriptions.
 func (cm *ConnectionManager) StopKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping KillSwitch listener...")
+	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
 	if cm.killSwitchSubscriber != nil {
 		return cm.killSwitchSubscriber.Close()
 	}
 	return nil
+}
+
+// StopAdminKillSwitchListener is now effectively a no-op because StopKillSwitchListener stops the shared subscriber.
+// Kept for conceptual separation but points to the shared nature of the Close().
+func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
+	return nil // No separate action if subscriber is shared and closed by the other Stop method.
 }

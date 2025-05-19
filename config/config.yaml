@@ -25,6 +25,8 @@ auth:
   token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE" # For company token encryption
   token_generation_admin_key: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE" # For /generate-token endpoint
   token_cache_ttl_seconds: 30
+  admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
+  admin_token_cache_ttl_seconds: 60
 
 # Application Specific
 app:

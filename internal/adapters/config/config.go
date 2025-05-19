@@ -45,10 +45,12 @@ type LogConfig struct {
 
 // AuthConfig holds authentication-related configurations.
 type AuthConfig struct {
-	SecretToken             string `mapstructure:"secret_token"`               // Should primarily come from ENV
-	TokenAESKey             string `mapstructure:"token_aes_key"`              // Should primarily come from ENV
-	TokenGenerationAdminKey string `mapstructure:"token_generation_admin_key"` // New: Key for /generate-token endpoint, from ENV
-	TokenCacheTTLSeconds    int    `mapstructure:"token_cache_ttl_seconds"`
+	SecretToken               string `mapstructure:"secret_token"`               // Should primarily come from ENV
+	TokenAESKey               string `mapstructure:"token_aes_key"`              // Should primarily come from ENV
+	TokenGenerationAdminKey   string `mapstructure:"token_generation_admin_key"` // New: Key for /generate-token endpoint, from ENV
+	TokenCacheTTLSeconds      int    `mapstructure:"token_cache_ttl_seconds"`
+	AdminTokenAESKey          string `mapstructure:"admin_token_aes_key"`           // For admin token encryption
+	AdminTokenCacheTTLSeconds int    `mapstructure:"admin_token_cache_ttl_seconds"` // TTL for cached admin tokens
 }
 
 // AppConfig holds application-specific configurations.
