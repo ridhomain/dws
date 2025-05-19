@@ -26,7 +26,7 @@ func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 		}
 
 		// Attempt to release the session lock associated with this connection
-		podID := cm.configProvider.Get().App.PodID
+		podID := cm.configProvider.Get().Server.PodID
 		if podID != "" {
 			released, err := cm.sessionLocker.ReleaseLock(logCtx, sessionKey, podID)
 			if err != nil {

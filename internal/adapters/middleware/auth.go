@@ -123,7 +123,6 @@ func CompanyTokenAuthMiddleware(authService *application.AuthService, logger dom
 			newReqCtx = context.WithValue(newReqCtx, contextkeys.CompanyIDKey, authCtx.CompanyID)
 			newReqCtx = context.WithValue(newReqCtx, contextkeys.AgentIDKey, authCtx.AgentID)
 			newReqCtx = context.WithValue(newReqCtx, contextkeys.UserIDKey, authCtx.UserID)
-			newReqCtx = context.WithValue(newReqCtx, contextkeys.IsAdminKey, authCtx.IsAdmin)
 
 			logger.Debug(r.Context(), "Company token authentication successful",
 				"path", r.URL.Path,

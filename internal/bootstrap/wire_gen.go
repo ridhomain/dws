@@ -13,42 +13,38 @@ import (
 // Injectors from wire.go:
 
 // InitializeApp creates and initializes a new application instance with all its dependencies.
-// It requires a serviceName to be passed in for logger configuration.
 // Wire will use the providers in ProviderSet and the NewApp function to build the *App.
 // The cleanup function returned can be used to sync loggers or close other resources.
-func InitializeApp(ctx context.Context, serviceName ServiceName) (*App, func(), error) {
-	logger, cleanup, err := BootstrapLoggerProvider()
+func InitializeApp(ctx context.Context) (*App, func(), error) {
+	provider, err := ConfigProvider()
 	if err != nil {
 		return nil, nil, err
 	}
-	provider, err := ConfigProvider(logger)
+	logger, err := LoggerProvider(provider)
+	if err != nil {
+		return nil, nil, err
+	}
+	serveMux := HTTPServeMuxProvider()
+	server := HTTPGracefulServerProvider(provider, serveMux)
+	handlerFunc := GenerateTokenHandlerProvider(provider, logger)
+	v := TokenGenerationAuthMiddlewareProvider(provider, logger)
+	client, cleanup, err := RedisClientProvider(provider, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	tokenCacheStore := TokenCacheStoreProvider(client, logger)
+	authService := AuthServiceProvider(logger, provider, tokenCacheStore)
+	sessionLockManager := SessionLockManagerProvider(client, logger)
+	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, logger)
+	connectionManager := ConnectionManagerProvider(logger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
+	handler := WebsocketHandlerProvider(logger, provider, connectionManager)
+	router := WebsocketRouterProvider(logger, provider, authService, handler)
+	app, cleanup2, err := NewApp(provider, logger, serveMux, server, handlerFunc, v, router, connectionManager)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
-	domainLogger, cleanup2, err := AppLoggerProvider(provider, serviceName)
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	healthCheck := HealthCheckHandlerProvider(domainLogger)
-	readinessCheck := ReadinessCheckHandlerProvider(domainLogger)
-	serveMux := HTTPServeMuxProvider(healthCheck, readinessCheck)
-	server := HTTPServerProvider(serveMux, provider, domainLogger)
-	client, cleanup3, err := RedisClientProvider(provider, domainLogger)
-	if err != nil {
-		cleanup2()
-		cleanup()
-		return nil, nil, err
-	}
-	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
-	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
-	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager)
-	router := WebsocketRouterProvider(handler, domainLogger, provider)
-	app := NewApp(server, domainLogger, router, serveMux, connectionManager)
 	return app, func() {
-		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil

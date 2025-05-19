@@ -16,6 +16,11 @@ const (
 	ErrRateLimitExceeded   ErrorCode = "RateLimitExceeded"   // WS Close 4429 (custom) or HTTP 429
 	ErrBadRequest          ErrorCode = "BadRequest"          // HTTP 400, e.g., invalid select_chat payload
 	ErrInternal            ErrorCode = "InternalServerError" // HTTP 500, WS Close 1011
+	ErrMethodNotAllowed    ErrorCode = "E4005"               // For HTTP 405 Method Not Allowed
+
+	// General Authentication/Authorization Errors
+	ErrUnauthorized ErrorCode = "E4001" // HTTP 401, general unauthorized
+	ErrForbidden    ErrorCode = "E4003" // HTTP 403, general forbidden (re-using E4003 if suitable or make new)
 )
 
 // ErrorResponse is the standard error format returned to clients via WebSocket or HTTP JSON.

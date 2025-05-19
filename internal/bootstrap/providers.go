@@ -4,209 +4,237 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/google/wire"
-	redisv9 "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	// ws "github.com/coder/websocket" // Alias for the websocket library - Not directly used in this file after simplification
+	// "github.com/nats-io/nats.go" // Temporarily commented out
+
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	apphttp "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/http"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/logger"
-	redisadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
+
+	// appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats" // Temporarily commented out
+	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
+	wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	// "gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys" // Not directly used in this file
 )
 
-// ServiceName is a type for injecting the service name string
-type ServiceName string
+// App struct is defined here for Wire to use.
+// It should be the single definition of App in the bootstrap package.
+type App struct {
+	configProvider            config.Provider
+	logger                    domain.Logger
+	httpServeMux              *http.ServeMux
+	httpServer                *http.Server
+	generateTokenHandler      http.HandlerFunc
+	tokenGenerationMiddleware func(http.Handler) http.Handler // Specific middleware for /generate-token
+	wsRouter                  *wsadapter.Router
+	connectionManager         *application.ConnectionManager
+	// natsCleanup            func() // Temporarily commented out
+}
 
-// Define distinct types for specific handlers to help Wire differentiate
-type HealthCheck http.HandlerFunc
-type ReadinessCheck http.HandlerFunc
-
-// BootstrapLoggerProvider provides a basic Zap logger for initial bootstrap processes.
-func BootstrapLoggerProvider() (*zap.Logger, func(), error) {
-	// Using NewDevelopment for more verbose bootstrap logs, switch to NewProduction if desired
-	logger, err := zap.NewDevelopment()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize bootstrap logger: %w", err)
+// NewApp is the constructor for App, also for Wire.
+// It should be the single definition of NewApp in the bootstrap package.
+func NewApp(
+	cfgProvider config.Provider,
+	appLogger domain.Logger,
+	mux *http.ServeMux,
+	server *http.Server,
+	genTokenHandler http.HandlerFunc,
+	tokenGenMiddleware func(http.Handler) http.Handler,
+	wsRouter *wsadapter.Router,
+	connManager *application.ConnectionManager,
+	// natsCleanup func(), // Temporarily commented out if NATS provider returns it
+) (*App, func(), error) { // Assuming a top-level cleanup for App
+	app := &App{
+		configProvider:            cfgProvider,
+		logger:                    appLogger,
+		httpServeMux:              mux,
+		httpServer:                server,
+		generateTokenHandler:      genTokenHandler,
+		tokenGenerationMiddleware: tokenGenMiddleware,
+		wsRouter:                  wsRouter,
+		connectionManager:         connManager,
+		// natsCleanup:            natsCleanup,
 	}
-	cleanup := func() { _ = logger.Sync() }
-	return logger, cleanup, nil
+
+	// Consolidated cleanup function for the App
+	cleanup := func() {
+		app.logger.Info(context.Background(), "Running app cleanup...")
+		// if app.natsCleanup != nil {
+		// 	app.natsCleanup()
+		// }
+		if app.connectionManager != nil {
+			app.connectionManager.StopKillSwitchListener()
+			app.connectionManager.StopSessionRenewalLoop()
+		}
+		// Add other cleanup tasks from providers if they return them directly to NewApp
+	}
+	return app, cleanup, nil
 }
 
 // ConfigProvider provides the application configuration.
-func ConfigProvider(bootstrapLogger *zap.Logger) (config.Provider, error) {
-	cfgProvider, err := config.NewViperProvider(bootstrapLogger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize config provider: %w", err)
+func ConfigProvider() (config.Provider, error) {
+	// For NewViperProvider to log its own errors, we give it a basic logger.
+	// This logger won't have the full app config (like log level from file) yet.
+	basicLogger, _ := zap.NewProduction() // Or zap.NewDevelopment() or zap.NewExample()
+	// In a real app, you might have a more sophisticated bootstrap logging setup.
+	return config.NewViperProvider(basicLogger)
+}
+
+// LoggerProvider provides the application logger.
+func LoggerProvider(cfgProvider config.Provider) (domain.Logger, error) {
+	appCfg := cfgProvider.Get()
+	return logger.NewZapAdapter(cfgProvider, appCfg.App.ServiceName) // Use ServiceName as Name is not available
+}
+
+// HTTPServeMuxProvider provides the main HTTP multiplexer.
+func HTTPServeMuxProvider() *http.ServeMux {
+	return http.NewServeMux()
+}
+
+// HTTPGracefulServerProvider provides a new HTTP server configured for graceful shutdown.
+func HTTPGracefulServerProvider(cfgProvider config.Provider, mux *http.ServeMux) *http.Server {
+	appCfg := cfgProvider.Get()
+
+	// TODO: Add ReadTimeoutSeconds and IdleTimeoutSeconds to config.AppConfig and use them here.
+	// Using hardcoded defaults for Read and Idle timeouts as they are not in AppConfig.
+	// WriteTimeoutSeconds is available in AppConfig.
+	readTimeout := 10 * time.Second  // Default read timeout
+	writeTimeout := 10 * time.Second // Default write timeout (fallback)
+	idleTimeout := 60 * time.Second  // Default idle timeout
+
+	if appCfg.App.WriteTimeoutSeconds > 0 {
+		writeTimeout = time.Duration(appCfg.App.WriteTimeoutSeconds) * time.Second
 	}
-	return cfgProvider, nil
-}
 
-// AppLoggerProvider provides the main application logger.
-func AppLoggerProvider(cfgProvider config.Provider, serviceName ServiceName) (domain.Logger, func(), error) {
-	appLogger, err := logger.NewZapAdapter(cfgProvider, string(serviceName)) // Use injected serviceName
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize application logger: %w", err)
+	return &http.Server{
+		Addr:         fmt.Sprintf(":%d", appCfg.Server.HTTPPort), // Use HTTPPort from ServerConfig
+		Handler:      mux,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	}
-	// Assuming ZapAdapter's underlying *zap.Logger has a Sync method for cleanup
-	// If logger.NewZapAdapter returns a concrete *logger.ZapAdapter, we can access its internal logger.Sync()
-	// For now, we'll assume the domain.Logger doesn't expose Sync directly.
-	// If the concrete type is known and has Sync():
-	// if concreteLogger, ok := appLogger.(*logger.ZapAdapter); ok {
-	//  cleanup := func() { _ = concreteLogger.ZapInstance().Sync() } // Assuming ZapInstance() returns *zap.Logger
-	//  return appLogger, cleanup, nil
-	// }
-	// If not, a no-op cleanup for the domain.Logger interface.
-	cleanup := func() {}
-	return appLogger, cleanup, nil
 }
 
-// HealthCheckHandlerProvider provides the HTTP handler for the /health endpoint.
-// Renamed to avoid conflict and to be more explicit for Wire.
-func HealthCheckHandlerProvider(appLogger domain.Logger) HealthCheck {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		reqCtx := context.WithValue(r.Context(), contextkeys.RequestIDKey, "health-check-wire") // Placeholder ID
-		appLogger.Info(reqCtx, "Health check endpoint hit via Wire")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, `{"status":"OK"}`)
-	}
-	return HealthCheck(fn)
+// GenerateTokenHandlerProvider provider
+func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
+	return apphttp.GenerateTokenHandler(cfgProvider, logger)
 }
 
-// ReadinessCheckHandlerProvider provides the HTTP handler for the /ready endpoint.
-// Renamed to avoid conflict and to be more explicit for Wire.
-func ReadinessCheckHandlerProvider(appLogger domain.Logger) ReadinessCheck {
-	fn := func(w http.ResponseWriter, r *http.Request) {
-		reqCtx := context.WithValue(r.Context(), contextkeys.RequestIDKey, "readiness-check-wire") // Placeholder ID
-		appLogger.Info(reqCtx, "Readiness check endpoint hit via Wire")
-		// TODO: Implement actual readiness checks (e.g., NATS, Redis connections) later
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, `{"status":"READY"}`)
-	}
-	return ReadinessCheck(fn)
+// TokenGenerationAuthMiddlewareProvider Provider
+func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
+	// Corrected: Pass the cfgProvider directly, the middleware will extract the key.
+	return middleware.TokenGenerationAuthMiddleware(cfgProvider, logger)
 }
 
-// HTTPServeMuxProvider provides the HTTP request multiplexer.
-// It registers handlers provided by other providers.
-func HTTPServeMuxProvider(healthHandler HealthCheck, readinessHandler ReadinessCheck) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", http.HandlerFunc(healthHandler))   // Cast back to http.HandlerFunc
-	mux.HandleFunc("/ready", http.HandlerFunc(readinessHandler)) // Cast back to http.HandlerFunc
-	return mux
+// WebsocketHandlerProvider provides the websocket handler.
+func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager) *wsadapter.Handler {
+	return wsadapter.NewHandler(logger, cfgProvider, connManager)
 }
 
-// HTTPServerProvider provides the main HTTP server.
-func HTTPServerProvider(mux *http.ServeMux, cfgProvider config.Provider, appLogger domain.Logger) *http.Server {
-	appConfig := cfgProvider.Get()
-	httpServer := &http.Server{
-		Addr:    fmt.Sprintf(":%d", appConfig.Server.HTTPPort),
-		Handler: mux,
-		// TODO: Add ReadTimeout, WriteTimeout, IdleTimeout later from config
-	}
-	appLogger.Info(context.Background(), fmt.Sprintf("HTTP server configured for port %d", appConfig.Server.HTTPPort))
-	return httpServer
+// WebsocketRouterProvider provides the websocket router.
+// Parameter wsHandler changed from http.Handler to *wsadapter.Handler
+func WebsocketRouterProvider(logger domain.Logger, cfgProvider config.Provider, authService *application.AuthService, wsHandler *wsadapter.Handler) *wsadapter.Router {
+	return wsadapter.NewRouter(logger, cfgProvider, authService, wsHandler)
 }
 
-// AuthServiceProvider provides the application.AuthService.
+// AuthServiceProvider provides the AuthService.
 func AuthServiceProvider(logger domain.Logger, cfgProvider config.Provider, tokenCache domain.TokenCacheStore) *application.AuthService {
 	return application.NewAuthService(logger, cfgProvider, tokenCache)
 }
 
-// WebsocketHandlerProvider provides the WebSocket connection handler.
-func WebsocketHandlerProvider(appLogger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager) *websocket.Handler {
-	// Here, you might also inject other dependencies into the NewHandler if it evolves,
-	// for example, a connection manager service.
-	return websocket.NewHandler(appLogger, cfgProvider, connManager)
-}
-
-// WebsocketRouterProvider provides the WebSocket router.
-// It depends on the WebsocketHandler to delegate connections to.
-func WebsocketRouterProvider(wsHandler *websocket.Handler, appLogger domain.Logger, cfgProvider config.Provider) *websocket.Router {
-	return websocket.NewRouter(appLogger, cfgProvider, wsHandler)
-}
-
-// RedisClientProvider provides a Redis client instance.
-func RedisClientProvider(cfgProvider config.Provider, appLogger domain.Logger) (*redisv9.Client, func(), error) {
-	cfg := cfgProvider.Get().Redis
-	client := redisv9.NewClient(&redisv9.Options{
-		Addr:     cfg.Address,
-		Password: cfg.Password,
-		DB:       cfg.DB,
+// RedisClientProvider provides a Redis client and a cleanup function.
+func RedisClientProvider(cfgProvider config.Provider, appLogger domain.Logger) (*redis.Client, func(), error) {
+	appCfg := cfgProvider.Get()
+	client := redis.NewClient(&redis.Options{
+		Addr:     appCfg.Redis.Address,
+		Password: appCfg.Redis.Password,
+		DB:       appCfg.Redis.DB,
 	})
-
-	// Check connection
-	statusCmd := client.Ping(context.Background())
-	if err := statusCmd.Err(); err != nil {
-		appLogger.Error(context.Background(), "Failed to connect to Redis", "address", cfg.Address, "error", err.Error())
-		return nil, func() { _ = client.Close() }, fmt.Errorf("failed to connect to Redis: %w", err)
+	_, err := client.Ping(context.Background()).Result()
+	if err != nil {
+		appLogger.Error(context.Background(), "Failed to connect to Redis", "error", err.Error(), "address", appCfg.Redis.Address)
+		return nil, nil, fmt.Errorf("failed to connect to Redis at %s: %w", appCfg.Redis.Address, err)
 	}
-	appLogger.Info(context.Background(), "Successfully connected to Redis", "address", cfg.Address)
-
 	cleanup := func() {
-		if err := client.Close(); err != nil {
-			appLogger.Error(context.Background(), "Failed to close Redis connection", "error", err.Error())
-		}
+		client.Close()
+		appLogger.Info(context.Background(), "Redis connection closed")
 	}
+	appLogger.Info(context.Background(), "Successfully connected to Redis", "address", appCfg.Redis.Address)
 	return client, cleanup, nil
 }
 
-// TokenCacheStoreProvider provides an instance of domain.TokenCacheStore (Redis implementation).
-// It seems NewTokenCacheAdapter was not created in previous tasks. This will be a placeholder.
-// TODO: Implement redisadapter.NewTokenCacheAdapter in internal/adapters/redis/token_cache_adapter.go
-func TokenCacheStoreProvider(redisClient *redisv9.Client, logger domain.Logger) domain.TokenCacheStore {
-	// return redisadapter.NewTokenCacheAdapter(redisClient, logger)
-	logger.Warn(context.Background(), "TokenCacheStoreProvider is using a nil placeholder because NewTokenCacheAdapter is not yet implemented.")
-	return nil // Placeholder until NewTokenCacheAdapter is implemented
+// SessionLockManagerProvider provides the session lock manager.
+func SessionLockManagerProvider(redisClient *redis.Client, logger domain.Logger) domain.SessionLockManager {
+	return appredis.NewSessionLockManagerAdapter(redisClient, logger)
 }
 
-// SessionLockManagerProvider provides an instance of domain.SessionLockManager.
-func SessionLockManagerProvider(redisClient *redisv9.Client, logger domain.Logger) domain.SessionLockManager {
-	return redisadapter.NewSessionLockManagerAdapter(redisClient, logger)
+// KillSwitchPubSubAdapterProvider provides the kill switch pub/sub adapter.
+func KillSwitchPubSubAdapterProvider(redisClient *redis.Client, logger domain.Logger) *appredis.KillSwitchPubSubAdapter {
+	return appredis.NewKillSwitchPubSubAdapter(redisClient, logger)
 }
 
-// KillSwitchPubSubAdapterProvider provides an instance that implements both
-// domain.KillSwitchPublisher and domain.KillSwitchSubscriber.
-func KillSwitchPubSubAdapterProvider(redisClient *redisv9.Client, logger domain.Logger) *redisadapter.KillSwitchPubSubAdapter {
-	return redisadapter.NewKillSwitchPubSubAdapter(redisClient, logger)
-}
-
-// ConnectionManagerProvider provides an instance of application.ConnectionManager.
+// ConnectionManagerProvider provides the connection manager.
 func ConnectionManagerProvider(
 	logger domain.Logger,
-	configProvider config.Provider,
+	cfgProvider config.Provider,
 	sessionLocker domain.SessionLockManager,
-	killSwitchPublisher domain.KillSwitchPublisher, // Will be the same instance as subscriber
-	killSwitchSubscriber domain.KillSwitchSubscriber, // Will be the same instance as publisher
+	killSwitchPub domain.KillSwitchPublisher,
+	killSwitchSub domain.KillSwitchSubscriber,
 ) *application.ConnectionManager {
-	return application.NewConnectionManager(logger, configProvider, sessionLocker, killSwitchPublisher, killSwitchSubscriber)
+	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub)
 }
 
-// ProviderSet is a Wire provider set that includes all the providers for the application.
+// TokenCacheStoreProvider provides a TokenCacheStore.
+func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.TokenCacheStore {
+	// TODO: Implement appredis.NewTokenCacheAdapter in internal/adapters/redis/token_cache_adapter.go
+	logger.Warn(context.Background(), "TokenCacheStoreProvider is using a placeholder nil implementation. Actual Redis-backed cache store needs to be implemented.")
+	return nil
+}
+
+// ProviderSet is the Wire provider set for the entire application.
 var ProviderSet = wire.NewSet(
-	BootstrapLoggerProvider,
 	ConfigProvider,
-	AppLoggerProvider,
-	HealthCheckHandlerProvider,
-	ReadinessCheckHandlerProvider,
+	LoggerProvider,
 	HTTPServeMuxProvider,
-	HTTPServerProvider,
-	// HTTPLogMiddlewareProvider, // Removed: not directly consumed by App
-	// APIKeyAuthMiddlewareProvider,       // Removed: created and used internally by WebsocketRouter
-	// CompanyTokenAuthMiddlewareProvider, // Removed: will be created and used internally by WebsocketRouter
-	AuthServiceProvider,
-	RedisClientProvider,
-	TokenCacheStoreProvider,
-	SessionLockManagerProvider,
-	KillSwitchPubSubAdapterProvider,
-	wire.Bind(new(domain.KillSwitchPublisher), new(*redisadapter.KillSwitchPubSubAdapter)),  // Bind adapter to publisher interface
-	wire.Bind(new(domain.KillSwitchSubscriber), new(*redisadapter.KillSwitchPubSubAdapter)), // Bind adapter to subscriber interface
+	HTTPGracefulServerProvider,
+
+	// HTTP Handlers and Middleware
+	GenerateTokenHandlerProvider,
+	TokenGenerationAuthMiddlewareProvider,
+
+	// WebSocket Components
 	WebsocketHandlerProvider,
 	WebsocketRouterProvider,
+	// AuthServiceProvide already here. No, it's AuthServiceProvider
+
+	// Infrastructure Adapters
+	RedisClientProvider,
+	SessionLockManagerProvider,
+	KillSwitchPubSubAdapterProvider,
+	wire.Bind(new(domain.KillSwitchPublisher), new(*appredis.KillSwitchPubSubAdapter)),
+	wire.Bind(new(domain.KillSwitchSubscriber), new(*appredis.KillSwitchPubSubAdapter)),
+	TokenCacheStoreProvider, // Added TokenCacheStoreProvider as AuthService needs it
+
+	// NATS - Currently commented out to isolate DI issues, will be re-enabled
+	// NatsConnProvider,
+	// NatsStreamProvider,
+	// NatsEventPublisherProvider,
+	// wire.Bind(new(domain.EventPublisher), new(*nats.EventPublisherAdapter)),
+	// NatsEventSubscriberProvider,
+	// wire.Bind(new(domain.EventSubscriber), new(*nats.EventSubscriberAdapter)),
+
+	// Application Services
+	AuthServiceProvider, // This is the one to keep
 	ConnectionManagerProvider,
-	// wire.Struct(new(App), "*"), // Intentionally commented out to use NewApp provider for *App
+
+	NewApp,
 )

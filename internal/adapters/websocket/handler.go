@@ -13,6 +13,7 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 
 	"github.com/coder/websocket"
@@ -38,21 +39,48 @@ func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *
 // ServeHTTP is the entry point for WebSocket upgrade requests.
 // It expects to be called after authentication middleware (APIKeyAuth, CompanyTokenAuth).
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	company := r.PathValue("company")
-	agent := r.PathValue("agent")
-	user := r.URL.Query().Get("user")
-	token := r.URL.Query().Get("token") // Token is for CompanyTokenAuth, but good to log its presence
+	pathCompany := r.PathValue("company")
+	pathAgent := r.PathValue("agent")
+	// user query param is no longer the primary source of user ID, but can be logged.
+	queryUser := r.URL.Query().Get("user")
+	token := r.URL.Query().Get("token") // Token is for CompanyTokenAuth, good to log its presence
 
-	if company == "" || agent == "" {
-		h.logger.Warn(r.Context(), "WebSocket upgrade failed: Missing company or agent in path",
-			"remote_addr", r.RemoteAddr, "path", r.URL.Path, "company", company, "agent", agent, "user", user, "token_present", token != "",
+	// Retrieve AuthenticatedUserContext injected by CompanyTokenAuthMiddleware
+	authCtx, ok := r.Context().Value(contextkeys.AuthUserContextKey).(*domain.AuthenticatedUserContext)
+	if !ok || authCtx == nil {
+		h.logger.Error(r.Context(), "AuthenticatedUserContext not found after middleware chain",
+			"path_company", pathCompany, "path_agent", pathAgent, "query_user", queryUser, "token_present", token != "",
 		)
-		domain.NewErrorResponse(domain.ErrBadRequest, "Missing company or agent in path parameters.", "").WriteJSON(w, http.StatusBadRequest)
+		// This should ideally not happen if middleware is correctly configured and run.
+		// If it does, it's an internal server error because the auth context is missing.
+		domain.NewErrorResponse(domain.ErrInternal, "Authentication context missing", "Server configuration error or middleware issue.").WriteJSON(w, http.StatusInternalServerError)
 		return
 	}
 
-	// TODO: Later, the AuthenticatedUserContext from CompanyTokenAuthMiddleware should be retrieved here.
-	// For now, we're just upgrading with APIKeyAuth having passed.
+	// Now, the authoritative identifiers come from the token.
+	// Path parameters (company, agent) might be used for resource identification or routing logic,
+	// but the user's identity (authCtx.CompanyID, authCtx.AgentID, authCtx.UserID) comes from the validated token.
+	// For session locking and identification, always use values from authCtx.
+
+	if pathCompany == "" || pathAgent == "" { // Still validate path params for resource routing
+		h.logger.Warn(r.Context(), "WebSocket upgrade failed: Missing company or agent in path",
+			"remote_addr", r.RemoteAddr, "path", r.URL.Path,
+			"auth_company_id", authCtx.CompanyID, "auth_agent_id", authCtx.AgentID, "auth_user_id", authCtx.UserID,
+		)
+		domain.NewErrorResponse(domain.ErrBadRequest, "Missing company or agent in path parameters.", "Ensure path is /ws/{company}/{agent}").WriteJSON(w, http.StatusBadRequest)
+		return
+	}
+
+	// Optional: Log if path params differ from token claims, might indicate a misconfiguration or specific intent.
+	if pathCompany != authCtx.CompanyID || pathAgent != authCtx.AgentID {
+		h.logger.Warn(r.Context(), "Path parameters differ from token claims",
+			"path_company", pathCompany, "token_company_id", authCtx.CompanyID,
+			"path_agent", pathAgent, "token_agent_id", authCtx.AgentID,
+			"token_user_id", authCtx.UserID,
+		)
+		// Depending on security policy, you might deny the connection here or proceed using token data as authoritative.
+		// For now, we'll proceed, using token data as authoritative for the session.
+	}
 
 	// Create a new context for this specific WebSocket connection's lifecycle.
 	// This context will be passed to the Connection wrapper.
@@ -65,15 +93,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lockAcqCtx, lockAcqCancel := context.WithTimeout(r.Context(), 5*time.Second) // Example timeout
 	defer lockAcqCancel()
 
-	acquired, err := h.connManager.AcquireSessionLockOrNotify(lockAcqCtx, company, agent, user)
+	acquired, err := h.connManager.AcquireSessionLockOrNotify(lockAcqCtx, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
 	if err != nil {
-		h.logger.Error(r.Context(), "Failed during session lock acquisition attempt", "error", err, "company", company, "agent", agent, "user", user)
+		h.logger.Error(r.Context(), "Failed during session lock acquisition attempt", "error", err,
+			"company", authCtx.CompanyID, "agent", authCtx.AgentID, "user", authCtx.UserID)
 		domain.NewErrorResponse(domain.ErrInternal, "Failed to process session.", err.Error()).WriteJSON(w, http.StatusInternalServerError)
 		cancelWsConnLifetimeCtx() // Important: cancel the context we created if we're aborting
 		return
 	}
 	if !acquired {
-		h.logger.Warn(r.Context(), "Session lock not acquired (conflict or notification sent)", "company", company, "agent", agent, "user", user)
+		h.logger.Warn(r.Context(), "Session lock not acquired (conflict or notification sent)",
+			"company", authCtx.CompanyID, "agent", authCtx.AgentID, "user", authCtx.UserID)
 		// Send a specific WebSocket close code if we could upgrade, or HTTP error if pre-upgrade.
 		// For now, sending HTTP 409 Conflict as an example. The PRD implies the kill happens on the *other* client.
 		// This new connection should be denied.
@@ -83,7 +113,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// If lock acquired, proceed to upgrade.
-	sessionKey := rediskeys.SessionKey(company, agent, user)
+	sessionKey := rediskeys.SessionKey(authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
 	h.logger.Info(r.Context(), "Session lock successfully acquired, proceeding to WebSocket upgrade", "sessionKey", sessionKey)
 
 	var wrappedConn *Connection // Declare wrappedConn here to be accessible for OnPongReceived
@@ -102,11 +132,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	c, err := websocket.Accept(w, r, &opts)
 	if err != nil {
-		h.logger.Error(r.Context(), "WebSocket upgrade failed", "error", err, "company", company, "agent", agent, "user", user)
+		h.logger.Error(r.Context(), "WebSocket upgrade failed", "error", err,
+			"company", authCtx.CompanyID, "agent", authCtx.AgentID, "user", authCtx.UserID)
 		// No HTTP response can be written here as hijack already happened or failed.
 		// Release the lock as we failed to establish the connection for this sessionKey
 		// This requires the current PodID which should be available in config.
-		currentPodID := h.configProvider.Get().App.PodID
+		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID != "" {
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer releaseCancel()
@@ -126,7 +157,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger.Info(wrappedConn.Context(), "WebSocket connection established",
 		"remoteAddr", wrappedConn.RemoteAddr(),
 		"subprotocol", c.Subprotocol(),
-		"company", company, "agent", agent, "user", user,
+		"company", authCtx.CompanyID,
+		"agent", authCtx.AgentID,
+		"user", authCtx.UserID,
 		"sessionKey", sessionKey)
 
 	// Register the connection with the ConnectionManager
@@ -137,7 +170,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.Info(wrappedConn.Context(), "Connection management goroutine finished. Deregistering connection.", "sessionKey", sessionKey)
 		h.connManager.DeregisterConnection(sessionKey)
 		// Also attempt to release the session lock owned by this pod when the connection closes cleanly.
-		currentPodID := h.configProvider.Get().App.PodID
+		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID != "" {
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second) // Use a fresh, short-lived context
 			defer releaseCancel()
@@ -147,20 +180,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				h.logger.Info(wrappedConn.Context(), "Successfully released session lock on connection close", "sessionKey", sessionKey)
 			} else {
 				// This might happen if the lock expired or was taken by another session (e.g. due to kill switch)
-				h.logger.Warn(wrappedConn.Context(), "Failed to release session lock on connection close (lock not held or value mismatch)", "sessionKey", sessionKey)
+				h.logger.Warn(wrappedConn.Context(), "Failed to release session lock on connection close (lock not held or value mismatch)", "sessionKey", sessionKey, "pod_id_used_for_release", currentPodID)
 			}
 		}
 	}()
 
-	go h.manageConnection(wsConnLifetimeCtx, wrappedConn, company, agent, user)
+	go h.manageConnection(wsConnLifetimeCtx, wrappedConn, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
 }
 
 // manageConnection handles the lifecycle of a single WebSocket connection.
 // It is responsible for reading messages, sending pings, handling timeouts, and ensuring cleanup.
+// The companyID, agentID, and userID parameters are now authoritative, derived from the validated token.
 func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, companyID, agentID, userID string) {
 	defer conn.Close(websocket.StatusNormalClosure, "connection ended") // Ensure WebSocket is closed
 
-	h.logger.Info(connCtx, "WebSocket connection established successfully", "subprotocol", conn.UnderlyingConn().Subprotocol(), "remote_addr", conn.RemoteAddr())
+	// Use the authenticated IDs for logging here
+	h.logger.Info(connCtx, "WebSocket connection management started",
+		"subprotocol", conn.UnderlyingConn().Subprotocol(),
+		"remote_addr", conn.RemoteAddr(),
+		"company_id", companyID,
+		"agent_id", agentID,
+		"user_id", userID)
 
 	// FR-12: Send {"type":"ready"} message (Subtask 4.4)
 	readyMessage := NewReadyMessage() // From websocket/protocol.go
@@ -287,7 +327,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 func (h *Handler) handleSelectChatMessage(connCtx context.Context, conn *Connection, rawPayload []byte, companyID, agentID, userID string) {
 	var selectChatPayload SelectChatMessagePayload
 	if err := json.Unmarshal(rawPayload, &selectChatPayload); err != nil {
-		h.logger.Error(connCtx, "Failed to unmarshal select_chat payload", "error", err)
+		h.logger.Error(connCtx, "Failed to unmarshal select_chat payload", "error", err, "company", companyID, "agent", agentID, "user", userID)
 		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", err.Error())
 		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
 			h.logger.Error(connCtx, "Failed to send error message to client for select_chat", "error", sendErr.Error())

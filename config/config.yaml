@@ -21,14 +21,17 @@ log:
 
 # Authentication Configuration
 auth:
-  # secret_token: "your_shared_api_key_here" # Corresponds to SECRET_TOKEN ENV - Prefer ENV for secrets
-  # token_aes_key: "your_32_byte_aes_gcm_key_hex_encoded_here" # Corresponds to TOKEN_AES_KEY ENV - Prefer ENV for secrets
+  secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE" # General API Key
+  token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE" # For company token encryption
+  token_generation_admin_key: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE" # For /generate-token endpoint
   token_cache_ttl_seconds: 30
 
 # Application Specific
 app:
   service_name: "daisi-ws-service"
+  version: "1.0.0"
   ping_interval_seconds: 20
+  shutdown_timeout_seconds: 30
   max_missed_pongs: 2
   session_ttl_seconds: 30
   route_ttl_seconds: 30

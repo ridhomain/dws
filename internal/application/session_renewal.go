@@ -11,7 +11,7 @@ func (cm *ConnectionManager) StartSessionRenewalLoop(appCtx context.Context) {
 	cfg := cm.configProvider.Get()
 	renewalInterval := time.Duration(cfg.App.TTLRefreshIntervalSeconds) * time.Second
 	sessionTTL := time.Duration(cfg.App.SessionTTLSeconds) * time.Second
-	podID := cfg.App.PodID
+	podID := cfg.Server.PodID
 
 	if renewalInterval <= 0 {
 		cm.logger.Warn(appCtx, "Session lock renewal interval is not configured or invalid; renewal loop will not start.", "intervalSeconds", cfg.App.TTLRefreshIntervalSeconds)
@@ -82,7 +82,7 @@ func (cm *ConnectionManager) StartSessionRenewalLoop(appCtx context.Context) {
 func (cm *ConnectionManager) StopSessionRenewalLoop() {
 	cfg := cm.configProvider.Get()
 	renewalInterval := time.Duration(cfg.App.TTLRefreshIntervalSeconds) * time.Second
-	if renewalInterval <= 0 || cfg.App.PodID == "" { // Check if loop was started
+	if renewalInterval <= 0 || cfg.Server.PodID == "" { // Check if loop was started
 		cm.logger.Info(context.Background(), "Session renewal loop was not started or podID not set, nothing to stop.")
 		return
 	}

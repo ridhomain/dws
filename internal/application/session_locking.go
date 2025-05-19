@@ -19,7 +19,7 @@ func (cm *ConnectionManager) SessionLocker() domain.SessionLockManager {
 // If the lock is already held, it publishes a notification to the kill switch channel.
 func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, companyID, agentID, userID string) (bool, error) {
 	cfg := cm.configProvider.Get()
-	podID := cfg.App.PodID
+	podID := cfg.Server.PodID
 	if podID == "" {
 		cm.logger.Error(ctx, "PodID is not configured. Session locking/notification will not work correctly.", "operation", "AcquireSessionLockOrNotify")
 		return false, fmt.Errorf("podID is not configured")

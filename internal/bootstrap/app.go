@@ -2,109 +2,112 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
-
-	"go.uber.org/zap"
+	// Imports for App struct fields if defined here, but App struct is in providers.go
+	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	// wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
+	// "gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	// "gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 )
 
-// App holds the main application components that are managed by DI (Wire).
-type App struct {
-	httpServer        *http.Server
-	logger            domain.Logger
-	wsRouter          *websocket.Router
-	httpServeMux      *http.ServeMux
-	connectionManager *application.ConnectionManager
-	// Add other long-lived components here, e.g., NATS connection, gRPC server
-}
+// NOTE: The App struct and NewApp function are defined in providers.go for Wire.
+// This file should only contain methods for the App struct, like Run().
 
-// NewApp creates a new application instance.
-// Dependencies are injected by Google Wire.
-func NewApp(
-	httpServer *http.Server,
-	logger domain.Logger,
-	wsRouter *websocket.Router,
-	httpServeMux *http.ServeMux,
-	connectionManager *application.ConnectionManager,
-) *App {
-	return &App{
-		httpServer:        httpServer,
-		logger:            logger,
-		wsRouter:          wsRouter,
-		httpServeMux:      httpServeMux,
-		connectionManager: connectionManager,
-	}
-}
-
-// Run starts the application, including the HTTP server, and handles graceful shutdown.
+// Run starts the application, listens for HTTP requests, and handles graceful shutdown.
 func (a *App) Run(ctx context.Context) error {
-	appCtx := ctx
-	if appCtx.Value(contextkeys.RequestIDKey) == nil {
-		appCtx = context.WithValue(appCtx, contextkeys.RequestIDKey, "app-lifecycle")
+	version := "unknown"              // Default if not found
+	serviceName := "daisi-ws-service" // Default service name
+	if a.configProvider != nil && a.configProvider.Get() != nil {
+		configApp := a.configProvider.Get().App
+		if configApp.Version != "" {
+			version = configApp.Version
+		}
+		if configApp.ServiceName != "" {
+			serviceName = configApp.ServiceName
+		}
+
 	}
+	a.logger.Info(ctx, "Starting application", "service_name", serviceName, "version", version)
 
-	a.logger.Info(appCtx, "Application starting...")
+	// Setup HTTP routes
+	a.httpServeMux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		a.logger.Info(r.Context(), "Health check endpoint hit")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"status":"OK"}`)
+	})
+	a.httpServeMux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+		a.logger.Info(r.Context(), "Readiness check endpoint hit")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"status":"READY"}`)
+	})
 
-	// Start ConnectionManager background services
-	if a.connectionManager != nil {
-		a.connectionManager.StartKillSwitchListener(appCtx)
-		a.logger.Info(appCtx, "ConnectionManager KillSwitch listener started")
-		a.connectionManager.StartSessionRenewalLoop(appCtx)
-		a.logger.Info(appCtx, "ConnectionManager Session Renewal loop started")
+	if a.wsRouter != nil {
+		a.wsRouter.RegisterRoutes(ctx, a.httpServeMux)
 	} else {
-		a.logger.Warn(appCtx, "ConnectionManager is nil, background services (KillSwitch, SessionRenewal) not started.")
+		a.logger.Warn(ctx, "WebSocket router is not initialized. WebSocket routes will not be available.")
 	}
 
-	a.wsRouter.RegisterRoutes(appCtx, a.httpServeMux)
-	a.logger.Info(appCtx, "WebSocket routes registered")
+	// Register /generate-token endpoint
+	// Assumes a.generateTokenHandler and a.tokenGenerationMiddleware are injected into App by Wire from providers.go
+	if a.generateTokenHandler != nil && a.tokenGenerationMiddleware != nil {
+		a.httpServeMux.Handle("POST /generate-token", a.tokenGenerationMiddleware(a.generateTokenHandler))
+		a.logger.Info(ctx, "/generate-token endpoint registered")
+	} else {
+		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
+	}
 
-	stopChan := make(chan os.Signal, 1)
-	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
+	if a.connectionManager != nil {
+		go func() {
+			a.connectionManager.StartKillSwitchListener(ctx)
+		}()
+		go func() {
+			a.connectionManager.StartSessionRenewalLoop(ctx)
+		}()
+	} else {
+		a.logger.Warn(ctx, "ConnectionManager not initialized. Session management features may be impaired.")
+	}
 
 	go func() {
-		a.logger.Info(appCtx, fmt.Sprintf("HTTP server starting on %s", a.httpServer.Addr))
-		if err := a.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			a.logger.Fatal(context.Background(), "HTTP server failed to start", zap.Error(err))
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		a.logger.Info(context.Background(), "Shutdown signal received, initiating graceful shutdown...")
+
+		shutdownTimeout := 30 * time.Second // Default
+		if a.configProvider != nil && a.configProvider.Get() != nil {
+			configApp := a.configProvider.Get().App
+			if configApp.ShutdownTimeoutSeconds > 0 {
+				shutdownTimeout = time.Duration(configApp.ShutdownTimeoutSeconds) * time.Second
+			}
 		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+
+		if a.connectionManager != nil {
+			a.connectionManager.StopKillSwitchListener()
+			a.connectionManager.StopSessionRenewalLoop()
+		}
+
+		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
+			a.logger.Error(context.Background(), "HTTP server graceful shutdown failed", "error", err.Error())
+		}
+		a.logger.Info(context.Background(), "HTTP server shut down.")
 	}()
 
-	<-stopChan
-
-	a.logger.Info(appCtx, "Shutting down application...")
-
-	// Stop ConnectionManager background services first
-	if a.connectionManager != nil {
-		a.logger.Info(appCtx, "Stopping ConnectionManager background services...")
-		// Stop renewal loop first, then kill switch listener
-		a.connectionManager.StopSessionRenewalLoop()
-		a.logger.Info(appCtx, "ConnectionManager Session Renewal loop stopped")
-
-		if err := a.connectionManager.StopKillSwitchListener(); err != nil {
-			a.logger.Error(appCtx, "Error stopping ConnectionManager KillSwitch listener", zap.Error(err))
-		} else {
-			a.logger.Info(appCtx, "ConnectionManager KillSwitch listener stopped")
-		}
-		a.logger.Info(appCtx, "ConnectionManager background services stopped.")
+	a.logger.Info(ctx, fmt.Sprintf("HTTP server listening on port %d", a.configProvider.Get().Server.HTTPPort))
+	if err := a.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		a.logger.Error(ctx, "HTTP server ListenAndServe error", "error", err.Error())
+		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelShutdown()
-
-	if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
-		a.logger.Error(appCtx, "HTTP server graceful shutdown failed", zap.Error(err))
-	} else {
-		a.logger.Info(appCtx, "HTTP server shutdown complete")
-	}
-
-	a.logger.Info(appCtx, "Application shutdown complete")
+	a.logger.Info(ctx, "Application shut down gracefully or server closed.")
 	return nil
 }

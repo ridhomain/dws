@@ -17,8 +17,9 @@ const envPrefix = "DAISI_WS"
 // ServerConfig holds server-related configurations.
 // Note: Fields should be exported (start with uppercase) to be unmarshalled by Viper.
 type ServerConfig struct {
-	HTTPPort int `mapstructure:"http_port"`
-	GRPCPort int `mapstructure:"grpc_port"`
+	HTTPPort int    `mapstructure:"http_port"`
+	GRPCPort int    `mapstructure:"grpc_port"`
+	PodID    string `mapstructure:"pod_id"` // Added for session management, expected from ENV (e.g., POD_IP via Downward API)
 }
 
 // NATSConfig holds NATS-related configurations.
@@ -42,15 +43,18 @@ type LogConfig struct {
 
 // AuthConfig holds authentication-related configurations.
 type AuthConfig struct {
-	SecretToken          string `mapstructure:"secret_token"`  // Should primarily come from ENV
-	TokenAESKey          string `mapstructure:"token_aes_key"` // Should primarily come from ENV
-	TokenCacheTTLSeconds int    `mapstructure:"token_cache_ttl_seconds"`
+	SecretToken             string `mapstructure:"secret_token"`               // Should primarily come from ENV
+	TokenAESKey             string `mapstructure:"token_aes_key"`              // Should primarily come from ENV
+	TokenGenerationAdminKey string `mapstructure:"token_generation_admin_key"` // New: Key for /generate-token endpoint, from ENV
+	TokenCacheTTLSeconds    int    `mapstructure:"token_cache_ttl_seconds"`
 }
 
 // AppConfig holds application-specific configurations.
 type AppConfig struct {
 	ServiceName               string `mapstructure:"service_name"`
+	Version                   string `mapstructure:"version"`
 	PingIntervalSeconds       int    `mapstructure:"ping_interval_seconds"`
+	ShutdownTimeoutSeconds    int    `mapstructure:"shutdown_timeout_seconds"`
 	PongWaitSeconds           int    `mapstructure:"pong_wait_seconds"`
 	WriteTimeoutSeconds       int    `mapstructure:"write_timeout_seconds"`
 	MaxMissedPongs            int    `mapstructure:"max_missed_pongs"`
@@ -58,7 +62,6 @@ type AppConfig struct {
 	RouteTTLSeconds           int    `mapstructure:"route_ttl_seconds"`
 	TTLRefreshIntervalSeconds int    `mapstructure:"ttl_refresh_interval_seconds"`
 	NATSMaxAckPending         int    `mapstructure:"nats_max_ack_pending"`
-	PodID                     string `mapstructure:"pod_id"`                      // Added for session management, expected from ENV (e.g., POD_IP via Downward API)
 	SessionLockRetryDelayMs   int    `mapstructure:"session_lock_retry_delay_ms"` // Delay in milliseconds for session lock retry
 }
 

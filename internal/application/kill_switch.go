@@ -20,7 +20,7 @@ func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message dom
 		"newPodIDInMessage", message.NewPodID,
 	)
 
-	currentPodID := cm.configProvider.Get().App.PodID
+	currentPodID := cm.configProvider.Get().Server.PodID
 	if message.NewPodID == currentPodID {
 		cm.logger.Info(ctx, "Kill message originated from this pod or is for a session this pod just acquired. No action needed on local connections.",
 			"channel", channel,
