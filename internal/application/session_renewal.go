@@ -3,6 +3,8 @@ package application
 import (
 	"context"
 	"time"
+
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 
 // StartSessionRenewalLoop starts a goroutine to periodically renew active session locks.
@@ -28,7 +30,7 @@ func (cm *ConnectionManager) StartSessionRenewalLoop(appCtx context.Context) {
 	cm.logger.Info(appCtx, "Starting session renewal loop", "renewalInterval", renewalInterval.String(), "sessionTTL", sessionTTL.String(), "podID", podID)
 	cm.renewalWg.Add(1)
 
-	go func() {
+	safego.Execute(appCtx, cm.logger, "SessionRenewalLoop", func() {
 		defer cm.renewalWg.Done()
 		ticker := time.NewTicker(renewalInterval)
 		defer ticker.Stop()
@@ -75,7 +77,7 @@ func (cm *ConnectionManager) StartSessionRenewalLoop(appCtx context.Context) {
 				return
 			}
 		}
-	}()
+	})
 }
 
 // StopSessionRenewalLoop signals the session renewal loop to stop and waits for it to complete.

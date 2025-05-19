@@ -7,6 +7,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 
 // KillSwitchPubSubAdapter implements both KillSwitchPublisher and KillSwitchSubscriber using Redis.
@@ -59,8 +60,7 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 
 	// Try to receive the first message to confirm subscription is active.
 	// This can be a PSubscribe confirmation message or an actual message.
-	_, err := a.sub.Receive(ctx)
-	if err != nil {
+	if _, err := a.sub.Receive(ctx); err != nil { // Use the passed-in context for initial Receive
 		a.logger.Error(ctx, "Failed to confirm Redis PSubscribe", "pattern", pattern, "error", err.Error())
 		// Ensure subscription is cleaned up if confirmation fails
 		_ = a.sub.Close()
@@ -71,32 +71,45 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 
 	ch := a.sub.Channel() // Get the message channel
 
-	go func() {
-		for msg := range ch {
-			var killMsg domain.KillSwitchMessage
-			if errUnmarshal := json.Unmarshal([]byte(msg.Payload), &killMsg); errUnmarshal != nil {
-				a.logger.Error(ctx, "Failed to unmarshal KillSwitchMessage from pub/sub",
-					"channel", msg.Channel,
-					"payload", msg.Payload,
-					"error", errUnmarshal.Error(),
-				)
-				continue // Skip malformed messages
-			}
+	// The goroutine that processes messages should also use the passed-in context (ctx)
+	// for its operations and respect its cancellation.
+	safego.Execute(ctx, a.logger, fmt.Sprintf("RedisKillSwitchMessageProcessor-%s", pattern), func() {
+		for {
+			select {
+			case msg, ok := <-ch:
+				if !ok {
+					a.logger.Info(ctx, "Redis pub/sub channel closed for pattern", "pattern", pattern)
+					return
+				}
 
-			a.logger.Info(ctx, "Received session kill message", "channel", msg.Channel, "new_pod_id", killMsg.NewPodID)
-			if errHandler := handler(msg.Channel, killMsg); errHandler != nil {
-				a.logger.Error(ctx, "Error in KillSwitchMessageHandler",
-					"channel", msg.Channel,
-					"new_pod_id", killMsg.NewPodID,
-					"error", errHandler.Error(),
-				)
-				// Decide on error handling: continue, retry, or stop subscription?
-				// For now, just log and continue.
+				var killMsg domain.KillSwitchMessage
+				if errUnmarshal := json.Unmarshal([]byte(msg.Payload), &killMsg); errUnmarshal != nil {
+					a.logger.Error(ctx, "Failed to unmarshal KillSwitchMessage from pub/sub",
+						"channel", msg.Channel,
+						"payload", msg.Payload,
+						"error", errUnmarshal.Error(),
+					)
+					continue // Skip malformed messages
+				}
+
+				a.logger.Info(ctx, "Received session kill message", "channel", msg.Channel, "new_pod_id", killMsg.NewPodID)
+				if errHandler := handler(msg.Channel, killMsg); errHandler != nil {
+					a.logger.Error(ctx, "Error in KillSwitchMessageHandler",
+						"channel", msg.Channel,
+						"new_pod_id", killMsg.NewPodID,
+						"error", errHandler.Error(),
+					)
+					// Decide on error handling: continue, retry, or stop subscription?
+					// For now, just log and continue.
+				}
+			case <-ctx.Done(): // Listen for cancellation of the context passed to SubscribeToSessionKillPattern
+				a.logger.Info(ctx, "Context cancelled, stopping Redis message processor for pattern", "pattern", pattern)
+				return
 			}
 		}
-		// If the loop exits, it means the subscription channel was closed.
-		a.logger.Info(ctx, "Subscription goroutine ended for pattern", "pattern", pattern)
-	}()
+		// If the loop exits, it means the subscription channel was closed or context was cancelled.
+		// a.logger.Info(ctx, "Subscription goroutine ended for pattern", "pattern", pattern) // This message might be redundant if already logged within the select cases.
+	})
 
 	return nil // The subscription itself runs in a goroutine; this function returns after setup.
 }

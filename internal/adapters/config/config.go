@@ -1,9 +1,11 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -91,7 +93,8 @@ type viperProvider struct {
 // NewViperProvider creates and initializes a new configuration provider using Viper.
 // It loads configuration from file and environment variables, and sets up hot-reloading.
 // A basic logger (e.g., zap.NewExample()) should be passed for internal logging during setup.
-func NewViperProvider(logger *zap.Logger) (Provider, error) {
+// appCtx is the application lifecycle context used for graceful shutdown of background tasks.
+func NewViperProvider(appCtx context.Context, logger *zap.Logger) (Provider, error) {
 	cfg := &Config{}
 	v := viper.New()
 
@@ -135,19 +138,34 @@ func NewViperProvider(logger *zap.Logger) (Provider, error) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGHUP)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("Panic recovered in SIGHUP handler goroutine",
+					zap.String("goroutine_name", "SIGHUPConfigReloader"),
+					zap.Any("panic_info", r),
+					zap.String("stacktrace", string(debug.Stack())),
+				)
+			}
+		}()
+		p.logger.Info("SIGHUPConfigReloader goroutine started.")
 		for {
-			<-sigChan
-			p.logger.Info("SIGHUP received, attempting to reload configuration...")
-			if err := v.ReadInConfig(); err != nil {
-				p.logger.Error("Failed to re-read config file on SIGHUP", zap.Error(err))
-			} else {
-				newCfg := &Config{}
-				if err := v.Unmarshal(newCfg); err != nil {
-					p.logger.Error("Failed to unmarshal re-read config on SIGHUP", zap.Error(err))
+			select {
+			case sig := <-sigChan:
+				p.logger.Info("SIGHUP received, attempting to reload configuration...", zap.String("signal", sig.String()))
+				if err := v.ReadInConfig(); err != nil {
+					p.logger.Error("Failed to re-read config file on SIGHUP", zap.Error(err))
 				} else {
-					p.config = newCfg
-					p.logger.Info("Configuration reloaded successfully via SIGHUP")
+					newCfg := &Config{}
+					if err := v.Unmarshal(newCfg); err != nil {
+						p.logger.Error("Failed to unmarshal re-read config on SIGHUP", zap.Error(err))
+					} else {
+						p.config = newCfg
+						p.logger.Info("Configuration reloaded successfully via SIGHUP")
+					}
 				}
+			case <-appCtx.Done():
+				p.logger.Info("SIGHUPConfigReloader goroutine shutting down due to context cancellation.")
+				return // Exit goroutine when application context is done
 			}
 		}
 	}()
@@ -155,7 +173,17 @@ func NewViperProvider(logger *zap.Logger) (Provider, error) {
 	// Optional: Watch for config file changes (useful for local dev, less so in containers usually)
 	v.WatchConfig()
 	v.OnConfigChange(func(e fsnotify.Event) {
-		p.logger.Info("Config file changed", zap.String("name", e.Name))
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("Panic recovered in OnConfigChange callback",
+					zap.String("event_name", e.Name),
+					zap.String("event_op", e.Op.String()),
+					zap.Any("panic_info", r),
+					zap.String("stacktrace", string(debug.Stack())),
+				)
+			}
+		}()
+		p.logger.Info("Config file changed", zap.String("name", e.Name), zap.String("op", e.Op.String()))
 		newCfg := &Config{}
 		if err := v.Unmarshal(newCfg); err != nil {
 			p.logger.Error("Failed to unmarshal config on file change event", zap.Error(err))

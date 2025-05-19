@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 
 	"github.com/coder/websocket"
 )
@@ -185,7 +187,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	go h.manageConnection(wsConnLifetimeCtx, wrappedConn, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
+	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("WebSocketConnectionManager-%s", sessionKey), func() {
+		h.manageConnection(wsConnLifetimeCtx, wrappedConn, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
+	})
 }
 
 // manageConnection handles the lifecycle of a single WebSocket connection.
@@ -223,7 +227,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		defer pinger.Stop()
 
 		// Goroutine for sending pings periodically
-		go func() {
+		safego.Execute(connCtx, conn.logger, fmt.Sprintf("WebSocketPinger-%s", conn.RemoteAddr()), func() {
 			for {
 				select {
 				case <-pinger.C:
@@ -249,7 +253,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					return
 				}
 			}
-		}()
+		})
 	} else {
 		h.logger.Warn(connCtx, "Ping interval is not configured or invalid, server-initiated pings disabled.", "configured_interval_sec", appCfg.PingIntervalSeconds)
 	}

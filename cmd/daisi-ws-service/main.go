@@ -11,10 +11,6 @@ import (
 	// as they are handled by the bootstrap package and Wire.
 )
 
-// APP_NAME defines the application name, used for service identification.
-// This can also be loaded from initial config if needed before full DI setup.
-const APP_NAME = bootstrap.ServiceName("daisi-ws-service")
-
 func main() {
 	// Create a root context for the application.
 	// This context can be enhanced with initial values if necessary.
@@ -23,7 +19,8 @@ func main() {
 
 	// Initialize the application using the Wire-generated injector.
 	// The serviceName is passed here; it could also be derived from initial config loading if complex.
-	app, cleanup, err := bootstrap.InitializeApp(ctx, APP_NAME)
+	// The InitializeApp function now likely only takes context, based on linter errors and Wire output.
+	app, cleanup, err := bootstrap.InitializeApp(ctx)
 	if err != nil {
 		// A very basic log if bootstrap fails, as the main logger isn't available.
 		fmt.Printf("Failed to initialize application: %v\n", err)

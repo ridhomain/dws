@@ -9,6 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	// Imports for App struct fields if defined here, but App struct is in providers.go
 	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	// wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
@@ -65,21 +67,25 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	if a.connectionManager != nil {
-		go func() {
+		safego.Execute(ctx, a.logger, "ConnectionManagerKillSwitchListener", func() {
 			a.connectionManager.StartKillSwitchListener(ctx)
-		}()
-		go func() {
+		})
+		safego.Execute(ctx, a.logger, "ConnectionManagerSessionRenewalLoop", func() {
 			a.connectionManager.StartSessionRenewalLoop(ctx)
-		}()
+		})
 	} else {
 		a.logger.Warn(ctx, "ConnectionManager not initialized. Session management features may be impaired.")
 	}
 
-	go func() {
+	safego.Execute(ctx, a.logger, "SignalListenerAndGracefulShutdown", func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-		<-quit
-		a.logger.Info(context.Background(), "Shutdown signal received, initiating graceful shutdown...")
+		select {
+		case sig := <-quit:
+			a.logger.Info(context.Background(), "Shutdown signal received, initiating graceful shutdown...", "signal", sig.String())
+		case <-ctx.Done(): // Listen to the application context as well
+			a.logger.Info(context.Background(), "Application context cancelled, initiating graceful shutdown...")
+		}
 
 		shutdownTimeout := 30 * time.Second // Default
 		if a.configProvider != nil && a.configProvider.Get() != nil {
@@ -100,7 +106,7 @@ func (a *App) Run(ctx context.Context) error {
 			a.logger.Error(context.Background(), "HTTP server graceful shutdown failed", "error", err.Error())
 		}
 		a.logger.Info(context.Background(), "HTTP server shut down.")
-	}()
+	})
 
 	a.logger.Info(ctx, fmt.Sprintf("HTTP server listening on port %d", a.configProvider.Get().Server.HTTPPort))
 	if err := a.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

@@ -81,12 +81,10 @@ func NewApp(
 }
 
 // ConfigProvider provides the application configuration.
-func ConfigProvider() (config.Provider, error) {
-	// For NewViperProvider to log its own errors, we give it a basic logger.
-	// This logger won't have the full app config (like log level from file) yet.
-	basicLogger, _ := zap.NewProduction() // Or zap.NewDevelopment() or zap.NewExample()
-	// In a real app, you might have a more sophisticated bootstrap logging setup.
-	return config.NewViperProvider(basicLogger)
+// It now accepts appCtx to be passed to NewViperProvider for graceful goroutine shutdown.
+func ConfigProvider(appCtx context.Context, logger *zap.Logger) (config.Provider, error) {
+	// Pass the application context to the Viper provider constructor
+	return config.NewViperProvider(appCtx, logger)
 }
 
 // LoggerProvider provides the application logger.

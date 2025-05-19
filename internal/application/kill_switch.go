@@ -8,6 +8,7 @@ import (
 	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 
 const sessionKillChannelPrefix = "session_kill:"
@@ -83,13 +84,19 @@ func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message dom
 // StartKillSwitchListener starts the Redis Pub/Sub listener for session kill messages.
 func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
 	cm.logger.Info(ctx, "Starting KillSwitch listener...")
-	go func() {
+	safego.Execute(ctx, cm.logger, "KillSwitchSubscriberLoop", func() {
 		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, rediskeys.SessionKillChannelKey("*", "*", "*"), cm.handleKillSwitchMessage)
 		if err != nil {
-			cm.logger.Error(ctx, "KillSwitch subscriber failed or terminated", "error", err.Error())
+			// Check if the context was cancelled, which might be a normal shutdown scenario
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
 		}
-	}()
-	cm.logger.Info(ctx, "ConnectionManager KillSwitch listener stopped.") // This log might be misleading as it logs before the goroutine actually stops.
+		// This log is reached when the SubscribeToSessionKillPattern function returns, either due to error or graceful stop.
+		cm.logger.Info(ctx, "ConnectionManager KillSwitch listener goroutine finished.")
+	})
 }
 
 // StopKillSwitchListener gracefully stops the subscriber.
