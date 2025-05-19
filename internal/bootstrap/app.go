@@ -90,11 +90,11 @@ func (a *App) Run(ctx context.Context) error {
 		safego.Execute(ctx, a.logger, "ConnectionManagerAdminKillSwitchListener", func() {
 			a.connectionManager.StartAdminKillSwitchListener(ctx)
 		})
-		safego.Execute(ctx, a.logger, "ConnectionManagerSessionRenewalLoop", func() {
-			a.connectionManager.StartSessionRenewalLoop(ctx)
+		safego.Execute(ctx, a.logger, "ConnectionManagerResourceRenewalLoop", func() {
+			a.connectionManager.StartResourceRenewalLoop(ctx)
 		})
 	} else {
-		a.logger.Warn(ctx, "ConnectionManager not initialized. Session management features may be impaired.")
+		a.logger.Warn(ctx, "ConnectionManager not initialized. Session and route management features may be impaired.")
 	}
 
 	safego.Execute(ctx, a.logger, "SignalListenerAndGracefulShutdown", func() {
@@ -119,7 +119,7 @@ func (a *App) Run(ctx context.Context) error {
 
 		if a.connectionManager != nil {
 			a.connectionManager.StopKillSwitchListener()
-			a.connectionManager.StopSessionRenewalLoop()
+			a.connectionManager.StopResourceRenewalLoop()
 		}
 
 		// Call NATS cleanup if available - This is now handled by Wire's aggregated cleanup.

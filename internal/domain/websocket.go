@@ -22,4 +22,7 @@ type ManagedConnection interface {
 	// Context returns the context associated with this specific connection.
 	// This context may contain connection-specific logging information like request_id.
 	Context() context.Context
+
+	// GetCurrentChatID returns the current chat ID associated with this connection.
+	GetCurrentChatID() string
 }

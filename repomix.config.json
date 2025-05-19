@@ -5,11 +5,11 @@
   "output": {
     "filePath": "repomix-output.md",
     "style": "markdown",
-    "parsableStyle": false,
+    "parsableStyle": true,
     "fileSummary": true,
     "directoryStructure": true,
     "files": true,
-    "removeComments": false,
+    "removeComments": true,
     "removeEmptyLines": true,
     "compress": false,
     "topFilesLength": 5,
