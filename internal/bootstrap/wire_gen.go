@@ -16,35 +16,44 @@ import (
 // Wire will use the providers in ProviderSet and the NewApp function to build the *App.
 // The cleanup function returned can be used to sync loggers or close other resources.
 func InitializeApp(ctx context.Context) (*App, func(), error) {
-	provider, err := ConfigProvider()
+	logger, cleanup, err := InitialZapLoggerProvider()
 	if err != nil {
 		return nil, nil, err
 	}
-	logger, err := LoggerProvider(provider)
-	if err != nil {
-		return nil, nil, err
-	}
-	serveMux := HTTPServeMuxProvider()
-	server := HTTPGracefulServerProvider(provider, serveMux)
-	handlerFunc := GenerateTokenHandlerProvider(provider, logger)
-	v := TokenGenerationAuthMiddlewareProvider(provider, logger)
-	client, cleanup, err := RedisClientProvider(provider, logger)
-	if err != nil {
-		return nil, nil, err
-	}
-	tokenCacheStore := TokenCacheStoreProvider(client, logger)
-	authService := AuthServiceProvider(logger, provider, tokenCacheStore)
-	sessionLockManager := SessionLockManagerProvider(client, logger)
-	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, logger)
-	connectionManager := ConnectionManagerProvider(logger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
-	handler := WebsocketHandlerProvider(logger, provider, connectionManager)
-	router := WebsocketRouterProvider(logger, provider, authService, handler)
-	app, cleanup2, err := NewApp(provider, logger, serveMux, server, handlerFunc, v, router, connectionManager)
+	provider, err := ConfigProvider(ctx, logger)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
+	domainLogger, err := LoggerProvider(provider)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	serveMux := HTTPServeMuxProvider()
+	server := HTTPGracefulServerProvider(provider, serveMux)
+	handlerFunc := GenerateTokenHandlerProvider(provider, domainLogger)
+	v := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
+	client, cleanup2, err := RedisClientProvider(provider, domainLogger)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
+	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore)
+	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
+	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
+	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter)
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager)
+	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
+	app, cleanup3, err := NewApp(provider, domainLogger, serveMux, server, handlerFunc, v, router, connectionManager)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
 	return app, func() {
+		cleanup3()
 		cleanup2()
 		cleanup()
 	}, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/wire"
@@ -25,6 +26,35 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	// "gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys" // Not directly used in this file
 )
+
+// InitialZapLoggerProvider provides a basic *zap.Logger instance, primarily for config initialization.
+// It returns the logger, a cleanup function (for syncing), and an error if creation fails.
+func InitialZapLoggerProvider() (*zap.Logger, func(), error) {
+	// Using zap.NewProduction() for a realistic default.
+	// Consider making this configurable via a simple ENV var if needed for dev vs. prod initial logging.
+	logger, err := zap.NewProduction()
+	if err != nil {
+		// Try NewDevelopment if NewProduction fails
+		logger, err = zap.NewDevelopment()
+		if err != nil {
+			// As a last resort, use NewExample, which does not return an error.
+			// This is unlikely to be hit if NewProduction/NewDevelopment are available.
+			logger = zap.NewExample()
+			// We will proceed with NewExample, but log the original error to stderr for visibility
+			fmt.Fprintf(os.Stderr, "Failed to create initial zap logger (production and development failed, falling back to example): %v\n", err)
+		}
+	}
+
+	cleanup := func() {
+		// Syncing flushes any buffered log entries.
+		// It's good practice, especially before application exit.
+		if syncErr := logger.Sync(); syncErr != nil {
+			// Log to stderr if sync fails, as the logger itself might be compromised.
+			fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
+		}
+	}
+	return logger, cleanup, nil
+}
 
 // App struct is defined here for Wire to use.
 // It should be the single definition of App in the bootstrap package.
@@ -204,6 +234,7 @@ var ProviderSet = wire.NewSet(
 	LoggerProvider,
 	HTTPServeMuxProvider,
 	HTTPGracefulServerProvider,
+	InitialZapLoggerProvider,
 
 	// HTTP Handlers and Middleware
 	GenerateTokenHandlerProvider,
