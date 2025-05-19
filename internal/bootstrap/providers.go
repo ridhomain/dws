@@ -230,38 +230,22 @@ func KillSwitchPubSubAdapterProvider(redisClient *redis.Client, logger domain.Lo
 	return appredis.NewKillSwitchPubSubAdapter(redisClient, logger)
 }
 
-// ConnectionManagerProvider provides the connection manager.
+// ConnectionManagerProvider provides a ConnectionManager.
 func ConnectionManagerProvider(
 	logger domain.Logger,
 	cfgProvider config.Provider,
 	sessionLocker domain.SessionLockManager,
 	killSwitchPub domain.KillSwitchPublisher,
 	killSwitchSub domain.KillSwitchSubscriber,
+	routeRegistry domain.RouteRegistry, // Added RouteRegistry dependency
 ) *application.ConnectionManager {
-	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub)
+	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub, routeRegistry) // Pass routeRegistry
 }
 
 // TokenCacheStoreProvider provides a TokenCacheStore.
 func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.TokenCacheStore {
-	// TODO: Implement appredis.NewTokenCacheAdapter in internal/adapters/redis/token_cache_adapter.go
 	logger.Warn(context.Background(), "TokenCacheStoreProvider is using a placeholder nil implementation. Actual Redis-backed cache store needs to be implemented.")
-	// For now, let's assume this TODO means we should actually provide it if it exists, or a real nil if not.
-	// If the previous step created internal/adapters/redis/token_cache_adapter.go, use it.
-	// Otherwise, if that file is still pending, this would be the place to create and use it.
-	// For now, I will assume it's not created and return nil, and address the TODO later.
-	// Update: The TODO was to implement it. If it's not, this will cause a panic in AuthService. For now, will stub it.
-	// return nil // This will cause panic in NewAuthService if not handled.
-	// Let's assume the adapter exists for TokenCacheStore, and we need one for AdminTokenCacheStore.
-	// If TokenCacheStore itself is not implemented, that's a separate issue.
-	// Based on diary, TokenCacheStore (for company tokens) should be implemented.
-	// The current diary does not mention explicit implementation of Redis backed TokenCacheStore, but it's required by AuthService.
-	// The current goal is Admin WebSocket, so I will focus on AdminTokenCacheStoreProvider.
-	// For TokenCacheStore, if it's not there, wire will complain. Let's assume it is or will be handled.
-	// For now, to unblock admin flow, if the actual file internal/adapters/redis/token_cache_adapter.go is not there or not implemented, this will need attention.
-	// For the purpose of this diff, let's assume it's using a similar adapter.
-	// return appredis.NewTokenCacheAdapter(redisClient, logger) // Assuming this exists from a previous task.
-	// The current diary shows a token_cache.go with TokenCacheStore interface but no redis adapter for it yet in bootstrap. This is a pre-existing issue.
-	// I will return nil for now and add a TODO, as per original code.
+	// TODO: Replace with actual appredis.NewTokenCacheAdapter(redisClient, logger) once implemented
 	return nil
 }
 
@@ -273,6 +257,11 @@ func AdminTokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logge
 // NatsConsumerAdapterProvider provides the NATS ConsumerAdapter.
 func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (*appnats.ConsumerAdapter, func(), error) {
 	return appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger)
+}
+
+// Provider for RouteRegistry
+func RouteRegistryProvider(redisClient *redis.Client, logger domain.Logger) domain.RouteRegistry {
+	return appredis.NewRouteRegistryAdapter(redisClient, logger)
 }
 
 // ProviderSet is the Wire provider set for the entire application.
@@ -314,6 +303,7 @@ var ProviderSet = wire.NewSet(
 	AdminAuthMiddlewareProvider,   // Added for admin auth
 	AdminWebsocketHandlerProvider, // Added for admin websocket
 	AdminTokenCacheStoreProvider,  // Added for admin token caching
+	RouteRegistryProvider,         // Added RouteRegistryProvider
 	NewApp,
 	NatsConsumerAdapterProvider,
 )

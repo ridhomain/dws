@@ -168,8 +168,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"user", authCtx.UserID,
 		"sessionKey", sessionKey)
 
-	// Register the connection with the ConnectionManager
-	h.connManager.RegisterConnection(sessionKey, wrappedConn)
+	// Pass companyID and agentID for route registration
+	h.connManager.RegisterConnection(sessionKey, wrappedConn, authCtx.CompanyID, authCtx.AgentID)
 
 	// Defer deregistration for when manageConnection exits
 	defer func() {
@@ -385,8 +385,10 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 			switch baseMsg.Type {
 			case MessageTypeSelectChat:
-				h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID)
+				h.logger.Info(connCtx, "Handling select_chat message type")
+				h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload)
 			default:
+				h.logger.Warn(connCtx, "Handling unknown message type", "type", baseMsg.Type)
 				h.handleUnknownMessage(connCtx, conn, baseMsg)
 			}
 		} else if msgType == websocket.MessageBinary {
@@ -397,19 +399,110 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 }
 
 // handleSelectChatMessage processes incoming messages of type MessageTypeSelectChat.
-func (h *Handler) handleSelectChatMessage(connCtx context.Context, conn *Connection, rawPayload []byte, companyID, agentID, userID string) {
-	var selectChatPayload SelectChatMessagePayload
-	if err := json.Unmarshal(rawPayload, &selectChatPayload); err != nil {
-		h.logger.Error(connCtx, "Failed to unmarshal select_chat payload", "error", err, "company", companyID, "agent", agentID, "user", userID)
-		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", err.Error())
+// It now accepts the already unmarshalled payload to avoid double unmarshalling.
+func (h *Handler) handleSelectChatMessage(connCtx context.Context, conn *Connection, rawPayload []byte, companyID, agentID, userID string, payloadData interface{}) {
+	// The payloadData is expected to be a map[string]interface{} due to initial unmarshal into BaseMessage
+	payloadMap, ok := payloadData.(map[string]interface{})
+	if !ok {
+		h.logger.Error(connCtx, "Invalid payload structure for select_chat after initial unmarshal", "type_received", fmt.Sprintf("%T", payloadData))
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload structure", "Expected a JSON object as payload.")
 		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for select_chat", "error", sendErr.Error())
+			h.logger.Error(connCtx, "Failed to send error message to client for select_chat structure", "error", sendErr.Error())
 		}
-		return // Return from handler, manageConnection loop will continue
+		return
 	}
-	h.logger.Info(connCtx, "Client selected chat", "chat_id", selectChatPayload.ChatID, "company", companyID, "agent", agentID, "user", userID)
-	// TODO (FR-5): Implement dynamic route registration logic with ConnectionManager/RouteRegistry
-	// e.g., h.connManager.UpdateChatSubscription(ctx, sessionKey, companyID, agentID, userID, selectChatPayload.ChatID)
+
+	chatIDInterface, found := payloadMap["chat_id"]
+	if !found {
+		h.logger.Error(connCtx, "chat_id missing from select_chat payload map", "company", companyID, "agent", agentID, "user", userID)
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", "chat_id is missing.")
+		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
+			h.logger.Error(connCtx, "Failed to send error message to client for missing chat_id", "error", sendErr.Error())
+		}
+		return
+	}
+
+	chatID, ok := chatIDInterface.(string)
+	if !ok || chatID == "" {
+		h.logger.Error(connCtx, "Invalid chat_id type or empty in select_chat payload", "type_received", fmt.Sprintf("%T", chatIDInterface), "value", chatIDInterface, "company", companyID, "agent", agentID, "user", userID)
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", "chat_id must be a non-empty string.")
+		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
+			h.logger.Error(connCtx, "Failed to send error message to client for invalid chat_id type", "error", sendErr.Error())
+		}
+		return
+	}
+
+	h.logger.Info(connCtx, "Client selected chat", "chat_id", chatID, "company", companyID, "agent", agentID, "user", userID)
+
+	// --- Subtask 7.4: Message Route Management Logic ---
+	cfg := h.configProvider.Get()
+	podID := cfg.Server.PodID
+	routeTTL := time.Duration(cfg.App.RouteTTLSeconds) * time.Second
+	if routeTTL <= 0 {
+		routeTTL = 30 * time.Second // Default if not configured
+		h.logger.Warn(connCtx, "RouteTTLSeconds not configured or zero, using default 30s for message route registration", "newChatID", chatID)
+	}
+
+	if podID == "" {
+		h.logger.Error(connCtx, "PodID is not configured. Cannot manage message routes.", "newChatID", chatID)
+		// Optionally send an error back to the client
+		errorResponse := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Cannot process chat selection due to server misconfiguration.")
+		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
+			h.logger.Error(connCtx, "Failed to send error message to client for podID config error", "error", sendErr.Error())
+		}
+		return
+	}
+
+	routeReg := h.connManager.RouteRegistrar()
+	if routeReg == nil {
+		h.logger.Error(connCtx, "RouteRegistry is not available in ConnectionManager. Cannot manage message routes.", "newChatID", chatID)
+		// Optionally send an error back to the client
+		errorResponse := domain.NewErrorResponse(domain.ErrInternal, "Server error", "Cannot process chat selection due to server error.")
+		if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
+			h.logger.Error(connCtx, "Failed to send error message to client for RouteRegistry nil error", "error", sendErr.Error())
+		}
+		return
+	}
+
+	// 1. Retrieve Old Chat ID
+	oldChatID := conn.GetCurrentChatID()
+
+	// 2. Unregister Old Message Route (if an old chat ID existed and is different from the new one)
+	if oldChatID != "" && oldChatID != chatID {
+		h.logger.Info(connCtx, "Unregistering old message route", "oldChatID", oldChatID, "podID", podID)
+		if err := routeReg.UnregisterMessageRoute(connCtx, companyID, agentID, oldChatID, podID); err != nil {
+			h.logger.Error(connCtx, "Failed to unregister old message route",
+				"oldChatID", oldChatID, "podID", podID, "error", err.Error(),
+			)
+			// Continue to register the new one, but log the error
+		} else {
+			h.logger.Info(connCtx, "Successfully unregistered old message route", "oldChatID", oldChatID)
+		}
+	}
+
+	// 3. Register New Message Route (only if it's different from the old one or if there was no old one)
+	if oldChatID != chatID {
+		h.logger.Info(connCtx, "Registering new message route", "newChatID", chatID, "podID", podID, "ttl", routeTTL.String())
+		if err := routeReg.RegisterMessageRoute(connCtx, companyID, agentID, chatID, podID, routeTTL); err != nil {
+			h.logger.Error(connCtx, "Failed to register new message route",
+				"newChatID", chatID, "podID", podID, "error", err.Error(),
+			)
+			// Optionally send an error back to the client
+			errorResponse := domain.NewErrorResponse(domain.ErrInternal, "Failed to select chat", "Could not update message subscription.")
+			if sendErr := conn.WriteJSON(NewErrorMessage(errorResponse)); sendErr != nil {
+				h.logger.Error(connCtx, "Failed to send error message to client for new route registration failure", "error", sendErr.Error())
+			}
+			// Do not update currentChatID if registration fails
+			return
+		} else {
+			h.logger.Info(connCtx, "Successfully registered new message route", "newChatID", chatID)
+		}
+	}
+
+	// 4. Update Stored Chat ID
+	conn.SetCurrentChatID(chatID)
+	h.logger.Info(connCtx, "Updated current chat ID for connection", "newChatID", chatID)
+
 }
 
 // handleUnknownMessage processes incoming messages of an unknown type.

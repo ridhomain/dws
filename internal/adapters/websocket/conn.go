@@ -26,7 +26,9 @@ type Connection struct {
 	writeTimeoutSeconds int
 	pingIntervalSeconds int
 	pongWaitSeconds     int
-	remoteAddrStr       string // Storing remote address as a string
+	remoteAddrStr       string     // Storing remote address as a string
+	currentChatID       string     // Added to store the current chat ID for this connection
+	currentChatIDMu     sync.Mutex // Mutex to protect access to currentChatID
 }
 
 // NewConnection creates a new Connection wrapper.
@@ -50,6 +52,7 @@ func NewConnection(
 		pingIntervalSeconds: appCfg.PingIntervalSeconds,
 		pongWaitSeconds:     appCfg.PongWaitSeconds,
 		remoteAddrStr:       remoteAddr, // Store the provided remote address string
+		currentChatID:       "",         // currentChatID is initialized as empty string
 	}
 }
 
@@ -133,6 +136,20 @@ func (c *Connection) Ping(ctx context.Context) error {
 		defer cancel()
 	}
 	return c.wsConn.Ping(ctxToWrite)
+}
+
+// GetCurrentChatID safely retrieves the current chat ID for the connection.
+func (c *Connection) GetCurrentChatID() string {
+	c.currentChatIDMu.Lock()
+	defer c.currentChatIDMu.Unlock()
+	return c.currentChatID
+}
+
+// SetCurrentChatID safely sets the current chat ID for the connection.
+func (c *Connection) SetCurrentChatID(chatID string) {
+	c.currentChatIDMu.Lock()
+	defer c.currentChatIDMu.Unlock()
+	c.currentChatID = chatID
 }
 
 // marshalToJSON helper is removed as per previous decision.
