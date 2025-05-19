@@ -114,8 +114,6 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Register the admin connection with the ConnectionManager
-	// TODO: ConnectionManager needs a way to distinguish admin connections or use a separate map if logic differs significantly.
-	// For now, using existing RegisterConnection. This will be refined in 12.4.
 	h.connManager.RegisterConnection(adminSessionKey, wrappedConn)
 
 	defer func() {
@@ -171,11 +169,9 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		} // Default to wildcard if not specified
 
 		natsMsgHandler := func(msg *nats.Msg) {
-			// TODO: Subtask 12.3: Parse EnrichedEventPayload (agent data) and forward to admin client
 			h.logger.Info(connCtx, "Admin NATS: Received message on agent events subject",
 				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
 			)
-			// Placeholder for 12.3:
 			var eventPayload domain.EnrichedEventPayload
 			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
 				h.logger.Error(connCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)

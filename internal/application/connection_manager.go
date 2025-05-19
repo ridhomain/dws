@@ -45,8 +45,3 @@ func NewConnectionManager(
 		// renewalWg is initialized by its zero value, which is fine for sync.WaitGroup
 	}
 }
-
-// TODO: Implement other methods for connection lifecycle management as per subsequent subtasks:
-// - HandleNewConnection(w http.ResponseWriter, r *http.Request, userCtx *domain.AuthenticatedUserContext)
-// - ManageExistingConnection(conn *websocket.ConnectionWrapper, userCtx *domain.AuthenticatedUserContext, companyID, agentID, userID string)
-// - RenewAllActiveSessionLocks() // for periodic renewal

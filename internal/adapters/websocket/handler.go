@@ -223,9 +223,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	if h.natsAdapter != nil {
 		// Define the message handler for NATS messages
 		natsMsgHandler := func(msg *nats.Msg) {
-			// Implement Subtask 6.3: Parse EnrichedEventPayload and forward to WebSocket client
 			h.logger.Info(connCtx, "Received NATS message", "subject", msg.Subject, "data_len", len(msg.Data))
-
 			var eventPayload domain.EnrichedEventPayload // Using placeholder from domain/nats_payloads.go
 			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
 				h.logger.Error(connCtx, "Failed to unmarshal NATS message into EnrichedEventPayload",
