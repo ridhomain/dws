@@ -19,9 +19,10 @@ const envPrefix = "DAISI_WS"
 // ServerConfig holds server-related configurations.
 // Note: Fields should be exported (start with uppercase) to be unmarshalled by Viper.
 type ServerConfig struct {
-	HTTPPort int    `mapstructure:"http_port"`
-	GRPCPort int    `mapstructure:"grpc_port"`
-	PodID    string `mapstructure:"pod_id"` // Added for session management, expected from ENV (e.g., POD_IP via Downward API)
+	HTTPPort         int    `mapstructure:"http_port"`
+	GRPCPort         int    `mapstructure:"grpc_port"`
+	PodID            string `mapstructure:"pod_id"`            // Added for session management, expected from ENV (e.g., POD_IP via Downward API)
+	EnableReflection bool   `mapstructure:"enable_reflection"` // For gRPC server reflection
 }
 
 // NATSConfig holds NATS-related configurations.
@@ -55,19 +56,20 @@ type AuthConfig struct {
 
 // AppConfig holds application-specific configurations.
 type AppConfig struct {
-	ServiceName               string `mapstructure:"service_name"`
-	Version                   string `mapstructure:"version"`
-	PingIntervalSeconds       int    `mapstructure:"ping_interval_seconds"`
-	ShutdownTimeoutSeconds    int    `mapstructure:"shutdown_timeout_seconds"`
-	PongWaitSeconds           int    `mapstructure:"pong_wait_seconds"`
-	WriteTimeoutSeconds       int    `mapstructure:"write_timeout_seconds"`
-	MaxMissedPongs            int    `mapstructure:"max_missed_pongs"`
-	SessionTTLSeconds         int    `mapstructure:"session_ttl_seconds"`
-	RouteTTLSeconds           int    `mapstructure:"route_ttl_seconds"`
-	TTLRefreshIntervalSeconds int    `mapstructure:"ttl_refresh_interval_seconds"`
-	NATSMaxAckPending         int    `mapstructure:"nats_max_ack_pending"`
-	SessionLockRetryDelayMs   int    `mapstructure:"session_lock_retry_delay_ms"` // Delay in milliseconds for session lock retry
-	NatsAckWaitSeconds        int    `mapstructure:"nats_ack_wait_seconds"`       // Added for NATS AckWait
+	ServiceName                     string `mapstructure:"service_name"`
+	Version                         string `mapstructure:"version"`
+	PingIntervalSeconds             int    `mapstructure:"ping_interval_seconds"`
+	ShutdownTimeoutSeconds          int    `mapstructure:"shutdown_timeout_seconds"`
+	PongWaitSeconds                 int    `mapstructure:"pong_wait_seconds"`
+	WriteTimeoutSeconds             int    `mapstructure:"write_timeout_seconds"`
+	MaxMissedPongs                  int    `mapstructure:"max_missed_pongs"`
+	SessionTTLSeconds               int    `mapstructure:"session_ttl_seconds"`
+	RouteTTLSeconds                 int    `mapstructure:"route_ttl_seconds"`
+	TTLRefreshIntervalSeconds       int    `mapstructure:"ttl_refresh_interval_seconds"`
+	NATSMaxAckPending               int    `mapstructure:"nats_max_ack_pending"`
+	SessionLockRetryDelayMs         int    `mapstructure:"session_lock_retry_delay_ms"`
+	NatsAckWaitSeconds              int    `mapstructure:"nats_ack_wait_seconds"`
+	GRPCCLientForwardTimeoutSeconds int    `mapstructure:"grpc_client_forward_timeout_seconds"`
 }
 
 // Config holds all configuration for the application.

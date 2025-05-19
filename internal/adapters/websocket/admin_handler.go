@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
@@ -178,20 +180,33 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		natsMsgHandler := func(msg *nats.Msg) {
 			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
 
-			h.logger.Info(connCtx, "Admin NATS: Received message on agent events subject",
+			// Start: request_id handling for NATS message
+			natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
+			if natsRequestID == "" {
+				natsRequestID = uuid.NewString()
+				h.logger.Debug(connCtx, "Generated new request_id for Admin NATS message", "subject", msg.Subject, "new_request_id", natsRequestID, "admin_id", adminInfo.AdminID)
+			} else {
+				h.logger.Debug(connCtx, "Using existing request_id from Admin NATS message header", "subject", msg.Subject, "request_id", natsRequestID, "admin_id", adminInfo.AdminID)
+			}
+			msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
+			// End: request_id handling for NATS message
+
+			h.logger.Info(msgCtx, "Admin NATS: Received message on agent events subject",
 				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
 			)
+
 			var eventPayload domain.EnrichedEventPayload
 			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
-				h.logger.Error(connCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
 				_ = msg.Ack()
 				return
 			}
+
 			wsMessage := domain.NewEventMessage(eventPayload)
 			if err := conn.WriteJSON(wsMessage); err != nil {
-				h.logger.Error(connCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
 			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeEvent) // Event sent to admin
+				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 			}
 			_ = msg.Ack()
 		}

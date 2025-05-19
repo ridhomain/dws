@@ -6,7 +6,7 @@ import (
 	"net"
 
 	"google.golang.org/grpc"
-	// TODO: Add import for reflection: "google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/reflection"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
@@ -31,8 +31,13 @@ func NewServer(appCtx context.Context, logger domain.Logger, cfgProvider config.
 	gsrv := grpc.NewServer(opts...)
 	pb.RegisterMessageForwardingServiceServer(gsrv, grpcHandler)
 
-	// TODO: Enable reflection only for development/debug builds based on config
-	// if cfgProvider.Get().App.EnableGRPCReflection { reflection.Register(gsrv) }
+	// Conditionally enable gRPC reflection
+	if cfgProvider.Get().Server.EnableReflection {
+		reflection.Register(gsrv)
+		logger.Info(appCtx, "gRPC reflection enabled.")
+	} else {
+		logger.Info(appCtx, "gRPC reflection disabled.")
+	}
 
 	// Create a new context that can be cancelled independently for this server's lifecycle,
 	// but is derived from the main application context.

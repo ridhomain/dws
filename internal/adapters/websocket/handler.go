@@ -25,7 +25,9 @@ import (
 	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 
 	// gRPC related imports
+	"github.com/google/uuid"                                                               // Added for request_id generation
 	dws_message_fwd "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto" // Alias for your generated proto package
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"                 // For XRequestIDHeader
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure" // For now, will add mTLS later
 	"google.golang.org/grpc/metadata"
@@ -238,9 +240,20 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	natsMessageHandler := func(msg *nats.Msg) {
 		metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric
 
-		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject) // Correctly using exported function
+		// Start: request_id handling for NATS message
+		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader) // Using const from middleware package
+		if natsRequestID == "" {
+			natsRequestID = uuid.NewString()
+			h.logger.Debug(connCtx, "Generated new request_id for NATS message", "subject", msg.Subject, "new_request_id", natsRequestID)
+		} else {
+			h.logger.Debug(connCtx, "Using existing request_id from NATS message header", "subject", msg.Subject, "request_id", natsRequestID)
+		}
+		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
+		// End: request_id handling for NATS message
+
+		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject)
 		if err != nil {
-			h.logger.Error(connCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
+			h.logger.Error(msgCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
 			_ = msg.Ack() // Ack to prevent redelivery of malformed subjects
 			return
 		}
@@ -257,47 +270,51 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		ownerPodID, err := h.natsAdapter.RouteRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID) // Correctly using exported field
 		if err != nil {
 			if errors.Is(err, appredis.ErrNoOwningPod) { // Correctly using imported package for error
-				h.logger.Warn(connCtx, "No owning pod found for message route in Redis, potential race or cleanup issue.", "subject", msg.Subject, "chat_id_from_subject", msgChatID)
-				// Decide if we should still try to process locally or drop. For now, let's assume it might be for this pod if no owner is listed.
-				// This assumption might need refinement based on desired behavior for orphaned routes.
-				// TODO: FR-8A - Refine behavior for ErrNoOwningPod. If no owner, should any pod process, or should it be dropped/NACKed to avoid duplicates?
-				// A safer default might be to NOT process if ownerPodID is empty after this block.
+				h.logger.Warn(connCtx, "No owning pod found for message route in Redis, potential race or cleanup issue. NACKing message.", "subject", msg.Subject, "chat_id_from_subject", msgChatID)
+				// FR-8A: NACK the message if no owning pod is found to prevent message loss.
+				// NATS will attempt redelivery or send to a dead-letter queue if configured.
+				if nakErr := msg.Nak(); nakErr != nil {
+					h.logger.Error(connCtx, "Failed to NACK NATS message for ErrNoOwningPod", "subject", msg.Subject, "error", nakErr.Error())
+				}
+				return // Stop processing this message
 			} else {
 				h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
-				_ = msg.Ack() // Ack as we can't determine ownership
+				_ = msg.Ack() // Ack as we can't determine ownership, to prevent blocking the consumer on this message.
 				return
 			}
 		}
 
-		// More precise ownership check:
+		// If we reach here, err is nil, and ownerPodID is the ID of the owning pod.
+		// It cannot be empty if a route was found, because GetOwningPodForMessageRoute returns members[0].
+		// If no route was found, ErrNoOwningPod would have been returned and handled above.
+
 		var isOwner bool
-		if err == nil && ownerPodID == currentPodID { // Explicitly owned by this pod
+		if ownerPodID == currentPodID {
 			isOwner = true
-		} else if err == nil && ownerPodID != "" && ownerPodID != currentPodID { // Owned by a different, specific pod
+		} else {
+			// If ownerPodID is not currentPodID, it implies another specific pod owns it.
+			// ownerPodID should not be empty here due to the logic in GetOwningPodForMessageRoute
+			// and the ErrNoOwningPod handling above.
 			isOwner = false
-		} else if errors.Is(err, appredis.ErrNoOwningPod) || (err == nil && ownerPodID == "") { // No owner listed or error indicating no owner
-			h.logger.Warn(connCtx, "Message route has no specific owner in Redis.", "subject", msg.Subject, "currentPodID", currentPodID)
-			isOwner = false // Default to NOT owner if no explicit owner. Avoids duplicate processing by multiple pods.
-			// TODO: FR-8A - Consider if this message should be NACKed to prevent loss if it was expected to have an owner.
-			// For now, it will be ACKed without local processing or gRPC hop if it falls here.
-		} else { // Other unexpected error during ownership check
-			h.logger.Error(connCtx, "Unexpected error checking message route ownership. Assuming not owner.", "subject", msg.Subject, "error", err)
-			isOwner = false
+			if ownerPodID == "" {
+				// This case is defensive and should ideally not be reached if GetOwningPodForMessageRoute behaves as expected (returning error for no owner).
+				h.logger.Error(connCtx, "Internal logic inconsistency: ownerPodID is empty after GetOwningPodForMessageRoute succeeded. Assuming not owner.", "subject", msg.Subject)
+			}
 		}
 
 		if isOwner {
 			// Subtask 8.2: Implement Local Message Delivery for Owner Pod
-			h.logger.Info(connCtx, "Current pod IS THE OWNER of the message route. Delivering locally.", "subject", msg.Subject, "podID", currentPodID)
+			h.logger.Info(msgCtx, "Current pod IS THE OWNER of the message route. Delivering locally.", "subject", msg.Subject, "podID", currentPodID)
 			var eventPayload domain.EnrichedEventPayload
 			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
-				h.logger.Error(connCtx, "Failed to unmarshal NATS message into EnrichedEventPayload (owner)",
+				h.logger.Error(msgCtx, "Failed to unmarshal NATS message into EnrichedEventPayload (owner)",
 					"subject", msg.Subject, "error", errUnmarshal.Error(), "raw_data", string(msg.Data))
 				_ = msg.Ack()
 				return
 			}
 			wsMessage := domain.NewEventMessage(eventPayload)
 			if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
-				h.logger.Error(connCtx, "Failed to forward NATS message to WebSocket client (owner)",
+				h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
 					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
 				)
 			} else {
@@ -305,23 +322,28 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			}
 		} else {
 			// Subtask 8.3: Forward Messages via gRPC to Owner Pod(s) When Not Owner
-			h.logger.Info(connCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop.",
+			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop.",
 				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
 
 			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
 				// TODO: FR-8B - Implement proper pod address resolution (e.g., from K8s service discovery or config map)
+				// For Kubernetes, this often involves using a headless service and internal DNS:
+				// e.g., targetService := fmt.Sprintf("%s.%s.svc.cluster.local", ownerPodID, "your-headless-service-name")
 				// For now, assume ownerPodID can be part of a resolvable address, e.g., ownerPodID + cluster_suffix
 				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort) // Assuming GRPCPort is in config
-				h.logger.Info(connCtx, "Attempting to forward message via gRPC", "target_address", gprcTargetAddress)
+				h.logger.Info(msgCtx, "Attempting to forward message via gRPC", "target_address", gprcTargetAddress)
 
 				// TODO: FR-8C - Implement gRPC client connection pooling/reuse
+				// Creating a new connection for each message is inefficient. A pool should be used.
 				connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())} // INSECURE
 				grpcConn, errClient := grpc.NewClient(gprcTargetAddress, connOpts...)
 				if errClient != nil {
-					h.logger.Error(connCtx, "Failed to connect to gRPC service on owner pod",
+					h.logger.Error(msgCtx, "Failed to connect to gRPC service on owner pod",
 						"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errClient.Error())
-					// TODO: FR-8E - Implement retry logic for gRPC connection/forwarding (Subtask 8.5)
 					// If connection fails, message is not forwarded. It will be ACKed without hop.
+					// The NACK for ErrNoOwningPod handles unroutable messages earlier.
+					// For direct connection failures here, we might consider a NACK with delay if retries are exhausted and we want NATS to handle redelivery.
+					// However, the current retry logic is below. If all retries fail, the message is effectively dropped from this pod's perspective for gRPC forwarding.
 				} else {
 					defer grpcConn.Close()
 					client := dws_message_fwd.NewMessageForwardingServiceClient(grpcConn)
@@ -329,12 +351,12 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					// Translate domain.EnrichedEventPayload to proto.EnrichedEventPayloadMessage
 					var domainPayload domain.EnrichedEventPayload
 					if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
-						h.logger.Error(connCtx, "Failed to unmarshal NATS message data for gRPC forwarding", "subject", msg.Subject, "error", errUnmarshal.Error())
+						h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding", "subject", msg.Subject, "error", errUnmarshal.Error())
 						// Message will be ACKed without hop if unmarshalling fails here.
 					} else {
 						protoData, errProtoStruct := structpb.NewStruct(domainPayload.Data.(map[string]interface{}))
 						if errProtoStruct != nil {
-							h.logger.Error(connCtx, "Failed to convert domainPayload.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
+							h.logger.Error(msgCtx, "Failed to convert domainPayload.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
 							// Message will be ACKed without hop.
 						} else {
 							grpcRequest := &dws_message_fwd.PushEventRequest{
@@ -353,53 +375,64 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 							// Propagate request_id via gRPC metadata
 							md := metadata.New(nil)
-							if reqID, ok := connCtx.Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+							if reqID, ok := msgCtx.Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
 								md.Set(string(contextkeys.RequestIDKey), reqID)
 							}
-							pushCtxWithMetadata := metadata.NewOutgoingContext(connCtx, md)
+							pushCtxWithMetadata := metadata.NewOutgoingContext(msgCtx, md)
 
-							pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, 5*time.Second)
+							// Use configured timeout, defaulting if necessary
+							grpcClientTimeoutSeconds := h.configProvider.Get().App.GRPCCLientForwardTimeoutSeconds
+							grpcClientTimeout := 5 * time.Second // Default timeout
+							if grpcClientTimeoutSeconds > 0 {
+								grpcClientTimeout = time.Duration(grpcClientTimeoutSeconds) * time.Second
+								h.logger.Debug(msgCtx, "Using configured gRPC client forward timeout", "seconds", grpcClientTimeoutSeconds)
+							} else {
+								h.logger.Debug(msgCtx, "Using default gRPC client forward timeout", "seconds", grpcClientTimeout.Seconds())
+							}
+
+							pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
 							resp, errPush := client.PushEvent(pushCtx, grpcRequest)
 							pushCancel()
 
 							if errPush != nil {
-								h.logger.Warn(connCtx, "Initial gRPC PushEvent to owner pod failed, preparing to retry...",
+								h.logger.Warn(msgCtx, "Initial gRPC PushEvent to owner pod failed, preparing to retry...",
 									"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error())
 
 								// Retry logic (Subtask 8.5)
 								time.Sleep(200 * time.Millisecond) // Fixed short delay for retry
-								h.logger.Info(connCtx, "Retrying gRPC PushEvent...", "target_pod", ownerPodID)
-								pushRetryCtx, pushRetryCancel := context.WithTimeout(connCtx, 5*time.Second) // Same timeout for retry
+								h.logger.Info(msgCtx, "Retrying gRPC PushEvent...", "target_pod", ownerPodID)
+								// Use the same configurable timeout for retry
+								pushRetryCtx, pushRetryCancel := context.WithTimeout(msgCtx, grpcClientTimeout)
 								resp, errPush = client.PushEvent(pushRetryCtx, grpcRequest)
 								pushRetryCancel()
 
 								if errPush != nil {
-									h.logger.Error(connCtx, "Retry gRPC PushEvent to owner pod also failed",
+									h.logger.Error(msgCtx, "Retry gRPC PushEvent to owner pod also failed",
 										"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error())
 								} else if resp != nil && !resp.Success {
-									h.logger.Warn(connCtx, "Retry gRPC PushEvent to owner pod was not successful",
+									h.logger.Warn(msgCtx, "Retry gRPC PushEvent to owner pod was not successful",
 										"target_pod", ownerPodID, "response_message", resp.Message)
 								} else if resp != nil && resp.Success {
-									h.logger.Info(connCtx, "Successfully forwarded message via gRPC on retry", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
+									h.logger.Info(msgCtx, "Successfully forwarded message via gRPC on retry", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
 									metrics.IncrementGrpcMessagesSent(ownerPodID)
 								}
 							} else if resp != nil && !resp.Success {
-								h.logger.Warn(connCtx, "Initial gRPC PushEvent to owner pod was not successful",
+								h.logger.Warn(msgCtx, "Initial gRPC PushEvent to owner pod was not successful",
 									"target_pod", ownerPodID, "response_message", resp.Message)
 							} else if resp != nil && resp.Success { // Initial push was successful
-								h.logger.Info(connCtx, "Successfully forwarded message via gRPC on initial attempt", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
+								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC on initial attempt", "target_pod", ownerPodID, "event_id", domainPayload.EventID)
 								metrics.IncrementGrpcMessagesSent(ownerPodID)
 							}
 						}
 					}
 				}
 			} else {
-				h.logger.Warn(connCtx, "No specific owner pod ID found for gRPC hop, message will not be forwarded.", "subject", msg.Subject)
+				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop, message will not be forwarded.", "subject", msg.Subject)
 			}
 		}
 
 		if ackErr := msg.Ack(); ackErr != nil {
-			h.logger.Error(connCtx, "Failed to ACK NATS message after processing", "subject", msg.Subject, "error", ackErr.Error())
+			h.logger.Error(msgCtx, "Failed to ACK NATS message after processing", "subject", msg.Subject, "error", ackErr.Error())
 		}
 	}
 

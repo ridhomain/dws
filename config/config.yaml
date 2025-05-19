@@ -2,18 +2,26 @@
 server:
   http_port: 8080
   grpc_port: 50051 # Corresponds to GRPC_PORT ENV
+  pod_id: "" # This should be set via ENV (e.g., POD_IP via Downward API)
+  enable_reflection: false # Default to false for production
 
 # NATS Configuration
 nats:
   url: "nats://nats:4222" # Corresponds to NATS_URL ENV
   stream_name: "wa_stream"
   consumer_name: "ws_fanout"
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
 
 # Redis Configuration
 redis:
   address: "redis:6379" # Corresponds to REDIS_ADDR ENV
   # password: "" # If needed
   # db: 0       # If needed
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
 
 # Logging Configuration
 log:
@@ -34,12 +42,15 @@ app:
   version: "1.0.0"
   ping_interval_seconds: 20
   shutdown_timeout_seconds: 30
+  pong_wait_seconds: 60 # Increased from any previous implicit/default values
+  write_timeout_seconds: 10
   max_missed_pongs: 2
   session_ttl_seconds: 30
   route_ttl_seconds: 30
   ttl_refresh_interval_seconds: 10
   nats_max_ack_pending: 5000
-  session_lock_retry_delay_ms: 250 # Delay in milliseconds for session lock retry
-  nats_ack_wait_seconds: 30 # Default NATS AckWait in seconds
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
 
 # Config holds all configuration for the application. 
