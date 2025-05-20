@@ -38,14 +38,9 @@ func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLog
 
 	appLogger.Info(ctx, "Attempting to connect to NATS server", "url", natsCfg.URL)
 
-	// TODO: Add more robust connection options from config (e.g., auth, TLS, timeouts)
-	// For now, using a simple connection with a name.
-	nc, err := nats.Connect(natsCfg.URL,
+	// Build NATS connection options from config
+	natsOptions := []nats.Option{
 		nats.Name(fmt.Sprintf("%s-consumer-%s", appName, appFullCfg.Server.PodID)),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(5),
-		nats.ReconnectWait(2*time.Second),
-		nats.Timeout(5*time.Second), // Connection timeout
 		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
 			appLogger.Error(ctx, "NATS error", "subscription", s.Subject, "error", err.Error())
 		}),
@@ -58,7 +53,32 @@ func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLog
 		nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
 			appLogger.Warn(ctx, "NATS disconnected", "error", err)
 		}),
-	)
+	}
+
+	if natsCfg.RetryOnFailedConnect {
+		natsOptions = append(natsOptions, nats.RetryOnFailedConnect(true))
+	} else {
+		// If explicitly set to false, you might want nats.NoReconnect() or ensure RetryOnFailedConnect(false) is effective.
+		// For now, if true, we add it. NATS default is true anyway.
+	}
+
+	if natsCfg.MaxReconnects != 0 { // NATS default for MaxReconnects is 60 if RetryOnFailedConnect is true. 0 might mean use default, -1 infinite.
+		natsOptions = append(natsOptions, nats.MaxReconnects(natsCfg.MaxReconnects))
+	}
+	if natsCfg.ReconnectWaitSeconds > 0 {
+		natsOptions = append(natsOptions, nats.ReconnectWait(time.Duration(natsCfg.ReconnectWaitSeconds)*time.Second))
+	}
+	if natsCfg.ConnectTimeoutSeconds > 0 {
+		natsOptions = append(natsOptions, nats.Timeout(time.Duration(natsCfg.ConnectTimeoutSeconds)*time.Second))
+	}
+	if natsCfg.PingIntervalSeconds > 0 {
+		natsOptions = append(natsOptions, nats.PingInterval(time.Duration(natsCfg.PingIntervalSeconds)*time.Second))
+	}
+	if natsCfg.MaxPingsOut > 0 {
+		natsOptions = append(natsOptions, nats.MaxPingsOutstanding(natsCfg.MaxPingsOut))
+	}
+
+	nc, err := nats.Connect(natsCfg.URL, natsOptions...)
 	if err != nil {
 		appLogger.Error(ctx, "Failed to connect to NATS", "url", natsCfg.URL, "error", err.Error())
 		return nil, nil, fmt.Errorf("failed to connect to NATS at %s: %w", natsCfg.URL, err)
@@ -308,7 +328,3 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 	)
 	return sub, nil
 }
-
-// TODO: Implement logic for Subtask 6.3 (Parse and Forward EnrichedEventPayload)
-// This will involve creating a message handler function that uses the domain.Connection
-// to write messages to the WebSocket client.

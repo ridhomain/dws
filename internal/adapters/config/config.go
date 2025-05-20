@@ -27,9 +27,15 @@ type ServerConfig struct {
 
 // NATSConfig holds NATS-related configurations.
 type NATSConfig struct {
-	URL          string `mapstructure:"url"`
-	StreamName   string `mapstructure:"stream_name"`
-	ConsumerName string `mapstructure:"consumer_name"`
+	URL                   string `mapstructure:"url"`
+	StreamName            string `mapstructure:"stream_name"`
+	ConsumerName          string `mapstructure:"consumer_name"`
+	ConnectTimeoutSeconds int    `mapstructure:"connect_timeout_seconds"`
+	ReconnectWaitSeconds  int    `mapstructure:"reconnect_wait_seconds"`
+	MaxReconnects         int    `mapstructure:"max_reconnects"`
+	PingIntervalSeconds   int    `mapstructure:"ping_interval_seconds"`
+	MaxPingsOut           int    `mapstructure:"max_pings_out"`
+	RetryOnFailedConnect  bool   `mapstructure:"retry_on_failed_connect"`
 }
 
 // RedisConfig holds Redis-related configurations.

@@ -95,17 +95,17 @@ func NewApp(
 	appLogger domain.Logger,
 	mux *http.ServeMux,
 	server *http.Server,
-	grpcSrv *appgrpc.Server,                            // Added gRPC Server
-	genTokenHandler CompanyUserTokenGenerateHandler,    // Updated type
+	grpcSrv *appgrpc.Server, // Added gRPC Server
+	genTokenHandler CompanyUserTokenGenerateHandler, // Updated type
 	genAdminTokenHandler AdminUserTokenGenerateHandler, // Updated type
 	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
 	natsAdapter *appnats.ConsumerAdapter, // Added NATS Consumer Adapter
-	adminAuthMid AdminAuthMiddleware,     // Added AdminAuthMiddleware
+	adminAuthMid AdminAuthMiddleware, // Added AdminAuthMiddleware
 	adminHandler *wsadapter.AdminHandler, // Added AdminHandler
-	natsConn *nats.Conn,                  // Added for readiness check
-	redisClient *redis.Client,            // Added for readiness check
+	natsConn *nats.Conn, // Added for readiness check
+	redisClient *redis.Client, // Added for readiness check
 ) (*App, func(), error) { // Assuming a top-level cleanup for App
 	app := &App{
 		configProvider:            cfgProvider,

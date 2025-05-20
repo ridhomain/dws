@@ -707,3 +707,20 @@ All subtasks for Task 12 are complete. The service now supports an admin WebSock
     - Create new connections if not found or if a pooled connection fails, and add them to the pool.
     - Removed `defer grpcConn.Close()` for pooled connections to allow reuse.
     - If a pooled connection errors during `PushEvent`, it's removed from the pool and closed.
+
+
+## Session - 2025-05-20 09:04:08 (GMT+7)
+
+**Addressed Remaining TODOs:**
+- **`internal/bootstrap/app.go`**: Implemented gRPC server health check in the `/ready` endpoint.
+  - Registered `grpc_health_v1` service in `internal/adapters/grpc/server.go`.
+  - Updated `readyHandler` to dial local gRPC server and check health status.
+- **`internal/adapters/nats/consumer.go`**: Added configurable NATS connection options.
+  - Added fields like `ConnectTimeoutSeconds`, `ReconnectWaitSeconds`, `MaxReconnects`, `PingIntervalSeconds`, `MaxPingsOut`, `RetryOnFailedConnect` to `NATSConfig` in `config.go` and `config.yaml`.
+  - Updated `NewConsumerAdapter` to use these options when calling `nats.Connect()`.
+  - Corrected NATS option `nats.MaxPingsOut` to `nats.MaxPingsOutstanding`.
+- **`internal/adapters/websocket/handler.go`**: Added basic health check for pooled gRPC client connections.
+  - Imported `google.golang.org/grpc/connectivity`.
+  - Before reusing a gRPC connection from the pool in `specificChatNatsMessageHandler`, check `grpcConn.GetState()`. If not `Ready` or `Idle`, discard the connection and create a new one.
+- **`internal/adapters/nats/consumer.go`**: Removed an outdated TODO comment about Subtask 6.3, as its functionality was implemented in `websocket/handler.go`.
+- **`internal/bootstrap/app.go`**: Ensured the `/admin/generate-token` endpoint is correctly registered.

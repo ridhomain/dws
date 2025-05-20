@@ -30,6 +30,7 @@ import (
 	dws_message_fwd "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto" // Alias for your generated proto package
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"                 // For XRequestIDHeader
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"         // Added for health check
 	"google.golang.org/grpc/credentials/insecure" // For now, will add mTLS later
 	"google.golang.org/grpc/metadata"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -141,8 +142,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	appSpecificConfig := h.configProvider.Get().App
 
 	opts := websocket.AcceptOptions{
-		Subprotocols: []string{"json.v1"},
-		// TODO (FR-9B): Consider InsecureSkipVerify for local dev if using self-signed certs, controlled by config.
+		Subprotocols:       []string{"json.v1"},
+		InsecureSkipVerify: appSpecificConfig.WebsocketDevelopmentInsecureSkipVerify,
 		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
 			if wrappedConn != nil {
 				h.logger.Debug(wrappedConn.Context(), "Pong received via AcceptOptions callback")
@@ -412,12 +413,20 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					grpcConn, connFromPool = connVal.(*grpc.ClientConn)
 					if !connFromPool {
 						h.logger.Error(msgCtx, "Invalid type in gRPC client pool, removing entry.", "target_address", gprcTargetAddress, "type", fmt.Sprintf("%T", connVal))
-						h.grpcClientPool.Delete(gprcTargetAddress) // Remove bad entry
-						// Fallback to creating a new connection by ensuring grpcConn is nil
+						h.grpcClientPool.Delete(gprcTargetAddress)
 						grpcConn = nil
 					} else {
-						// TODO: Add a basic health check here if possible. For now, assume good or will error out on use.
-						h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress)
+						// Basic health check for pooled connection
+						connState := grpcConn.GetState()
+						if connState != connectivity.Ready && connState != connectivity.Idle {
+							h.logger.Warn(msgCtx, "Pooled gRPC connection is not Ready or Idle, discarding.", "target_address", gprcTargetAddress, "state", connState.String())
+							h.grpcClientPool.Delete(gprcTargetAddress)
+							grpcConn.Close()     // Close the unhealthy connection
+							grpcConn = nil       // Force creation of a new connection
+							connFromPool = false // No longer considered from pool for error handling later if new one fails
+						} else {
+							h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress, "state", connState.String())
+						}
 					}
 				}
 
@@ -606,9 +615,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			"type", msgType.String(),
 			"payload_len", len(p),
 		)
-		// TODO: Implement actual message processing based on protocol (Subtask 4.3)
 		// This is where you would unmarshal `p` into a BaseMessage, then switch on Type.
-		// Example of sending an error for an unhandled type:
 		if msgType == websocket.MessageText {
 			var baseMsg domain.BaseMessage
 			if err := json.Unmarshal(p, &baseMsg); err != nil {

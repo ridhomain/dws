@@ -116,68 +116,6 @@ go.mod
 
 # Files
 
-## File: internal/adapters/redis/token_cache_adapter.go
-```go
-package redis
-import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"time"
-	"github.com/redis/go-redis/v9"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type TokenCacheAdapter struct {
-	redisClient *redis.Client
-	logger      domain.Logger
-}
-func NewTokenCacheAdapter(redisClient *redis.Client, logger domain.Logger) *TokenCacheAdapter {
-	if redisClient == nil {
-		panic("redisClient cannot be nil in NewTokenCacheAdapter")
-	}
-	if logger == nil {
-		panic("logger cannot be nil in NewTokenCacheAdapter")
-	}
-	return &TokenCacheAdapter{
-		redisClient: redisClient,
-		logger:      logger,
-	}
-}
-func (a *TokenCacheAdapter) Get(ctx context.Context, key string) (*domain.AuthenticatedUserContext, error) {
-	val, err := a.redisClient.Get(ctx, key).Result()
-	if errors.Is(err, redis.Nil) {
-		a.logger.Debug(ctx, "Company token cache miss", "key", key)
-		return nil, application.ErrCacheMiss
-	}
-	if err != nil {
-		a.logger.Error(ctx, "Failed to get company token from Redis cache", "key", key, "error", err.Error())
-		return nil, fmt.Errorf("redis GET for company token key '%s' failed: %w", key, err)
-	}
-	var userCtx domain.AuthenticatedUserContext
-	if err = json.Unmarshal([]byte(val), &userCtx); err != nil {
-		a.logger.Error(ctx, "Failed to unmarshal cached company token data", "key", key, "error", err.Error())
-		return nil, fmt.Errorf("failed to unmarshal company token data for key '%s': %w", key, err)
-	}
-	a.logger.Debug(ctx, "Company token cache hit", "key", key, "user_id", userCtx.UserID)
-	return &userCtx, nil
-}
-func (a *TokenCacheAdapter) Set(ctx context.Context, key string, value *domain.AuthenticatedUserContext, ttl time.Duration) error {
-	payloadBytes, err := json.Marshal(value)
-	if err != nil {
-		a.logger.Error(ctx, "Failed to marshal company token for caching", "key", key, "user_id", value.UserID, "error", err.Error())
-		return fmt.Errorf("failed to marshal company token for key '%s': %w", key, err)
-	}
-	if err = a.redisClient.Set(ctx, key, string(payloadBytes), ttl).Err(); err != nil {
-		a.logger.Error(ctx, "Failed to set company token in Redis cache", "key", key, "user_id", value.UserID, "error", err.Error())
-		return fmt.Errorf("redis SET for company token key '%s' failed: %w", key, err)
-	}
-	a.logger.Debug(ctx, "Successfully cached company token", "key", key, "user_id", value.UserID, "ttl", ttl.String())
-	return nil
-}
-```
-
 ## File: internal/adapters/grpc/proto/dws_message_fwd.proto
 ```protobuf
 syntax = "proto3";
@@ -212,141 +150,6 @@ message PushEventRequest {
 message PushEventResponse {
   bool success = 1;
   string message = 2; // Optional: error message or status
-}
-```
-
-## File: internal/adapters/http/admin_handlers.go
-```go
-package http
-import (
-	"encoding/json"
-	"net/http"
-	"time"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
-)
-type GenerateTokenRequest struct {
-	CompanyID        string `json:"company_id"`
-	AgentID          string `json:"agent_id"`
-	UserID           string `json:"user_id"`
-	ExpiresInSeconds int    `json:"expires_in_seconds"`
-}
-type GenerateTokenResponse struct {
-	Token string `json:"token"`
-}
-func GenerateTokenHandler(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			logger.Warn(r.Context(), "Invalid method for /generate-token", "method", r.Method)
-			domain.NewErrorResponse(domain.ErrMethodNotAllowed, "Method not allowed", "Only POST method is allowed.").WriteJSON(w, http.StatusMethodNotAllowed)
-			return
-		}
-		var reqPayload GenerateTokenRequest
-		if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
-			logger.Warn(r.Context(), "Failed to decode /generate-token payload", "error", err.Error())
-			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid request payload", err.Error()).WriteJSON(w, http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-		if reqPayload.CompanyID == "" || reqPayload.AgentID == "" || reqPayload.UserID == "" || reqPayload.ExpiresInSeconds <= 0 {
-			logger.Warn(r.Context(), "Invalid payload for /generate-token", "payload", reqPayload)
-			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid payload", "company_id, agent_id, user_id, and positive expires_in_seconds are required.").WriteJSON(w, http.StatusBadRequest)
-			return
-		}
-		appCfg := cfgProvider.Get()
-		if appCfg.Auth.TokenAESKey == "" {
-			logger.Error(r.Context(), "TokenAESKey not configured for /generate-token")
-			domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token encryption key not configured.").WriteJSON(w, http.StatusInternalServerError)
-			return
-		}
-		tokenAuthContext := domain.AuthenticatedUserContext{
-			CompanyID: reqPayload.CompanyID,
-			AgentID:   reqPayload.AgentID,
-			UserID:    reqPayload.UserID,
-			ExpiresAt: time.Now().Add(time.Duration(reqPayload.ExpiresInSeconds) * time.Second),
-		}
-		plaintextTokenPayload, err := json.Marshal(tokenAuthContext)
-		if err != nil {
-			logger.Error(r.Context(), "Failed to marshal token context for /generate-token", "error", err.Error())
-			domain.NewErrorResponse(domain.ErrInternal, "Failed to create token", "Internal error during token generation.").WriteJSON(w, http.StatusInternalServerError)
-			return
-		}
-		encryptedToken, err := crypto.EncryptAESGCM(appCfg.Auth.TokenAESKey, plaintextTokenPayload)
-		if err != nil {
-			logger.Error(r.Context(), "Failed to encrypt token for /generate-token", "error", err.Error())
-			domain.NewErrorResponse(domain.ErrInternal, "Failed to create token", "Internal error during token encryption.").WriteJSON(w, http.StatusInternalServerError)
-			return
-		}
-		resp := GenerateTokenResponse{Token: encryptedToken}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			logger.Error(r.Context(), "Failed to encode /generate-token response", "error", err.Error())
-		}
-	}
-}
-type GenerateAdminTokenRequest struct {
-	AdminID              string `json:"admin_id"`
-	ExpiresInSeconds     int    `json:"expires_in_seconds"`
-	SubscribedCompanyID  string `json:"subscribed_company_id,omitempty"`
-	SubscribedAgentID    string `json:"subscribed_agent_id,omitempty"`
-	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
-}
-type GenerateAdminTokenResponse struct {
-	Token string `json:"token"`
-}
-func GenerateAdminTokenHandler(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			logger.Warn(r.Context(), "Invalid method for /admin/generate-token", "method", r.Method)
-			domain.NewErrorResponse(domain.ErrMethodNotAllowed, "Method not allowed", "Only POST method is allowed.").WriteJSON(w, http.StatusMethodNotAllowed)
-			return
-		}
-		var reqPayload GenerateAdminTokenRequest
-		if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
-			logger.Warn(r.Context(), "Failed to decode /admin/generate-token payload", "error", err.Error())
-			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid request payload", err.Error()).WriteJSON(w, http.StatusBadRequest)
-			return
-		}
-		defer r.Body.Close()
-		if reqPayload.AdminID == "" || reqPayload.ExpiresInSeconds <= 0 {
-			logger.Warn(r.Context(), "Invalid payload for /admin/generate-token", "payload", reqPayload)
-			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid payload", "admin_id and positive expires_in_seconds are required.").WriteJSON(w, http.StatusBadRequest)
-			return
-		}
-		appAuthCfg := cfgProvider.Get().Auth
-		if appAuthCfg.AdminTokenAESKey == "" {
-			logger.Error(r.Context(), "AdminTokenAESKey not configured for /admin/generate-token")
-			domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Admin token encryption key not configured.").WriteJSON(w, http.StatusInternalServerError)
-			return
-		}
-		adminTokenContext := domain.AdminUserContext{
-			AdminID:              reqPayload.AdminID,
-			ExpiresAt:            time.Now().Add(time.Duration(reqPayload.ExpiresInSeconds) * time.Second),
-			SubscribedCompanyID:  reqPayload.SubscribedCompanyID,
-			SubscribedAgentID:    reqPayload.SubscribedAgentID,
-			CompanyIDRestriction: reqPayload.CompanyIDRestriction,
-		}
-		plaintextTokenPayload, err := json.Marshal(adminTokenContext)
-		if err != nil {
-			logger.Error(r.Context(), "Failed to marshal admin token context for /admin/generate-token", "error", err.Error())
-			domain.NewErrorResponse(domain.ErrInternal, "Failed to create admin token", "Internal error during token generation.").WriteJSON(w, http.StatusInternalServerError)
-			return
-		}
-		encryptedToken, err := crypto.EncryptAESGCM(appAuthCfg.AdminTokenAESKey, plaintextTokenPayload)
-		if err != nil {
-			logger.Error(r.Context(), "Failed to encrypt admin token for /admin/generate-token", "error", err.Error())
-			domain.NewErrorResponse(domain.ErrInternal, "Failed to create admin token", "Internal error during token encryption.").WriteJSON(w, http.StatusInternalServerError)
-			return
-		}
-		resp := GenerateAdminTokenResponse{Token: encryptedToken}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			logger.Error(r.Context(), "Failed to encode /admin/generate-token response", "error", err.Error())
-		}
-	}
 }
 ```
 
@@ -767,6 +570,68 @@ func (a *SessionLockManagerAdapter) ForceAcquireLock(ctx context.Context, key st
 	}
 	a.logger.Info(ctx, "Redis SET successful for ForceAcquireLock", "key", key, "value", value, "ttl", ttl)
 	return true, nil
+}
+```
+
+## File: internal/adapters/redis/token_cache_adapter.go
+```go
+package redis
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type TokenCacheAdapter struct {
+	redisClient *redis.Client
+	logger      domain.Logger
+}
+func NewTokenCacheAdapter(redisClient *redis.Client, logger domain.Logger) *TokenCacheAdapter {
+	if redisClient == nil {
+		panic("redisClient cannot be nil in NewTokenCacheAdapter")
+	}
+	if logger == nil {
+		panic("logger cannot be nil in NewTokenCacheAdapter")
+	}
+	return &TokenCacheAdapter{
+		redisClient: redisClient,
+		logger:      logger,
+	}
+}
+func (a *TokenCacheAdapter) Get(ctx context.Context, key string) (*domain.AuthenticatedUserContext, error) {
+	val, err := a.redisClient.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		a.logger.Debug(ctx, "Company token cache miss", "key", key)
+		return nil, application.ErrCacheMiss
+	}
+	if err != nil {
+		a.logger.Error(ctx, "Failed to get company token from Redis cache", "key", key, "error", err.Error())
+		return nil, fmt.Errorf("redis GET for company token key '%s' failed: %w", key, err)
+	}
+	var userCtx domain.AuthenticatedUserContext
+	if err = json.Unmarshal([]byte(val), &userCtx); err != nil {
+		a.logger.Error(ctx, "Failed to unmarshal cached company token data", "key", key, "error", err.Error())
+		return nil, fmt.Errorf("failed to unmarshal company token data for key '%s': %w", key, err)
+	}
+	a.logger.Debug(ctx, "Company token cache hit", "key", key, "user_id", userCtx.UserID)
+	return &userCtx, nil
+}
+func (a *TokenCacheAdapter) Set(ctx context.Context, key string, value *domain.AuthenticatedUserContext, ttl time.Duration) error {
+	payloadBytes, err := json.Marshal(value)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to marshal company token for caching", "key", key, "user_id", value.UserID, "error", err.Error())
+		return fmt.Errorf("failed to marshal company token for key '%s': %w", key, err)
+	}
+	if err = a.redisClient.Set(ctx, key, string(payloadBytes), ttl).Err(); err != nil {
+		a.logger.Error(ctx, "Failed to set company token in Redis cache", "key", key, "user_id", value.UserID, "error", err.Error())
+		return fmt.Errorf("redis SET for company token key '%s' failed: %w", key, err)
+	}
+	a.logger.Debug(ctx, "Successfully cached company token", "key", key, "user_id", value.UserID, "ttl", ttl.String())
+	return nil
 }
 ```
 
@@ -1211,6 +1076,141 @@ func (s *Server) Start() error {
 func (s *Server) GracefulStop() {
 	s.logger.Info(s.appCtx, "GracefulStop called for gRPC server. Cancelling its lifecycle context to trigger stop.")
 	s.cancelCtx()
+}
+```
+
+## File: internal/adapters/http/admin_handlers.go
+```go
+package http
+import (
+	"encoding/json"
+	"net/http"
+	"time"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
+)
+type GenerateTokenRequest struct {
+	CompanyID        string `json:"company_id"`
+	AgentID          string `json:"agent_id"`
+	UserID           string `json:"user_id"`
+	ExpiresInSeconds int    `json:"expires_in_seconds"`
+}
+type GenerateTokenResponse struct {
+	Token string `json:"token"`
+}
+func GenerateTokenHandler(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			logger.Warn(r.Context(), "Invalid method for /generate-token", "method", r.Method)
+			domain.NewErrorResponse(domain.ErrMethodNotAllowed, "Method not allowed", "Only POST method is allowed.").WriteJSON(w, http.StatusMethodNotAllowed)
+			return
+		}
+		var reqPayload GenerateTokenRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
+			logger.Warn(r.Context(), "Failed to decode /generate-token payload", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid request payload", err.Error()).WriteJSON(w, http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+		if reqPayload.CompanyID == "" || reqPayload.AgentID == "" || reqPayload.UserID == "" || reqPayload.ExpiresInSeconds <= 0 {
+			logger.Warn(r.Context(), "Invalid payload for /generate-token", "payload", reqPayload)
+			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid payload", "company_id, agent_id, user_id, and positive expires_in_seconds are required.").WriteJSON(w, http.StatusBadRequest)
+			return
+		}
+		appCfg := cfgProvider.Get()
+		if appCfg.Auth.TokenAESKey == "" {
+			logger.Error(r.Context(), "TokenAESKey not configured for /generate-token")
+			domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token encryption key not configured.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		tokenAuthContext := domain.AuthenticatedUserContext{
+			CompanyID: reqPayload.CompanyID,
+			AgentID:   reqPayload.AgentID,
+			UserID:    reqPayload.UserID,
+			ExpiresAt: time.Now().Add(time.Duration(reqPayload.ExpiresInSeconds) * time.Second),
+		}
+		plaintextTokenPayload, err := json.Marshal(tokenAuthContext)
+		if err != nil {
+			logger.Error(r.Context(), "Failed to marshal token context for /generate-token", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrInternal, "Failed to create token", "Internal error during token generation.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		encryptedToken, err := crypto.EncryptAESGCM(appCfg.Auth.TokenAESKey, plaintextTokenPayload)
+		if err != nil {
+			logger.Error(r.Context(), "Failed to encrypt token for /generate-token", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrInternal, "Failed to create token", "Internal error during token encryption.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		resp := GenerateTokenResponse{Token: encryptedToken}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			logger.Error(r.Context(), "Failed to encode /generate-token response", "error", err.Error())
+		}
+	}
+}
+type GenerateAdminTokenRequest struct {
+	AdminID              string `json:"admin_id"`
+	ExpiresInSeconds     int    `json:"expires_in_seconds"`
+	SubscribedCompanyID  string `json:"subscribed_company_id,omitempty"`
+	SubscribedAgentID    string `json:"subscribed_agent_id,omitempty"`
+	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
+}
+type GenerateAdminTokenResponse struct {
+	Token string `json:"token"`
+}
+func GenerateAdminTokenHandler(cfgProvider config.Provider, logger domain.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			logger.Warn(r.Context(), "Invalid method for /admin/generate-token", "method", r.Method)
+			domain.NewErrorResponse(domain.ErrMethodNotAllowed, "Method not allowed", "Only POST method is allowed.").WriteJSON(w, http.StatusMethodNotAllowed)
+			return
+		}
+		var reqPayload GenerateAdminTokenRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqPayload); err != nil {
+			logger.Warn(r.Context(), "Failed to decode /admin/generate-token payload", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid request payload", err.Error()).WriteJSON(w, http.StatusBadRequest)
+			return
+		}
+		defer r.Body.Close()
+		if reqPayload.AdminID == "" || reqPayload.ExpiresInSeconds <= 0 {
+			logger.Warn(r.Context(), "Invalid payload for /admin/generate-token", "payload", reqPayload)
+			domain.NewErrorResponse(domain.ErrBadRequest, "Invalid payload", "admin_id and positive expires_in_seconds are required.").WriteJSON(w, http.StatusBadRequest)
+			return
+		}
+		appAuthCfg := cfgProvider.Get().Auth
+		if appAuthCfg.AdminTokenAESKey == "" {
+			logger.Error(r.Context(), "AdminTokenAESKey not configured for /admin/generate-token")
+			domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Admin token encryption key not configured.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		adminTokenContext := domain.AdminUserContext{
+			AdminID:              reqPayload.AdminID,
+			ExpiresAt:            time.Now().Add(time.Duration(reqPayload.ExpiresInSeconds) * time.Second),
+			SubscribedCompanyID:  reqPayload.SubscribedCompanyID,
+			SubscribedAgentID:    reqPayload.SubscribedAgentID,
+			CompanyIDRestriction: reqPayload.CompanyIDRestriction,
+		}
+		plaintextTokenPayload, err := json.Marshal(adminTokenContext)
+		if err != nil {
+			logger.Error(r.Context(), "Failed to marshal admin token context for /admin/generate-token", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrInternal, "Failed to create admin token", "Internal error during token generation.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		encryptedToken, err := crypto.EncryptAESGCM(appAuthCfg.AdminTokenAESKey, plaintextTokenPayload)
+		if err != nil {
+			logger.Error(r.Context(), "Failed to encrypt admin token for /admin/generate-token", "error", err.Error())
+			domain.NewErrorResponse(domain.ErrInternal, "Failed to create admin token", "Internal error during token encryption.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		resp := GenerateAdminTokenResponse{Token: encryptedToken}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			logger.Error(r.Context(), "Failed to encode /admin/generate-token response", "error", err.Error())
+		}
+	}
 }
 ```
 
@@ -2188,12 +2188,8 @@ func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLog
 		appLogger.Warn(ctx, "NatsAckWaitSeconds not configured or invalid, defaulting to 30s")
 	}
 	appLogger.Info(ctx, "Attempting to connect to NATS server", "url", natsCfg.URL)
-	nc, err := nats.Connect(natsCfg.URL,
+	natsOptions := []nats.Option{
 		nats.Name(fmt.Sprintf("%s-consumer-%s", appName, appFullCfg.Server.PodID)),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(5),
-		nats.ReconnectWait(2*time.Second),
-		nats.Timeout(5*time.Second),
 		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
 			appLogger.Error(ctx, "NATS error", "subscription", s.Subject, "error", err.Error())
 		}),
@@ -2206,7 +2202,27 @@ func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLog
 		nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
 			appLogger.Warn(ctx, "NATS disconnected", "error", err)
 		}),
-	)
+	}
+	if natsCfg.RetryOnFailedConnect {
+		natsOptions = append(natsOptions, nats.RetryOnFailedConnect(true))
+	} else {
+	}
+	if natsCfg.MaxReconnects != 0 {
+		natsOptions = append(natsOptions, nats.MaxReconnects(natsCfg.MaxReconnects))
+	}
+	if natsCfg.ReconnectWaitSeconds > 0 {
+		natsOptions = append(natsOptions, nats.ReconnectWait(time.Duration(natsCfg.ReconnectWaitSeconds)*time.Second))
+	}
+	if natsCfg.ConnectTimeoutSeconds > 0 {
+		natsOptions = append(natsOptions, nats.Timeout(time.Duration(natsCfg.ConnectTimeoutSeconds)*time.Second))
+	}
+	if natsCfg.PingIntervalSeconds > 0 {
+		natsOptions = append(natsOptions, nats.PingInterval(time.Duration(natsCfg.PingIntervalSeconds)*time.Second))
+	}
+	if natsCfg.MaxPingsOut > 0 {
+		natsOptions = append(natsOptions, nats.MaxPingsOutstanding(natsCfg.MaxPingsOut))
+	}
+	nc, err := nats.Connect(natsCfg.URL, natsOptions...)
 	if err != nil {
 		appLogger.Error(ctx, "Failed to connect to NATS", "url", natsCfg.URL, "error", err.Error())
 		return nil, nil, fmt.Errorf("failed to connect to NATS at %s: %w", natsCfg.URL, err)
@@ -3369,9 +3385,12 @@ nats:
   url: "nats://nats:4222"
   stream_name: "wa_stream"
   consumer_name: "ws_fanout"
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5
+  connect_timeout_seconds: 5
+  reconnect_wait_seconds: 2
+  max_reconnects: 5
+  ping_interval_seconds: 120
+  max_pings_out: 2
+  retry_on_failed_connect: true
 redis:
   address: "redis:6379"
   session_lock_retry_delay_ms: 250
@@ -3431,9 +3450,15 @@ type ServerConfig struct {
 	EnableReflection bool   `mapstructure:"enable_reflection"`
 }
 type NATSConfig struct {
-	URL          string `mapstructure:"url"`
-	StreamName   string `mapstructure:"stream_name"`
-	ConsumerName string `mapstructure:"consumer_name"`
+	URL                   string `mapstructure:"url"`
+	StreamName            string `mapstructure:"stream_name"`
+	ConsumerName          string `mapstructure:"consumer_name"`
+	ConnectTimeoutSeconds int    `mapstructure:"connect_timeout_seconds"`
+	ReconnectWaitSeconds  int    `mapstructure:"reconnect_wait_seconds"`
+	MaxReconnects         int    `mapstructure:"max_reconnects"`
+	PingIntervalSeconds   int    `mapstructure:"ping_interval_seconds"`
+	MaxPingsOut           int    `mapstructure:"max_pings_out"`
+	RetryOnFailedConnect  bool   `mapstructure:"retry_on_failed_connect"`
 }
 type RedisConfig struct {
 	Address  string `mapstructure:"address"`
@@ -3688,6 +3713,9 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
 )
 func (a *App) Run(ctx context.Context) error {
 	version := "unknown"
@@ -3740,6 +3768,36 @@ func (a *App) Run(ctx context.Context) error {
 			ready = false
 			a.logger.Warn(r.Context(), "Readiness check failed: Redis client not configured in App struct")
 		}
+		if a.grpcServer != nil && a.configProvider.Get().Server.GRPCPort > 0 {
+			grpcTarget := fmt.Sprintf("localhost:%d", a.configProvider.Get().Server.GRPCPort)
+			conn, err := grpc.DialContext(r.Context(), grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+			if err != nil {
+				dependenciesStatus["grpc"] = "dial_error"
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check failed: gRPC server dial error", "target", grpcTarget, "error", err.Error())
+			} else {
+				healthClient := grpc_health_v1.NewHealthClient(conn)
+				healthResp, err := healthClient.Check(r.Context(), &grpc_health_v1.HealthCheckRequest{Service: ""}) // Check overall server health
+				if err != nil {
+					dependenciesStatus["grpc"] = "health_check_error"
+					ready = false
+					a.logger.Warn(r.Context(), "Readiness check failed: gRPC health check error", "target", grpcTarget, "error", err.Error())
+				} else if healthResp.GetStatus() != grpc_health_v1.HealthCheckResponse_SERVING {
+					dependenciesStatus["grpc"] = "not_serving"
+					ready = false
+					a.logger.Warn(r.Context(), "Readiness check failed: gRPC server not serving", "target", grpcTarget, "status", healthResp.GetStatus().String())
+				} else {
+					dependenciesStatus["grpc"] = "serving"
+				}
+				conn.Close()
+			}
+		} else {
+			dependenciesStatus["grpc"] = "not_configured_or_running"
+			if a.configProvider.Get().Server.GRPCPort > 0 {
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check: gRPC server not configured or not running but GRPCPort > 0")
+			}
+		}
 		response := struct {
 			Status       string            `json:"status"`
 			Dependencies map[string]string `json:"dependencies"`
@@ -3772,6 +3830,14 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {
 		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
+	}
+	if a.generateAdminTokenHandler != nil && a.tokenGenerationMiddleware != nil {
+		adminHandlerToWrap := http.HandlerFunc(a.generateAdminTokenHandler)
+		finalAdminGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(adminHandlerToWrap))
+		a.httpServeMux.Handle("POST /admin/generate-token", finalAdminGenerateTokenHandler)
+		a.logger.Info(ctx, "/admin/generate-token endpoint registered")
+	} else {
+		a.logger.Error(ctx, "GenerateAdminTokenHandler or TokenGenerationMiddleware not initialized. /admin/generate-token endpoint will not be available.")
 	}
 	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil {
 		apiKeyAuth := middleware.APIKeyAuthMiddleware(a.configProvider, a.logger)
@@ -4127,6 +4193,7 @@ import (
 	dws_message_fwd "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -4204,7 +4271,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	appSpecificConfig := h.configProvider.Get().App
 	opts := websocket.AcceptOptions{
-		Subprotocols: []string{"json.v1"},
+		Subprotocols:       []string{"json.v1"},
+		InsecureSkipVerify: appSpecificConfig.WebsocketDevelopmentInsecureSkipVerify,
 		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
 			if wrappedConn != nil {
 				h.logger.Debug(wrappedConn.Context(), "Pong received via AcceptOptions callback")
@@ -4419,7 +4487,16 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 						h.grpcClientPool.Delete(gprcTargetAddress)
 						grpcConn = nil
 					} else {
-						h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress)
+						connState := grpcConn.GetState()
+						if connState != connectivity.Ready && connState != connectivity.Idle {
+							h.logger.Warn(msgCtx, "Pooled gRPC connection is not Ready or Idle, discarding.", "target_address", gprcTargetAddress, "state", connState.String())
+							h.grpcClientPool.Delete(gprcTargetAddress)
+							grpcConn.Close()
+							grpcConn = nil
+							connFromPool = false
+						} else {
+							h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress, "state", connState.String())
+						}
 					}
 				}
 				if grpcConn == nil {

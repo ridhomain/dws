@@ -10,9 +10,12 @@ nats:
   url: "nats://nats:4222" # Corresponds to NATS_URL ENV
   stream_name: "wa_stream"
   consumer_name: "ws_fanout"
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
+  connect_timeout_seconds: 5    # Default NATS client connection timeout
+  reconnect_wait_seconds: 2   # Default NATS client reconnect wait
+  max_reconnects: 5           # Default NATS client max reconnects (-1 for infinite)
+  ping_interval_seconds: 120  # NATS client default is 2 minutes
+  max_pings_out: 2            # NATS client default
+  retry_on_failed_connect: true # NATS client default
 
 # Redis Configuration
 redis:

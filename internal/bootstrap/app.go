@@ -16,6 +16,9 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	// Imports for App struct fields if defined here, but App struct is in providers.go
 	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	// wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
@@ -88,7 +91,39 @@ func (a *App) Run(ctx context.Context) error {
 			a.logger.Warn(r.Context(), "Readiness check failed: Redis client not configured in App struct")
 		}
 
-		// TODO: Add other checks like gRPC server health if applicable in the future
+		// Check gRPC server health
+		if a.grpcServer != nil && a.configProvider.Get().Server.GRPCPort > 0 {
+			grpcTarget := fmt.Sprintf("localhost:%d", a.configProvider.Get().Server.GRPCPort)
+			conn, err := grpc.DialContext(r.Context(), grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+			if err != nil {
+				dependenciesStatus["grpc"] = "dial_error"
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check failed: gRPC server dial error", "target", grpcTarget, "error", err.Error())
+			} else {
+				healthClient := grpc_health_v1.NewHealthClient(conn)
+				healthResp, err := healthClient.Check(r.Context(), &grpc_health_v1.HealthCheckRequest{Service: ""}) // Check overall server health
+				if err != nil {
+					dependenciesStatus["grpc"] = "health_check_error"
+					ready = false
+					a.logger.Warn(r.Context(), "Readiness check failed: gRPC health check error", "target", grpcTarget, "error", err.Error())
+				} else if healthResp.GetStatus() != grpc_health_v1.HealthCheckResponse_SERVING {
+					dependenciesStatus["grpc"] = "not_serving"
+					ready = false
+					a.logger.Warn(r.Context(), "Readiness check failed: gRPC server not serving", "target", grpcTarget, "status", healthResp.GetStatus().String())
+				} else {
+					dependenciesStatus["grpc"] = "serving"
+				}
+				conn.Close()
+			}
+		} else {
+			dependenciesStatus["grpc"] = "not_configured_or_running"
+			// If gRPC is optional or not started, it might not affect overall readiness
+			// For now, let's assume if it's configured to run, it should be healthy.
+			if a.configProvider.Get().Server.GRPCPort > 0 { // Only consider it a failure if it was supposed to run
+				ready = false
+				a.logger.Warn(r.Context(), "Readiness check: gRPC server not configured or not running but GRPCPort > 0")
+			}
+		}
 
 		response := struct {
 			Status       string            `json:"status"`
@@ -129,6 +164,16 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {
 		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
+	}
+
+	// Register new /admin/generate-token endpoint
+	if a.generateAdminTokenHandler != nil && a.tokenGenerationMiddleware != nil { // Assuming same middleware for now
+		adminHandlerToWrap := http.HandlerFunc(a.generateAdminTokenHandler)
+		finalAdminGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(adminHandlerToWrap))
+		a.httpServeMux.Handle("POST /admin/generate-token", finalAdminGenerateTokenHandler)
+		a.logger.Info(ctx, "/admin/generate-token endpoint registered")
+	} else {
+		a.logger.Error(ctx, "GenerateAdminTokenHandler or TokenGenerationMiddleware not initialized. /admin/generate-token endpoint will not be available.")
 	}
 
 	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil { // Check configProvider for APIKeyAuth
@@ -194,7 +239,7 @@ func (a *App) Run(ctx context.Context) error {
 		if a.connectionManager != nil {
 			a.logger.Info(context.Background(), "Closing all WebSocket connections gracefully...")
 			a.connectionManager.GracefullyCloseAllConnections(domain.StatusGoingAway, "Server is shutting down")
-			time.Sleep(1 * time.Second) // TODO: Make this configurable if needed
+			time.Sleep(1 * time.Second)
 
 			a.connectionManager.StopKillSwitchListener()
 			a.connectionManager.StopResourceRenewalLoop()

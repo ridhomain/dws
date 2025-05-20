@@ -1,34 +1,5 @@
 # TODO List
 
-## `cmd/daisi-ws-service/main.go`
-- Implement actual readiness checks for the `/ready` endpoint (e.g., NATS, Redis connections).
-- Add production hardening to HTTP server (ReadTimeout, WriteTimeout, IdleTimeout).
-- Add cleanup for other resources (NATS, Redis, gRPC server) during graceful shutdown.
-
-## `internal/adapters/websocket/handler.go`
-- TODO: (From code comment) Later, the `AuthenticatedUserContext` from `CompanyTokenAuthMiddleware` should be retrieved and utilized within `ServeHTTP` and `manageConnection` for more detailed logging, context-aware operations, and passing user details to NATS subscription logic. (Partially addressed, core details are used; further clarification on "more detailed" aspects might be needed).
-- TODO: (FR-9B from code comment) Add WebSocket compression options to `websocket.AcceptOptions` based on application configuration.
-- TODO: (FR-9B from code comment) Consider adding `InsecureSkipVerify` to `websocket.AcceptOptions` for local development if using self-signed certificates, controlled by application configuration.
-- Implement remaining Client Message Processing logic within `manageConnection` for `json.v1` subprotocol. This primarily includes:
-    - Defining behavior for other potential client message types or unknown types (e.g., sending `ErrorMessage`). (Partially done, `handleUnknownMessage` exists, ongoing as new types may emerge).
-
-## `internal/adapters/redis/token_cache_adapter.go`
-- **Implement Redis Token Cache Adapter**
-  - Corresponding to `// TODO: Implement appredis.NewTokenCacheAdapter in internal/adapters/redis/token_cache_adapter.go` in `internal/bootstrap/providers.go`.
-  - Create `internal/adapters/redis/token_cache_adapter.go`.
-  - Implement the `NewTokenCacheAdapter` function and the necessary methods to satisfy the `domain.TokenCacheStore` interface using Redis.
-  - Update `TokenCacheStoreProvider` in `internal/bootstrap/providers.go` to use the implemented adapter.
-
-## Admin Functionality
-- **Admin Token Generation & Scoping**: Implement a mechanism for generating admin tokens. Ensure that the process populates `AdminUserContext.SubscribedCompanyID` and `AdminUserContext.SubscribedAgentID` appropriately. This is crucial for correct NATS topic subscriptions in `AdminHandler` for agent events (FR-ADMIN-2).
-  - Consider creating a new admin-specific token generation endpoint (e.g., `/admin/generate-token`) or an offline utility script.
-  - Define how an admin's scope (e.g., global vs. company-specific) translates to `SubscribedCompanyID` and `SubscribedAgentID` in the token.
-
-## `internal/bootstrap/providers.go`
-- TODO: (From code comment line 142) Add `ReadTimeoutSeconds` and `IdleTimeoutSeconds` to `config.AppConfig` and use them in `HTTPGracefulServerProvider`.
-
-- TODO: FR-8C (`websocket/handler.go`): Implement gRPC client connection pooling/reuse for inter-pod communication. **(New specific TODO)**
-
 --- 
 
 # Completed TODO
@@ -40,6 +11,7 @@
 - **`internal/adapters/websocket/handler.go`**: Added configurable WebSocket compression options to `websocket.AcceptOptions`.
 - **`internal/adapters/websocket/handler.go`**: Added configurable `InsecureSkipVerify` to `websocket.AcceptOptions` for local development.
 - **`internal/adapters/websocket/handler.go`**: Implemented NATS subscription logic: initial general `wa.C.A.chats` subscription, then switch to specific `wa.C.A.messages.chatID` on `MessageTypeSelectChat`, including draining previous subscriptions.
+- **`internal/adapters/websocket/handler.go`**: the `AuthenticatedUserContext` from `CompanyTokenAuthMiddleware` should be retrieved and utilized within `ServeHTTP` and `manageConnection` for more detailed logging, context-aware operations, and passing user details to NATS subscription logic. (Partially addressed, core details are used; further clarification on "more detailed" aspects might be needed).
 - **`internal/adapters/redis/token_cache_adapter.go`**: Implemented Redis Token Cache Adapter (`NewTokenCacheAdapter` and `domain.TokenCacheStore` methods) and updated `TokenCacheStoreProvider`.
 - **Admin Functionality**: Implemented Admin Token Generation & Scoping (`/admin/generate-token` endpoint, `AdminUserContext` population for NATS scoping).
 - **`internal/bootstrap/providers.go`**: Added `ReadTimeoutSeconds` and `IdleTimeoutSeconds` to `config.AppConfig` and used them in `HTTPGracefulServerProvider` (covered by HTTP server hardening).
@@ -63,3 +35,7 @@
 ## Task 10 Follow-ups (Metrics & Tracing)
 - TODO: (`websocket/handler.go`, `admin_handler.go`): Implement `request_id` extraction from NATS message headers/payload (if present) or generation for NATS-consumed messages. Ensure this `request_id` is added to the context used for subsequent logging and gRPC calls. **(Implemented: NATS messages now have request_id in context for logging and gRPC propagation in user handler; admin handler has it for logging.)**
 - TODO: (Task 10.5 Clarification): Clarify the requirement for "JetStream Lag Awareness". Determine if this service needs to actively query NATS and expose a Prometheus metric for consumer lag, or if it's an operational concern for an external NATS exporter and HPA configuration. **(Clarified - Operational Concern, no code changes needed in this service)**
+
+- **`internal/bootstrap/app.go`**: Add other checks like gRPC server health if applicable in the future
+- **`internal/adapters/nats/consumer.go`**: Add more robust connection options from config (e.g., timeouts, reconnectWait, maxReconnect)
+- **`internal/adapters/websocket/handler.go`**: Add a basic health check here if possible. For now, assume good or will error out on use.
