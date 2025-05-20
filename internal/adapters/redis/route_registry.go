@@ -132,3 +132,15 @@ func (a *RouteRegistryAdapter) RefreshRouteTTL(ctx context.Context, routeKey, po
 	a.logger.Debug(ctx, "Redis RefreshRouteTTL result", "key", routeKey, "podID", podID, "ttl_seconds", ttlSeconds, "refreshed_by_script", refreshed, "script_result_val", result)
 	return refreshed, nil
 }
+
+func (a *RouteRegistryAdapter) RecordActivity(ctx context.Context, routeKey string, activityTTL time.Duration) error {
+	activityKey := routeKey + ":last_active"
+	now := time.Now().Unix()
+	err := a.redisClient.Set(ctx, activityKey, now, activityTTL).Err()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SET failed for RecordActivity on route key", "key", activityKey, "error", err.Error())
+		return fmt.Errorf("redis SET for key '%s' in RecordActivity (route) failed: %w", activityKey, err)
+	}
+	a.logger.Debug(ctx, "Redis SET successful for RecordActivity on route key", "key", activityKey, "timestamp", now, "ttl", activityTTL)
+	return nil
+}

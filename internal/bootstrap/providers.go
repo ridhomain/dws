@@ -263,9 +263,10 @@ func ConnectionManagerProvider(
 	sessionLocker domain.SessionLockManager,
 	killSwitchPub domain.KillSwitchPublisher,
 	killSwitchSub domain.KillSwitchSubscriber,
-	routeRegistry domain.RouteRegistry, // Added RouteRegistry dependency
+	routeRegistry domain.RouteRegistry,
+	redisClient *redis.Client,
 ) *application.ConnectionManager {
-	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub, routeRegistry) // Pass routeRegistry
+	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub, routeRegistry, redisClient)
 }
 
 // TokenCacheStoreProvider provides a TokenCacheStore.
@@ -293,8 +294,8 @@ func RouteRegistryProvider(redisClient *redis.Client, logger domain.Logger) doma
 }
 
 // Provider for GRPCMessageHandler
-func GRPCMessageHandlerProvider(logger domain.Logger, connManager *application.ConnectionManager) *application.GRPCMessageHandler {
-	return application.NewGRPCMessageHandler(logger, connManager)
+func GRPCMessageHandlerProvider(logger domain.Logger, connManager *application.ConnectionManager, cfgProvider config.Provider) *application.GRPCMessageHandler {
+	return application.NewGRPCMessageHandler(logger, connManager, cfgProvider)
 }
 
 // Provider for gRPC Server

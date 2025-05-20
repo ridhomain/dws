@@ -23,6 +23,9 @@ type SessionLockManager interface {
 	// ForceAcquireLock forcefully sets the lock for the given key with a specific value and TTL,
 	// overwriting any existing lock. It should return true if the lock was set, false on error.
 	ForceAcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+
+	// RecordActivity records activity for the given key for a specified duration.
+	RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error
 }
 
 // KillSwitchMessage represents the payload sent over the session kill channel.

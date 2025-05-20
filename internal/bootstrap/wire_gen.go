@@ -40,8 +40,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
 	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
 	routeRegistry := RouteRegistryProvider(client, domainLogger)
-	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter, routeRegistry)
-	grpcMessageHandler := GRPCMessageHandlerProvider(domainLogger, connectionManager)
+	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter, routeRegistry, client)
+	grpcMessageHandler := GRPCMessageHandlerProvider(domainLogger, connectionManager, provider)
 	grpcServer, err := GRPCServerProvider(ctx, domainLogger, provider, grpcMessageHandler)
 	if err != nil {
 		cleanup2()

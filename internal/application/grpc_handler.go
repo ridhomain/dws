@@ -4,26 +4,31 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 	"google.golang.org/grpc/metadata"
 )
 
 // GRPCMessageHandler implements the gRPC MessageForwardingService.
 type GRPCMessageHandler struct {
 	pb.UnimplementedMessageForwardingServiceServer
-	logger      domain.Logger
-	connManager *ConnectionManager
+	logger         domain.Logger
+	connManager    *ConnectionManager
+	configProvider config.Provider
 }
 
 // NewGRPCMessageHandler creates a new GRPCMessageHandler.
-func NewGRPCMessageHandler(logger domain.Logger, connManager *ConnectionManager) *GRPCMessageHandler {
+func NewGRPCMessageHandler(logger domain.Logger, connManager *ConnectionManager, configProvider config.Provider) *GRPCMessageHandler {
 	return &GRPCMessageHandler{
-		logger:      logger,
-		connManager: connManager,
+		logger:         logger,
+		connManager:    connManager,
+		configProvider: configProvider,
 	}
 }
 
@@ -103,6 +108,21 @@ func (h *GRPCMessageHandler) PushEvent(ctx context.Context, req *pb.PushEventReq
 			"error", err.Error(),
 		)
 		return &pb.PushEventResponse{Success: false, Message: "Failed to write to local WebSocket"}, nil
+	}
+
+	// Record message route activity after successful local delivery by gRPC handler
+	if h.connManager != nil && h.connManager.RouteRegistrar() != nil && h.configProvider != nil {
+		messageRouteKey := rediskeys.RouteKeyMessages(req.TargetCompanyId, req.TargetAgentId, req.TargetChatId)
+		adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
+		activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
+		if activityTTL <= 0 { // Fallback if MaxTTLSeconds is not set or zero
+			activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
+		}
+		if errAct := h.connManager.RouteRegistrar().RecordActivity(targetConn.Context(), messageRouteKey, activityTTL); errAct != nil {
+			h.logger.Error(targetConn.Context(), "gRPC PushEvent: Failed to record message route activity after local delivery", "messageRouteKey", messageRouteKey, "error", errAct)
+		} else {
+			h.logger.Debug(targetConn.Context(), "gRPC PushEvent: Recorded message route activity after local delivery", "messageRouteKey", messageRouteKey, "activityTTL", activityTTL.String())
+		}
 	}
 
 	h.logger.Info(targetConn.Context(), "gRPC PushEvent: Successfully delivered message to local WebSocket connection",

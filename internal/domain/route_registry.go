@@ -50,4 +50,7 @@ type RouteRegistry interface {
 	// This is a generic refresh that could be used for both chat and message routes.
 	// It should use a Lua script to ensure atomicity: check current value, then EXPIRE.
 	RefreshRouteTTL(ctx context.Context, routeKey, podID string, ttl time.Duration) (bool, error)
+
+	// RecordActivity records an activity for a given route key with a specified TTL.
+	RecordActivity(ctx context.Context, routeKey string, activityTTL time.Duration) error
 }

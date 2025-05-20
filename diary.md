@@ -701,3 +701,50 @@ All subtasks for Task 12 are complete. The service now supports an admin WebSock
     *   **Successful Buffering, Later Writer Failure:** If `conn.WriteJSON()` successfully buffers a message (NATS ACKed), but the dedicated writer goroutine in `Connection` later fails to write this specific message to the actual WebSocket, that message is lost for that client. The writer goroutine attempts to signal a connection closure by cancelling `connCtx`, but the NATS message was already ACKed. This is a known trade-off for asynchronous buffered writes; ensuring NATS ACK only after *actual* WebSocket write confirmation would significantly increase complexity and reduce throughput.
 
 **Outcome:** The NATS ACK/NACK logic is now more robust in conjunction with the WebSocket buffering and backpressure mechanisms. Messages are less likely to be prematurely ACKed if they cannot be successfully buffered or if critical processing/forwarding steps fail, improving overall message reliability under various conditions.
+
+## Task 14.5: Adaptive Redis Key Expiration Strategy - COMPLETED - 2025-05-20 16:48:18 (GMT+7)
+
+- **Objective**: Enhance Redis key expiration to use variable TTLs based on activity patterns for `session_lock` and `message_route` keys.
+
+- **Configuration (`internal/adapters/config/config.go`, `config/config.yaml`):**
+    - Added `adaptive_ttl` section with `enabled`, `min_ttl_seconds`, `max_ttl_seconds`, `activity_threshold_seconds`, `active_ttl_seconds`, and `inactive_ttl_seconds` for `session_lock`, `message_route`, and `chat_route` (adaptive for `chat_route` is defaulted to `false`).
+
+- **Domain Interfaces (`internal/domain/session.go`, `internal/domain/route_registry.go`):**
+    - Added `RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error` method to `SessionLockManager` and `RouteRegistry` interfaces.
+
+- **Redis Adapters (`internal/adapters/redis/session_lock_manager.go`, `internal/adapters/redis/route_registry.go`):**
+    - Implemented `RecordActivity` methods to store a `key:<key_name>:last_active` timestamp in Redis with a specified TTL (typically the max TTL for the key type to ensure the activity marker persists).
+
+- **ConnectionManager & Renewal Loop (`internal/application/connection_manager.go`, `internal/application/session_renewal.go`):**
+    - Added `redisClient` directly to `ConnectionManager` to allow `StartResourceRenewalLoop` to fetch `last_active` keys.
+    - Modified `StartResourceRenewalLoop`:
+        - Fetches `last_active` timestamps for session locks and active message routes.
+        - Calculates adaptive TTLs based on these timestamps and the new `adaptive_ttl` configurations.
+        - Clamps calculated TTLs within the configured min/max values.
+        - Calls existing `RefreshLock` and `RefreshRouteTTL` methods with these dynamically determined TTLs.
+        - Falls back to default global TTLs if adaptive TTL is disabled for a key type or if `last_active` data is unavailable.
+
+- **Activity Recording Integration:**
+    - **Session Activity** (`sessionKey:last_active`):
+        - In `internal/adapters/websocket/handler.go` (`manageConnection`): Recorded after a successful `select_chat` message processing.
+        - Also recorded after successfully sending a NATS-originated event (general or specific chat) to the WebSocket client.
+    - **Message Route Activity** (`messageRouteKey:last_active`):
+        - In `internal/adapters/websocket/handler.go` (`specificChatNatsMessageHandler`): Recorded if the current pod owns the route and successfully delivers the NATS message to the WebSocket client.
+        - In `internal/application/grpc_handler.go` (`PushEvent`): Recorded if a gRPC event is successfully delivered to a local WebSocket connection. `GRPCMessageHandler` and its provider were updated to include `ConfigProvider` for this.
+
+- **Telemetry (`internal/adapters/metrics/prometheus_adapter.go`):**
+    - Added new Prometheus metrics:
+        - `RedisTTLCalculatedSeconds` (Histogram): Distribution of TTLs applied.
+        - `RedisTTLDecisionTotal` (Counter): Counts of different TTL decisions (e.g., active, inactive, default).
+        - `RedisActivityAgeSeconds` (Histogram): Age of activity data used for decisions.
+    - Integrated these metric calls into `StartResourceRenewalLoop`.
+
+- **DI & Code Generation:**
+    - Updated `ConnectionManagerProvider` and `GRPCMessageHandlerProvider` in `internal/bootstrap/providers.go`.
+    - Ran `go generate ./...` to update `internal/bootstrap/wire_gen.go`.
+
+- **Backward Compatibility:**
+    - The system defaults to global TTLs if adaptive settings are disabled or `last_active` keys are absent.
+    - Existing key formats are unchanged.
+
+This task provides a more nuanced approach to Redis key expiration, aiming for better resource utilization by adjusting TTLs based on observed activity. Next steps would typically involve thorough testing of this new adaptive behavior under various scenarios.

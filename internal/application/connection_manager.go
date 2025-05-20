@@ -3,6 +3,7 @@ package application
 import (
 	"sync"
 
+	"github.com/redis/go-redis/v9"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	// Imports like "context", "fmt", "time", "strings", "github.com/coder/websocket", "gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
@@ -26,6 +27,7 @@ type ConnectionManager struct {
 	// For session renewal goroutine
 	renewalStopChan chan struct{}
 	renewalWg       sync.WaitGroup
+	redisClient     *redis.Client
 }
 
 // NewConnectionManager creates a new ConnectionManager.
@@ -36,6 +38,7 @@ func NewConnectionManager(
 	killSwitchPublisher domain.KillSwitchPublisher,
 	killSwitchSubscriber domain.KillSwitchSubscriber,
 	routeRegistry domain.RouteRegistry,
+	redisClient *redis.Client,
 ) *ConnectionManager {
 	return &ConnectionManager{
 		logger:                 logger,
@@ -47,7 +50,8 @@ func NewConnectionManager(
 		activeConnections:      sync.Map{},
 		activeAdminConnections: sync.Map{},
 		renewalStopChan:        make(chan struct{}),
-		// renewalWg is initialized by its zero value, which is fine for sync.WaitGroup
+		renewalWg:              sync.WaitGroup{},
+		redisClient:            redisClient,
 	}
 }
 

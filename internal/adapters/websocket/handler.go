@@ -279,10 +279,21 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
-			// Do NOT ACK if WriteJSON failed
-			return // Return to let NATS redeliver after AckWait
+			return // Do not record activity if write failed
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+			// Record session activity after successful write
+			if h.connManager != nil && h.connManager.SessionLocker() != nil {
+				sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+				adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+				activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+				if activityTTL <= 0 {
+					activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+				}
+				if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
+					h.logger.Error(msgCtx, "Failed to record session activity after general NATS event write", "sessionKey", sessionKey, "error", errAct)
+				}
+			}
 		}
 		_ = msg.Ack()
 	}
@@ -369,10 +380,33 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
 					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
 				)
-				// Do NOT ACK if WriteJSON failed
-				return // Return to let NATS redeliver after AckWait
+				return // Do not record activity if write failed
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+				// Record session activity
+				if h.connManager != nil && h.connManager.SessionLocker() != nil {
+					sessionKey := rediskeys.SessionKey(companyID, agentID, userID) // companyID, agentID, userID are from manageConnection scope
+					adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+					activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+					if activityTTL <= 0 {
+						activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+					}
+					if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
+						h.logger.Error(msgCtx, "Failed to record session activity after specific NATS event write", "sessionKey", sessionKey, "error", errAct)
+					}
+				}
+				// Record message route activity
+				if h.routeRegistry != nil {
+					messageRouteKey := rediskeys.RouteKeyMessages(msgCompanyID, msgAgentID, msgChatID)
+					adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
+					activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
+					if activityTTL <= 0 {
+						activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
+					}
+					if errAct := h.routeRegistry.RecordActivity(msgCtx, messageRouteKey, activityTTL); errAct != nil {
+						h.logger.Error(msgCtx, "Failed to record message route activity after specific NATS event write (owner)", "messageRouteKey", messageRouteKey, "error", errAct)
+					}
+				}
 			}
 		} else {
 			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop via MessageForwarder.",
@@ -541,11 +575,23 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 						metrics.IncrementMessagesSent(domain.MessageTypeError)
 					}
 				} else {
-					// If handleSelectChatMessage was successful, generalNatsSubscription might have been cleared if it existed.
-					// And specificNatsSubscription would be the new one.
-					generalNatsSubscription = nil // Explicitly nil out general if specific is now active
+					generalNatsSubscription = nil // This was incorrectly outside the successful case before
 					specificNatsSubscription = newSub
 					currentSpecificChatID = newChatID
+					// Record session activity after successful chat selection
+					if h.connManager != nil && h.connManager.SessionLocker() != nil {
+						sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+						adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+						activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+						if activityTTL <= 0 { // Fallback if MaxTTLSeconds is not set or zero
+							activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2 // Default to 2x base session TTL
+						}
+						if errAct := h.connManager.SessionLocker().RecordActivity(connCtx, sessionKey, activityTTL); errAct != nil {
+							h.logger.Error(connCtx, "Failed to record session activity after select_chat", "sessionKey", sessionKey, "error", errAct)
+						} else {
+							h.logger.Debug(connCtx, "Recorded session activity after select_chat", "sessionKey", sessionKey, "activityTTL", activityTTL.String())
+						}
+					}
 				}
 			default:
 				h.logger.Warn(connCtx, "Handling unknown message type", "type", baseMsg.Type)

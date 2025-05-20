@@ -94,14 +94,30 @@ type AppConfig struct {
 	WebsocketSlowClientDisconnectThresholdMs int    `mapstructure:"websocket_slow_client_disconnect_threshold_ms"`
 }
 
+type AdaptiveTTLRules struct {
+	Enabled                  bool `mapstructure:"enabled"`
+	MinTTLSeconds            int  `mapstructure:"min_ttl_seconds"`
+	MaxTTLSeconds            int  `mapstructure:"max_ttl_seconds"`
+	ActivityThresholdSeconds int  `mapstructure:"activity_threshold_seconds"` // If last_active is within this, consider active
+	ActiveTTLSeconds         int  `mapstructure:"active_ttl_seconds"`         // TTL to set if active
+	InactiveTTLSeconds       int  `mapstructure:"inactive_ttl_seconds"`       // TTL to set if inactive
+}
+
+type AdaptiveTTLConfig struct {
+	SessionLock  AdaptiveTTLRules `mapstructure:"session_lock"`
+	MessageRoute AdaptiveTTLRules `mapstructure:"message_route"`
+	ChatRoute    AdaptiveTTLRules `mapstructure:"chat_route"`
+}
+
 // Config holds all configuration for the application.
 type Config struct {
-	Server ServerConfig `mapstructure:"server"`
-	NATS   NATSConfig   `mapstructure:"nats"`
-	Redis  RedisConfig  `mapstructure:"redis"`
-	Log    LogConfig    `mapstructure:"log"`
-	Auth   AuthConfig   `mapstructure:"auth"`
-	App    AppConfig    `mapstructure:"app"`
+	Server      ServerConfig      `mapstructure:"server"`
+	NATS        NATSConfig        `mapstructure:"nats"`
+	Redis       RedisConfig       `mapstructure:"redis"`
+	Log         LogConfig         `mapstructure:"log"`
+	Auth        AuthConfig        `mapstructure:"auth"`
+	App         AppConfig         `mapstructure:"app"`
+	AdaptiveTTL AdaptiveTTLConfig `mapstructure:"adaptive_ttl"`
 }
 
 // Provider defines an interface for accessing application configuration.

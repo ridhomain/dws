@@ -66,9 +66,33 @@ app:
   grpc_circuitbreaker_fail_threshold: 5           # After 5 consecutive failures
   grpc_circuitbreaker_open_duration_seconds: 30 # Circuit stays open for 30 seconds
   # New WebSocket Backpressure settings
-  websocket_message_buffer_size: 100 # Number of messages
-  websocket_backpressure_drop_policy: "drop_oldest" # "drop_oldest" or "block"
-  websocket_slow_client_latency_ms: 5000 # Threshold for considering a client slow (not directly used yet)
-  websocket_slow_client_disconnect_threshold_ms: 30000 # Threshold for disconnecting a slow client (not directly used yet)
+  websocket_message_buffer_size: 100 # Number of messages that can be buffered per connection before blocking or dropping
+  websocket_backpressure_drop_policy: "drop_oldest" # "drop_oldest" or "block". What to do when buffer is full.
+  websocket_slow_client_latency_ms: 5000 # Threshold for considering a client's send buffer processing as slow.
+  websocket_slow_client_disconnect_threshold_ms: 30000 # Duration for which a client can be slow before being disconnected.
+
+# Adaptive TTL Configuration
+adaptive_ttl:
+  session_lock:
+    enabled: true
+    min_ttl_seconds: 60
+    max_ttl_seconds: 300
+    activity_threshold_seconds: 120
+    active_ttl_seconds: 180
+    inactive_ttl_seconds: 60
+  message_route:
+    enabled: true
+    min_ttl_seconds: 300
+    max_ttl_seconds: 900
+    activity_threshold_seconds: 600
+    active_ttl_seconds: 900
+    inactive_ttl_seconds: 300
+  chat_route:
+    enabled: false # Kept simple for now, uses fixed TTL from app.route_ttl_seconds
+    min_ttl_seconds: 1800
+    max_ttl_seconds: 7200
+    activity_threshold_seconds: 3600 
+    active_ttl_seconds: 3600
+    inactive_ttl_seconds: 1800
 
 # Config holds all configuration for the application. 

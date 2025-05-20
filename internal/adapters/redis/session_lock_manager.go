@@ -95,3 +95,15 @@ func (a *SessionLockManagerAdapter) ForceAcquireLock(ctx context.Context, key st
 	a.logger.Info(ctx, "Redis SET successful for ForceAcquireLock", "key", key, "value", value, "ttl", ttl)
 	return true, nil
 }
+
+func (a *SessionLockManagerAdapter) RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error {
+	activityKey := key + ":last_active"
+	now := time.Now().Unix()
+	err := a.redisClient.Set(ctx, activityKey, now, activityTTL).Err()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SET failed for RecordActivity", "key", activityKey, "error", err.Error())
+		return fmt.Errorf("redis SET for key '%s' in RecordActivity failed: %w", activityKey, err)
+	}
+	a.logger.Debug(ctx, "Redis SET successful for RecordActivity", "key", activityKey, "timestamp", now, "ttl", activityTTL)
+	return nil
+}

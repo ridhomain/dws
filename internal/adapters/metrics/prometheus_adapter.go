@@ -199,6 +199,33 @@ var (
 			Help: "Total slow WebSocket clients disconnected.",
 		},
 	)
+
+	// Adaptive TTL Metrics
+	RedisTTLCalculatedSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "dws_redis_ttl_calculated_seconds",
+			Help:    "Distribution of calculated TTL values for Redis keys, partitioned by key type.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 16), // 1s to ~9hrs
+		},
+		[]string{"key_type"},
+	)
+
+	RedisTTLDecisionTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_redis_ttl_decision_total",
+			Help: "Total adaptive TTL decisions made, partitioned by key type and decision outcome.",
+		},
+		[]string{"key_type", "decision"}, // decision: active, inactive, no_activity_key, error_fetching_activity, disabled, default
+	)
+
+	RedisActivityAgeSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "dws_redis_activity_age_seconds",
+			Help:    "Distribution of the age of the last activity timestamp when making TTL decisions.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 16), // 1s to ~9hrs
+		},
+		[]string{"key_type"},
+	)
 )
 
 // IncrementActiveConnections increments the active connections gauge.
@@ -321,4 +348,16 @@ func IncrementWebsocketMessagesDropped(sessionKey, reason string) {
 
 func IncrementWebsocketSlowClientsDisconnected() {
 	WebsocketSlowClientsDisconnectedTotalCounter.Inc()
+}
+
+func ObserveRedisTTLCalculated(keyType string, ttlSeconds float64) {
+	RedisTTLCalculatedSeconds.WithLabelValues(keyType).Observe(ttlSeconds)
+}
+
+func IncrementRedisTTLDecision(keyType string, decision string) {
+	RedisTTLDecisionTotal.WithLabelValues(keyType, decision).Inc()
+}
+
+func ObserveRedisActivityAge(keyType string, ageSeconds float64) {
+	RedisActivityAgeSeconds.WithLabelValues(keyType).Observe(ageSeconds)
 }
