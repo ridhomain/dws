@@ -119,6 +119,43 @@ go.mod
 
 # Files
 
+## File: internal/adapters/grpc/proto/dws_message_fwd.proto
+```protobuf
+syntax = "proto3";
+
+package dws_message_fwd;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto;dws_message_fwd";
+
+service MessageForwardingService {
+  rpc PushEvent(PushEventRequest) returns (PushEventResponse);
+}
+
+message EnrichedEventPayloadMessage {
+  string event_id = 1;
+  string event_type = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  string source = 4;
+  google.protobuf.Struct data = 5; // For arbitrary JSON-like data
+}
+
+message PushEventRequest {
+  EnrichedEventPayloadMessage payload = 1;
+  string target_company_id = 2; // For routing/logging on recipient
+  string target_agent_id = 3;
+  string target_chat_id = 4;
+  string source_pod_id = 5; // Added to track source for metrics
+}
+
+message PushEventResponse {
+  bool success = 1;
+  string message = 2; // Optional: error message or status
+}
+```
+
 ## File: internal/adapters/grpc/forwarder_adapter.go
 ```go
 package grpc
@@ -268,76 +305,6 @@ func (fa *ForwarderAdapter) ForwardEvent(ctx context.Context, targetPodAddress s
 		return finalErr
 	}
 	return nil
-}
-```
-
-## File: internal/domain/forwarder.go
-```go
-package domain
-import (
-	"context"
-)
-type MessageForwarder interface {
-	ForwardEvent(ctx context.Context, targetPodAddress string, event *EnrichedEventPayload, targetCompanyID, targetAgentID, targetChatID, sourcePodID string) error
-}
-```
-
-## File: internal/domain/nats.go
-```go
-package domain
-import (
-	"context"
-	"github.com/nats-io/nats.go"
-)
-type NatsMessageSubscription interface {
-	Drain() error
-	IsValid() bool
-	Subject() string
-}
-type NatsMessageHandler func(msg *nats.Msg)
-type NatsConsumer interface {
-	SubscribeToChats(ctx context.Context, companyID, agentID string, handler NatsMessageHandler) (NatsMessageSubscription, error)
-	SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler NatsMessageHandler) (NatsMessageSubscription, error)
-	SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler NatsMessageHandler) (NatsMessageSubscription, error)
-	NatsConn() *nats.Conn
-	Close()
-}
-```
-
-## File: internal/adapters/grpc/proto/dws_message_fwd.proto
-```protobuf
-syntax = "proto3";
-
-package dws_message_fwd;
-
-import "google/protobuf/timestamp.proto";
-import "google/protobuf/struct.proto";
-
-option go_package = "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto;dws_message_fwd";
-
-service MessageForwardingService {
-  rpc PushEvent(PushEventRequest) returns (PushEventResponse);
-}
-
-message EnrichedEventPayloadMessage {
-  string event_id = 1;
-  string event_type = 2;
-  google.protobuf.Timestamp timestamp = 3;
-  string source = 4;
-  google.protobuf.Struct data = 5; // For arbitrary JSON-like data
-}
-
-message PushEventRequest {
-  EnrichedEventPayloadMessage payload = 1;
-  string target_company_id = 2; // For routing/logging on recipient
-  string target_agent_id = 3;
-  string target_chat_id = 4;
-  string source_pod_id = 5; // Added to track source for metrics
-}
-
-message PushEventResponse {
-  bool success = 1;
-  string message = 2; // Optional: error message or status
 }
 ```
 
@@ -920,6 +887,17 @@ func (h *GRPCMessageHandler) PushEvent(ctx context.Context, req *pb.PushEventReq
 }
 ```
 
+## File: internal/domain/forwarder.go
+```go
+package domain
+import (
+	"context"
+)
+type MessageForwarder interface {
+	ForwardEvent(ctx context.Context, targetPodAddress string, event *EnrichedEventPayload, targetCompanyID, targetAgentID, targetChatID, sourcePodID string) error
+}
+```
+
 ## File: internal/domain/logger.go
 ```go
 package domain
@@ -946,6 +924,28 @@ type EnrichedEventPayload struct {
 	Timestamp time.Time   `json:"timestamp"`
 	Source    string      `json:"source"`
 	Data      interface{} `json:"data"`
+}
+```
+
+## File: internal/domain/nats.go
+```go
+package domain
+import (
+	"context"
+	"github.com/nats-io/nats.go"
+)
+type NatsMessageSubscription interface {
+	Drain() error
+	IsValid() bool
+	Subject() string
+}
+type NatsMessageHandler func(msg *nats.Msg)
+type NatsConsumer interface {
+	SubscribeToChats(ctx context.Context, companyID, agentID string, handler NatsMessageHandler) (NatsMessageSubscription, error)
+	SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler NatsMessageHandler) (NatsMessageSubscription, error)
+	SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler NatsMessageHandler) (NatsMessageSubscription, error)
+	NatsConn() *nats.Conn
+	Close()
 }
 ```
 
@@ -1496,166 +1496,6 @@ func (a *KillSwitchPubSubAdapter) Close() error {
 		return nil
 	}
 	return fmt.Errorf("no active subscription to close")
-}
-```
-
-## File: internal/application/auth_service.go
-```go
-package application
-import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"strings"
-	"time"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-)
-var (
-	ErrTokenPayloadInvalid = errors.New("token payload is invalid")
-	ErrTokenExpired        = errors.New("token has expired")
-	ErrCacheMiss           = errors.New("token not found in cache")
-)
-type AuthService struct {
-	logger     domain.Logger
-	config     config.Provider
-	cache      domain.TokenCacheStore
-	adminCache domain.AdminTokenCacheStore
-}
-func NewAuthService(logger domain.Logger, config config.Provider, cache domain.TokenCacheStore, adminCache domain.AdminTokenCacheStore) *AuthService {
-	if logger == nil {
-		panic("logger is nil in NewAuthService")
-	}
-	if config == nil {
-		panic("config provider is nil in NewAuthService")
-	}
-	if cache == nil {
-		logger.Warn(context.Background(), "Company token cache (TokenCacheStore) is nil in NewAuthService. Company token caching will be disabled.")
-	}
-	if adminCache == nil {
-		panic("admin token cache store is nil in NewAuthService")
-	}
-	return &AuthService{
-		logger:     logger,
-		config:     config,
-		cache:      cache,
-		adminCache: adminCache,
-	}
-}
-func (s *AuthService) ParseAndValidateDecryptedToken(decryptedPayload []byte, rawTokenB64 string) (*domain.AuthenticatedUserContext, error) {
-	var ctx domain.AuthenticatedUserContext
-	err := json.Unmarshal(decryptedPayload, &ctx)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to unmarshal token JSON: %v", ErrTokenPayloadInvalid, err)
-	}
-	if err := ctx.Validate(); err != nil {
-		if strings.Contains(err.Error(), "expired") {
-			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
-		}
-		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
-	}
-	ctx.Token = rawTokenB64
-	return &ctx, nil
-}
-func (s *AuthService) ParseAndValidateAdminDecryptedToken(decryptedPayload []byte, rawTokenB64 string) (*domain.AdminUserContext, error) {
-	var adminCtx domain.AdminUserContext
-	err := json.Unmarshal(decryptedPayload, &adminCtx)
-	if err != nil {
-		return nil, fmt.Errorf("%w: failed to unmarshal admin token JSON: %v", ErrTokenPayloadInvalid, err)
-	}
-	if err := adminCtx.Validate(); err != nil {
-		if strings.Contains(err.Error(), "expired") {
-			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
-		}
-		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
-	}
-	adminCtx.Token = rawTokenB64
-	return &adminCtx, nil
-}
-func (s *AuthService) ProcessToken(reqCtx context.Context, tokenB64 string) (*domain.AuthenticatedUserContext, error) {
-	cacheKey := rediskeys.TokenCacheKey(tokenB64)
-	cachedCtx, err := s.cache.Get(reqCtx, cacheKey)
-	if err == nil && cachedCtx != nil {
-		if time.Now().After(cachedCtx.ExpiresAt) {
-			s.logger.Warn(reqCtx, "Cached token found but was expired", "cache_key", cacheKey, "expires_at", cachedCtx.ExpiresAt)
-		} else {
-			s.logger.Debug(reqCtx, "Token found in cache and is valid", "cache_key", cacheKey)
-			return cachedCtx, nil
-		}
-	} else if err != nil && !errors.Is(err, ErrCacheMiss) {
-		s.logger.Error(reqCtx, "Error retrieving token from cache", "cache_key", cacheKey, "error", err.Error())
-	}
-	s.logger.Debug(reqCtx, "Token not found in cache or cache error, proceeding to decrypt", "cache_key", cacheKey)
-	aesKeyHex := s.config.Get().Auth.TokenAESKey
-	if aesKeyHex == "" {
-		s.logger.Error(reqCtx, "TOKEN_AES_KEY not configured", "config_key", "auth.token_aes_key")
-		return nil, errors.New("application not configured for token decryption")
-	}
-	decryptedPayload, err := crypto.DecryptAESGCM(aesKeyHex, tokenB64)
-	if err != nil {
-		s.logger.Warn(reqCtx, "Token decryption failed", "error", err.Error())
-		return nil, err
-	}
-	validatedCtx, err := s.ParseAndValidateDecryptedToken(decryptedPayload, tokenB64)
-	if err != nil {
-		s.logger.Warn(reqCtx, "Decrypted token failed validation", "error", err.Error())
-		return nil, err
-	}
-	cacheTTLSeconds := s.config.Get().Auth.TokenCacheTTLSeconds
-	cacheTTL := time.Duration(cacheTTLSeconds) * time.Second
-	if cacheTTLSeconds == 0 {
-		cacheTTL = 30 * time.Second
-		s.logger.Debug(reqCtx, "auth.tokenCacheTTLSeconds not configured or zero, using default 30s", "cache_key", cacheKey)
-	}
-	if err := s.cache.Set(reqCtx, cacheKey, validatedCtx, cacheTTL); err != nil {
-		s.logger.Error(reqCtx, "Failed to cache validated token", "cache_key", cacheKey, "error", err.Error())
-	}
-	s.logger.Info(reqCtx, "Token decrypted, validated, and cached successfully", "cache_key", cacheKey)
-	return validatedCtx, nil
-}
-func (s *AuthService) ProcessAdminToken(reqCtx context.Context, tokenB64 string) (*domain.AdminUserContext, error) {
-	cacheKey := rediskeys.TokenCacheKey("admin_" + tokenB64)
-	cachedAdminCtx, err := s.adminCache.Get(reqCtx, cacheKey)
-	if err == nil && cachedAdminCtx != nil {
-		if time.Now().After(cachedAdminCtx.ExpiresAt) {
-			s.logger.Warn(reqCtx, "Cached admin token found but was expired", "cache_key", cacheKey, "expires_at", cachedAdminCtx.ExpiresAt)
-		} else {
-			s.logger.Debug(reqCtx, "Admin token found in cache and is valid", "cache_key", cacheKey)
-			return cachedAdminCtx, nil
-		}
-	} else if err != nil && !errors.Is(err, ErrCacheMiss) {
-		s.logger.Error(reqCtx, "Error retrieving admin token from cache", "cache_key", cacheKey, "error", err.Error())
-	}
-	s.logger.Debug(reqCtx, "Admin token not found in cache or cache error, proceeding to decrypt", "cache_key", cacheKey)
-	aesKeyHex := s.config.Get().Auth.AdminTokenAESKey
-	if aesKeyHex == "" {
-		s.logger.Error(reqCtx, "AdminTokenAESKey not configured", "config_key", "auth.admin_token_aes_key")
-		return nil, errors.New("application not configured for admin token decryption")
-	}
-	decryptedPayload, err := crypto.DecryptAESGCM(aesKeyHex, tokenB64)
-	if err != nil {
-		s.logger.Warn(reqCtx, "Admin token decryption failed", "error", err.Error())
-		return nil, err
-	}
-	validatedAdminCtx, err := s.ParseAndValidateAdminDecryptedToken(decryptedPayload, tokenB64)
-	if err != nil {
-		s.logger.Warn(reqCtx, "Decrypted admin token failed validation", "error", err.Error())
-		return nil, err
-	}
-	cacheTTLSeconds := s.config.Get().Auth.AdminTokenCacheTTLSeconds
-	cacheTTL := time.Duration(cacheTTLSeconds) * time.Second
-	if cacheTTLSeconds == 0 {
-		cacheTTL = 60 * time.Second
-		s.logger.Debug(reqCtx, "auth.adminTokenCacheTTLSeconds not configured or zero, using default 60s", "cache_key", cacheKey)
-	}
-	if err := s.adminCache.Set(reqCtx, cacheKey, validatedAdminCtx, cacheTTL); err != nil {
-		s.logger.Error(reqCtx, "Failed to cache validated admin token", "cache_key", cacheKey, "error", err.Error())
-	}
-	s.logger.Info(reqCtx, "Admin token decrypted, validated, and cached successfully", "cache_key", cacheKey, "admin_id", validatedAdminCtx.AdminID)
-	return validatedAdminCtx, nil
 }
 ```
 
@@ -2365,45 +2205,163 @@ func (c *Connection) SetCurrentChatID(chatID string) {
 }
 ```
 
-## File: internal/domain/auth.go
+## File: internal/application/auth_service.go
 ```go
-package domain
+package application
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 )
-type AuthenticatedUserContext struct {
-	CompanyID string    `json:"company_id"`
-	AgentID   string    `json:"agent_id"`
-	UserID    string    `json:"user_id"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Token     string    `json:"-"`
+var (
+	ErrTokenPayloadInvalid = errors.New("token payload is invalid")
+	ErrTokenExpired        = errors.New("token has expired")
+	ErrCacheMiss           = errors.New("token not found in cache")
+)
+type AuthService struct {
+	logger     domain.Logger
+	config     config.Provider
+	cache      domain.TokenCacheStore
+	adminCache domain.AdminTokenCacheStore
 }
-func (auc *AuthenticatedUserContext) Validate() error {
-	if auc.CompanyID == "" || auc.AgentID == "" || auc.UserID == "" || auc.ExpiresAt.IsZero() {
-		return fmt.Errorf("missing essential fields (company_id, agent_id, user_id, expires_at)")
+func NewAuthService(logger domain.Logger, config config.Provider, cache domain.TokenCacheStore, adminCache domain.AdminTokenCacheStore) *AuthService {
+	if logger == nil {
+		panic("logger is nil in NewAuthService")
 	}
-	if time.Now().After(auc.ExpiresAt) {
-		return fmt.Errorf("token expired at %v", auc.ExpiresAt)
+	if config == nil {
+		panic("config provider is nil in NewAuthService")
 	}
-	return nil
+	if cache == nil {
+		logger.Warn(context.Background(), "Company token cache (TokenCacheStore) is nil in NewAuthService. Company token caching will be disabled.")
+	}
+	if adminCache == nil {
+		panic("admin token cache store is nil in NewAuthService")
+	}
+	return &AuthService{
+		logger:     logger,
+		config:     config,
+		cache:      cache,
+		adminCache: adminCache,
+	}
 }
-type AdminUserContext struct {
-	AdminID              string `json:"admin_id"`
-	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
-	SubscribedCompanyID string    `json:"subscribed_company_id,omitempty"`
-	SubscribedAgentID   string    `json:"subscribed_agent_id,omitempty"`
-	ExpiresAt           time.Time `json:"expires_at"`
-	Token               string    `json:"-"`
+func (s *AuthService) ParseAndValidateDecryptedToken(decryptedPayload []byte, rawTokenB64 string) (*domain.AuthenticatedUserContext, error) {
+	var ctx domain.AuthenticatedUserContext
+	err := json.Unmarshal(decryptedPayload, &ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to unmarshal token JSON: %v", ErrTokenPayloadInvalid, err)
+	}
+	if err := ctx.Validate(); err != nil {
+		if strings.Contains(err.Error(), "expired") {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
+	}
+	ctx.Token = rawTokenB64
+	return &ctx, nil
 }
-func (auc *AdminUserContext) Validate() error {
-	if auc.AdminID == "" || auc.ExpiresAt.IsZero() {
-		return fmt.Errorf("missing essential fields (admin_id, expires_at) in admin token")
+func (s *AuthService) ParseAndValidateAdminDecryptedToken(decryptedPayload []byte, rawTokenB64 string) (*domain.AdminUserContext, error) {
+	var adminCtx domain.AdminUserContext
+	err := json.Unmarshal(decryptedPayload, &adminCtx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to unmarshal admin token JSON: %v", ErrTokenPayloadInvalid, err)
 	}
-	if time.Now().After(auc.ExpiresAt) {
-		return fmt.Errorf("admin token expired at %v", auc.ExpiresAt)
+	if err := adminCtx.Validate(); err != nil {
+		if strings.Contains(err.Error(), "expired") {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
 	}
-	return nil
+	adminCtx.Token = rawTokenB64
+	return &adminCtx, nil
+}
+func (s *AuthService) ProcessToken(reqCtx context.Context, tokenB64 string) (*domain.AuthenticatedUserContext, error) {
+	cacheKey := rediskeys.TokenCacheKey(tokenB64)
+	cachedCtx, err := s.cache.Get(reqCtx, cacheKey)
+	if err == nil && cachedCtx != nil {
+		if time.Now().After(cachedCtx.ExpiresAt) {
+			s.logger.Warn(reqCtx, "Cached token found but was expired", "cache_key", cacheKey, "expires_at", cachedCtx.ExpiresAt)
+		} else {
+			s.logger.Debug(reqCtx, "Token found in cache and is valid", "cache_key", cacheKey)
+			return cachedCtx, nil
+		}
+	} else if err != nil && !errors.Is(err, ErrCacheMiss) {
+		s.logger.Error(reqCtx, "Error retrieving token from cache", "cache_key", cacheKey, "error", err.Error())
+	}
+	s.logger.Debug(reqCtx, "Token not found in cache or cache error, proceeding to decrypt", "cache_key", cacheKey)
+	aesKeyHex := s.config.Get().Auth.TokenAESKey
+	if aesKeyHex == "" {
+		s.logger.Error(reqCtx, "TOKEN_AES_KEY not configured", "config_key", "auth.token_aes_key")
+		return nil, errors.New("application not configured for token decryption")
+	}
+	decryptedPayload, err := crypto.DecryptAESGCM(aesKeyHex, tokenB64)
+	if err != nil {
+		s.logger.Warn(reqCtx, "Token decryption failed", "error", err.Error())
+		return nil, err
+	}
+	validatedCtx, err := s.ParseAndValidateDecryptedToken(decryptedPayload, tokenB64)
+	if err != nil {
+		s.logger.Warn(reqCtx, "Decrypted token failed validation", "error", err.Error())
+		return nil, err
+	}
+	cacheTTLSeconds := s.config.Get().Auth.TokenCacheTTLSeconds
+	cacheTTL := time.Duration(cacheTTLSeconds) * time.Second
+	if cacheTTLSeconds == 0 {
+		cacheTTL = 30 * time.Second
+		s.logger.Debug(reqCtx, "auth.tokenCacheTTLSeconds not configured or zero, using default 30s", "cache_key", cacheKey)
+	}
+	if err := s.cache.Set(reqCtx, cacheKey, validatedCtx, cacheTTL); err != nil {
+		s.logger.Error(reqCtx, "Failed to cache validated token", "cache_key", cacheKey, "error", err.Error())
+	}
+	s.logger.Info(reqCtx, "Token decrypted, validated, and cached successfully", "cache_key", cacheKey)
+	return validatedCtx, nil
+}
+func (s *AuthService) ProcessAdminToken(reqCtx context.Context, tokenB64 string) (*domain.AdminUserContext, error) {
+	cacheKey := rediskeys.TokenCacheKey("admin_" + tokenB64)
+	cachedAdminCtx, err := s.adminCache.Get(reqCtx, cacheKey)
+	if err == nil && cachedAdminCtx != nil {
+		if time.Now().After(cachedAdminCtx.ExpiresAt) {
+			s.logger.Warn(reqCtx, "Cached admin token found but was expired", "cache_key", cacheKey, "expires_at", cachedAdminCtx.ExpiresAt)
+		} else {
+			s.logger.Debug(reqCtx, "Admin token found in cache and is valid", "cache_key", cacheKey)
+			return cachedAdminCtx, nil
+		}
+	} else if err != nil && !errors.Is(err, ErrCacheMiss) {
+		s.logger.Error(reqCtx, "Error retrieving admin token from cache", "cache_key", cacheKey, "error", err.Error())
+	}
+	s.logger.Debug(reqCtx, "Admin token not found in cache or cache error, proceeding to decrypt", "cache_key", cacheKey)
+	aesKeyHex := s.config.Get().Auth.AdminTokenAESKey
+	if aesKeyHex == "" {
+		s.logger.Error(reqCtx, "AdminTokenAESKey not configured", "config_key", "auth.admin_token_aes_key")
+		return nil, errors.New("application not configured for admin token decryption")
+	}
+	decryptedPayload, err := crypto.DecryptAESGCM(aesKeyHex, tokenB64)
+	if err != nil {
+		s.logger.Warn(reqCtx, "Admin token decryption failed", "error", err.Error())
+		return nil, err
+	}
+	validatedAdminCtx, err := s.ParseAndValidateAdminDecryptedToken(decryptedPayload, tokenB64)
+	if err != nil {
+		s.logger.Warn(reqCtx, "Decrypted admin token failed validation", "error", err.Error())
+		return nil, err
+	}
+	cacheTTLSeconds := s.config.Get().Auth.AdminTokenCacheTTLSeconds
+	cacheTTL := time.Duration(cacheTTLSeconds) * time.Second
+	if cacheTTLSeconds == 0 {
+		cacheTTL = 60 * time.Second
+		s.logger.Debug(reqCtx, "auth.adminTokenCacheTTLSeconds not configured or zero, using default 60s", "cache_key", cacheKey)
+	}
+	if err := s.adminCache.Set(reqCtx, cacheKey, validatedAdminCtx, cacheTTL); err != nil {
+		s.logger.Error(reqCtx, "Failed to cache validated admin token", "cache_key", cacheKey, "error", err.Error())
+	}
+	s.logger.Info(reqCtx, "Admin token decrypted, validated, and cached successfully", "cache_key", cacheKey, "admin_id", validatedAdminCtx.AdminID)
+	return validatedAdminCtx, nil
 }
 ```
 
@@ -2905,6 +2863,257 @@ func (cm *ConnectionManager) StopResourceRenewalLoop() {
 	close(cm.renewalStopChan) // Signal the loop to stop
 	cm.renewalWg.Wait()       // Wait for the goroutine to finish
 	cm.logger.Info(context.Background(), "Resource renewal loop stopped.")
+}
+```
+
+## File: internal/domain/auth.go
+```go
+package domain
+import (
+	"fmt"
+	"time"
+)
+type AuthenticatedUserContext struct {
+	CompanyID string    `json:"company_id"`
+	AgentID   string    `json:"agent_id"`
+	UserID    string    `json:"user_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Token     string    `json:"-"`
+}
+func (auc *AuthenticatedUserContext) Validate() error {
+	if auc.CompanyID == "" || auc.AgentID == "" || auc.UserID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (company_id, agent_id, user_id, expires_at)")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("token expired at %v", auc.ExpiresAt)
+	}
+	return nil
+}
+type AdminUserContext struct {
+	AdminID              string `json:"admin_id"`
+	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
+	SubscribedCompanyID string    `json:"subscribed_company_id,omitempty"`
+	SubscribedAgentID   string    `json:"subscribed_agent_id,omitempty"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	Token               string    `json:"-"`
+}
+func (auc *AdminUserContext) Validate() error {
+	if auc.AdminID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (admin_id, expires_at) in admin token")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("admin token expired at %v", auc.ExpiresAt)
+	}
+	return nil
+}
+```
+
+## File: internal/application/connection_manager.go
+```go
+package application
+import (
+	"sync"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type ConnectionManager struct {
+	logger                 domain.Logger
+	configProvider         config.Provider
+	sessionLocker          domain.SessionLockManager
+	killSwitchPublisher    domain.KillSwitchPublisher
+	killSwitchSubscriber   domain.KillSwitchSubscriber
+	routeRegistry          domain.RouteRegistry
+	activeConnections      sync.Map
+	activeAdminConnections sync.Map
+	renewalStopChan chan struct{}
+	renewalWg       sync.WaitGroup
+}
+func NewConnectionManager(
+	logger domain.Logger,
+	configProvider config.Provider,
+	sessionLocker domain.SessionLockManager,
+	killSwitchPublisher domain.KillSwitchPublisher,
+	killSwitchSubscriber domain.KillSwitchSubscriber,
+	routeRegistry domain.RouteRegistry,
+) *ConnectionManager {
+	return &ConnectionManager{
+		logger:                 logger,
+		configProvider:         configProvider,
+		sessionLocker:          sessionLocker,
+		killSwitchPublisher:    killSwitchPublisher,
+		killSwitchSubscriber:   killSwitchSubscriber,
+		routeRegistry:          routeRegistry,
+		activeConnections:      sync.Map{},
+		activeAdminConnections: sync.Map{},
+		renewalStopChan:        make(chan struct{}),
+	}
+}
+func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
+	return cm.routeRegistry
+}
+```
+
+## File: internal/application/kill_switch.go
+```go
+package application
+import (
+	"context"
+	"fmt"
+	"strings"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+const (
+	sessionKillChannelPrefix      = "session_kill:"
+	adminSessionKillChannelPrefix = "session_kill:admin:"
+)
+func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
+		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
+	}
+	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
+	parts := strings.Split(partsStr, ":")
+	if len(parts) != 3 {
+		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
+		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
+	}
+	companyID, agentID, userID := parts[0], parts[1], parts[2]
+	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
+		"sessionKey", sessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+	val, exists := cm.activeConnections.Load(sessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
+		return nil
+	}
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
+		cm.DeregisterConnection(sessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
+	}
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
+		"sessionKey", sessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "SessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
+			"sessionKey", sessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(sessionKey)
+	return nil
+}
+func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
+		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
+	}
+	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
+	adminSessionKey := rediskeys.AdminSessionKey(adminID)
+	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
+		"adminSessionKey", adminSessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+	val, exists := cm.activeConnections.Load(adminSessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
+		return nil
+	}
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
+		cm.DeregisterConnection(adminSessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
+	}
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
+		"adminSessionKey", adminSessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Admin session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "AdminSessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
+			"adminSessionKey", adminSessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(adminSessionKey)
+	return nil
+}
+func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.SessionKillChannelKey("*", "*", "*")
+		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
+	})
+}
+func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.AdminSessionKillChannelKey("*")
+		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
+	})
+}
+func (cm *ConnectionManager) StopKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
+	if cm.killSwitchSubscriber != nil {
+		return cm.killSwitchSubscriber.Close()
+	}
+	return nil
+}
+func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
+	return nil
 }
 ```
 
@@ -3456,215 +3665,6 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 }
 ```
 
-## File: internal/application/connection_manager.go
-```go
-package application
-import (
-	"sync"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type ConnectionManager struct {
-	logger                 domain.Logger
-	configProvider         config.Provider
-	sessionLocker          domain.SessionLockManager
-	killSwitchPublisher    domain.KillSwitchPublisher
-	killSwitchSubscriber   domain.KillSwitchSubscriber
-	routeRegistry          domain.RouteRegistry
-	activeConnections      sync.Map
-	activeAdminConnections sync.Map
-	renewalStopChan chan struct{}
-	renewalWg       sync.WaitGroup
-}
-func NewConnectionManager(
-	logger domain.Logger,
-	configProvider config.Provider,
-	sessionLocker domain.SessionLockManager,
-	killSwitchPublisher domain.KillSwitchPublisher,
-	killSwitchSubscriber domain.KillSwitchSubscriber,
-	routeRegistry domain.RouteRegistry,
-) *ConnectionManager {
-	return &ConnectionManager{
-		logger:                 logger,
-		configProvider:         configProvider,
-		sessionLocker:          sessionLocker,
-		killSwitchPublisher:    killSwitchPublisher,
-		killSwitchSubscriber:   killSwitchSubscriber,
-		routeRegistry:          routeRegistry,
-		activeConnections:      sync.Map{},
-		activeAdminConnections: sync.Map{},
-		renewalStopChan:        make(chan struct{}),
-	}
-}
-func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
-	return cm.routeRegistry
-}
-```
-
-## File: internal/application/kill_switch.go
-```go
-package application
-import (
-	"context"
-	"fmt"
-	"strings"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
-)
-const (
-	sessionKillChannelPrefix      = "session_kill:"
-	adminSessionKillChannelPrefix = "session_kill:admin:"
-)
-func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background()
-	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
-		"channel", channel,
-		"newPodIDInMessage", message.NewPodID,
-	)
-	currentPodID := cm.configProvider.Get().Server.PodID
-	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
-		return nil
-	}
-	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
-		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
-	}
-	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
-	parts := strings.Split(partsStr, ":")
-	if len(parts) != 3 {
-		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
-		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
-	}
-	companyID, agentID, userID := parts[0], parts[1], parts[2]
-	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
-		"sessionKey", sessionKey,
-		"messageNewPodID", message.NewPodID,
-		"currentPodID", currentPodID)
-	val, exists := cm.activeConnections.Load(sessionKey)
-	if !exists {
-		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
-		return nil
-	}
-	managedConn, ok := val.(domain.ManagedConnection)
-	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
-		cm.DeregisterConnection(sessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
-	}
-	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
-		"sessionKey", sessionKey,
-		"remoteAddr", managedConn.RemoteAddr(),
-		"conflictingPodID", message.NewPodID,
-	)
-	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Session taken over by another connection")
-	if err := managedConn.CloseWithError(errResp, "SessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
-			"sessionKey", sessionKey,
-			"remoteAddr", managedConn.RemoteAddr(),
-			"error", err.Error(),
-		)
-	}
-	cm.DeregisterConnection(sessionKey)
-	return nil
-}
-func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background()
-	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
-		"channel", channel,
-		"newPodIDInMessage", message.NewPodID,
-	)
-	currentPodID := cm.configProvider.Get().Server.PodID
-	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
-		return nil
-	}
-	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
-		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
-	}
-	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
-	adminSessionKey := rediskeys.AdminSessionKey(adminID)
-	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
-		"adminSessionKey", adminSessionKey,
-		"messageNewPodID", message.NewPodID,
-		"currentPodID", currentPodID)
-	val, exists := cm.activeConnections.Load(adminSessionKey)
-	if !exists {
-		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
-		return nil
-	}
-	managedConn, ok := val.(domain.ManagedConnection)
-	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
-		cm.DeregisterConnection(adminSessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
-	}
-	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
-		"adminSessionKey", adminSessionKey,
-		"remoteAddr", managedConn.RemoteAddr(),
-		"conflictingPodID", message.NewPodID,
-	)
-	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Admin session taken over by another connection")
-	if err := managedConn.CloseWithError(errResp, "AdminSessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
-			"adminSessionKey", adminSessionKey,
-			"remoteAddr", managedConn.RemoteAddr(),
-			"error", err.Error(),
-		)
-	}
-	cm.DeregisterConnection(adminSessionKey)
-	return nil
-}
-func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
-		pattern := rediskeys.SessionKillChannelKey("*", "*", "*")
-		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
-			} else {
-				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
-			}
-		}
-		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
-	})
-}
-func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
-		pattern := rediskeys.AdminSessionKillChannelKey("*")
-		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
-			} else {
-				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
-			}
-		}
-		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
-	})
-}
-func (cm *ConnectionManager) StopKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
-	if cm.killSwitchSubscriber != nil {
-		return cm.killSwitchSubscriber.Close()
-	}
-	return nil
-}
-func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
-	return nil
-}
-```
-
 ## File: internal/application/connection_registry.go
 ```go
 package application
@@ -3912,9 +3912,9 @@ type viperProvider struct {
 func NewViperProvider(appCtx context.Context, logger *zap.Logger) (Provider, error) {
 	cfg := &Config{}
 	v := viper.New()
-	v.SetConfigName(os.Getenv("VIPER_CONFIG_NAME"))
+	v.SetConfigName(getEnv("DAISI_WS_CONFIG_NAME", "config"))
 	v.SetConfigType("yaml")
-	v.AddConfigPath(os.Getenv("VIPER_CONFIG_PATH"))
+	v.AddConfigPath(getEnv("DAISI_WS_CONFIG_PATH", "./config"))
 	v.AddConfigPath(".")
 	v.SetEnvPrefix(envPrefix)
 	v.AutomaticEnv()
@@ -4001,22 +4001,6 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-func InitializeViperForBootstrap() (*viper.Viper, error) {
-	v := viper.New()
-	v.SetConfigName(getEnv("VIPER_CONFIG_NAME", "config"))
-	v.SetConfigType("yaml")
-	v.AddConfigPath(getEnv("VIPER_CONFIG_PATH", "/app/config"))
-	v.AddConfigPath(".")
-	v.SetEnvPrefix(envPrefix)
-	v.AutomaticEnv()
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
-	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("failed to read bootstrap config: %w", err)
-		}
-	}
-	return v, nil
 }
 ```
 

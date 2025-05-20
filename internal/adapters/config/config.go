@@ -119,10 +119,10 @@ func NewViperProvider(appCtx context.Context, logger *zap.Logger) (Provider, err
 	// v.SetDefault("log.level", "info")
 
 	// Configure Viper to read from YAML file
-	v.SetConfigName(os.Getenv("VIPER_CONFIG_NAME")) // e.g., "config"
+	v.SetConfigName(getEnv("DAISI_WS_CONFIG_NAME", "config"))
 	v.SetConfigType("yaml")
-	v.AddConfigPath(os.Getenv("VIPER_CONFIG_PATH")) // e.g., "/app/config" or "./config" for local dev
-	v.AddConfigPath(".")                            // Also look in current directory for local dev
+	v.AddConfigPath(getEnv("DAISI_WS_CONFIG_PATH", "./config"))
+	v.AddConfigPath(".") // Also look in current directory for local dev
 
 	// Configure Viper to read from environment variables
 	v.SetEnvPrefix(envPrefix)
@@ -225,26 +225,4 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-// InitializeViperForBootstrap sets up minimal viper for early stage needs like logger config.
-// This is if you need a very basic logger *before* the full config provider is up.
-// Generally, passing a pre-configured basic zap logger to NewViperProvider is preferred.
-func InitializeViperForBootstrap() (*viper.Viper, error) {
-	v := viper.New()
-	v.SetConfigName(getEnv("VIPER_CONFIG_NAME", "config"))
-	v.SetConfigType("yaml")
-	v.AddConfigPath(getEnv("VIPER_CONFIG_PATH", "/app/config"))
-	v.AddConfigPath(".")
-	v.SetEnvPrefix(envPrefix)
-	v.AutomaticEnv()
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
-
-	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("failed to read bootstrap config: %w", err)
-		}
-		// Config file not found is okay, will rely on ENV or defaults
-	}
-	return v, nil
 }
