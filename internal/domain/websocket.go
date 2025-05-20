@@ -13,6 +13,9 @@ type ManagedConnection interface {
 	// Close attempts to close the WebSocket connection with a specified status code and reason.
 	Close(statusCode websocket.StatusCode, reason string) error
 
+	// CloseWithError closes the WebSocket connection with an error response and reason.
+	CloseWithError(errResp ErrorResponse, reason string) error
+
 	// WriteJSON sends a JSON-encoded message to the client.
 	WriteJSON(v interface{}) error
 

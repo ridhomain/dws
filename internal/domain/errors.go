@@ -3,6 +3,8 @@ package domain
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/coder/websocket"
 )
 
 // ErrorCode represents a specific error condition.
@@ -43,6 +45,54 @@ func NewErrorResponse(code ErrorCode, message string, details string) ErrorRespo
 // WriteJSON sends an ErrorResponse as JSON with the given HTTP status code.
 func (er ErrorResponse) WriteJSON(w http.ResponseWriter, httpStatusCode int) {
 	w.Header().Set("Content-Type", "application/json")
+
+	// If status code is 0 or not provided explicitly, use the mapping function
+	if httpStatusCode <= 0 {
+		httpStatusCode = er.ToHTTPStatus()
+	}
+
 	w.WriteHeader(httpStatusCode)
 	json.NewEncoder(w).Encode(er) // Best effort, error from Encode is not typically handled here.
+}
+
+// ToWebSocketCloseCode converts an ErrorCode to the appropriate WebSocket close code.
+func (er ErrorResponse) ToWebSocketCloseCode() websocket.StatusCode {
+	switch er.Code {
+	case ErrInvalidAPIKey:
+		return websocket.StatusCode(4401)
+	case ErrInvalidToken, ErrUnauthorized, ErrForbidden:
+		return websocket.StatusCode(4403)
+	case ErrSessionConflict:
+		return websocket.StatusCode(4402)
+	case ErrRateLimitExceeded:
+		return websocket.StatusCode(4429)
+	case ErrBadRequest, ErrMethodNotAllowed:
+		return websocket.StatusCode(4400)
+	case ErrInternal, ErrSubscriptionFailure:
+		return websocket.StatusCode(1011)
+	default:
+		return websocket.StatusCode(1011) // Internal Server Error for any unhandled case
+	}
+}
+
+// ToHTTPStatus converts an ErrorCode to the appropriate HTTP status code.
+func (er ErrorResponse) ToHTTPStatus() int {
+	switch er.Code {
+	case ErrInvalidAPIKey, ErrUnauthorized:
+		return http.StatusUnauthorized // 401
+	case ErrInvalidToken, ErrForbidden:
+		return http.StatusForbidden // 403
+	case ErrSessionConflict:
+		return http.StatusConflict // 409
+	case ErrRateLimitExceeded:
+		return http.StatusTooManyRequests // 429
+	case ErrBadRequest:
+		return http.StatusBadRequest // 400
+	case ErrMethodNotAllowed:
+		return http.StatusMethodNotAllowed // 405
+	case ErrInternal, ErrSubscriptionFailure:
+		return http.StatusInternalServerError // 500
+	default:
+		return http.StatusInternalServerError // 500 for any unhandled case
+	}
 }

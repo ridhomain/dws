@@ -11,6 +11,7 @@ import (
 
 	"github.com/coder/websocket" // Direct import, no alias
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 )
 
@@ -69,6 +70,26 @@ func (c *Connection) Close(statusCode websocket.StatusCode, reason string) error
 		c.cancelConnCtxFunc()
 	}
 	return c.wsConn.Close(statusCode, reason)
+}
+
+// CloseWithError sends an error message to the client and then closes the WebSocket connection
+// with the appropriate close code derived from the error response.
+func (c *Connection) CloseWithError(errResp domain.ErrorResponse, reason string) error {
+	// First send the error message to the client
+	errorMsg := domain.NewErrorMessage(errResp)
+	if err := c.WriteJSON(errorMsg); err != nil {
+		c.logger.Error(c.connCtx, "Failed to send error message before closing connection",
+			"error", err.Error(),
+			"error_code", string(errResp.Code),
+			"message", errResp.Message)
+		// Continue with close even if we couldn't send the error message
+	} else {
+		metrics.IncrementMessagesSent(domain.MessageTypeError)
+	}
+
+	// Then close the WebSocket with the appropriate status code
+	closeCode := errResp.ToWebSocketCloseCode()
+	return c.Close(closeCode, reason)
 }
 
 // WriteJSON sends a JSON-encoded message to the client with a timeout.

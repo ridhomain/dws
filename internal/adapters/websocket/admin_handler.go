@@ -148,7 +148,9 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // manageAdminConnection handles the lifecycle of a single admin WebSocket connection.
 func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Connection, adminInfo *domain.AdminUserContext) {
-	defer conn.Close(websocket.StatusNormalClosure, "admin connection ended")
+	// For normal/graceful closure, we intentionally use a direct Close instead of CloseWithError
+	// since this is an expected termination (e.g., function exit), not an error condition that needs to be reported to the client.
+	defer conn.Close(websocket.StatusNormalClosure, "admin connection ended") // Ensures WebSocket closes if all other error handling is bypassed
 
 	h.logger.Info(connCtx, "Admin WebSocket connection management started",
 		"admin_id", adminInfo.AdminID,
@@ -261,16 +263,18 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 				case <-pinger.C:
 					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
 					if err := conn.Ping(pingWriteCtx); err != nil {
-						h.logger.Error(connCtx, "Failed to send ping to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
+						h.logger.Error(connCtx, "Failed to send admin ping", "error", err.Error(), "admin_id", adminInfo.AdminID)
 						pingCancel()
-						conn.Close(websocket.StatusAbnormalClosure, "Admin Ping failure")
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
+						conn.CloseWithError(errResp, "Admin Ping failure")
 						return
 					}
 					pingCancel()
 					h.logger.Debug(connCtx, "Sent ping to admin client", "admin_id", adminInfo.AdminID)
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
 						h.logger.Warn(connCtx, "Admin Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "admin_id", adminInfo.AdminID)
-						conn.Close(websocket.StatusPolicyViolation, "Admin Pong timeout")
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
+						conn.CloseWithError(errResp, "Admin Pong timeout")
 						return
 					}
 				case <-connCtx.Done():
@@ -299,7 +303,8 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		if errRead != nil {
 			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
 				h.logger.Warn(connCtx, "Admin Pong timeout: No message received. Closing connection.", "admin_id", adminInfo.AdminID)
-				conn.Close(websocket.StatusPolicyViolation, "Admin Pong timeout")
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within configured timeout period.")
+				conn.CloseWithError(errResp, "Admin Pong timeout")
 				return
 			}
 			closeStatus := websocket.CloseStatus(errRead)

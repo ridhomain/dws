@@ -244,7 +244,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // It is responsible for reading messages, sending pings, handling timeouts, and ensuring cleanup.
 // The companyID, agentID, and userID parameters are now authoritative, derived from the validated token.
 func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, companyID, agentID, userID string) {
-	defer conn.Close(websocket.StatusNormalClosure, "connection ended") // Ensure WebSocket is closed
+	// For normal/graceful closure, we intentionally use a direct Close instead of CloseWithError
+	// since this is an expected termination (e.g., function exit), not an error condition that needs to be reported to the client.
+	defer conn.Close(websocket.StatusNormalClosure, "connection ended") // Ensures WebSocket closes if all other error handling is bypassed
 
 	// Use the authenticated IDs for logging here
 	h.logger.Info(connCtx, "WebSocket connection management started",
@@ -552,7 +554,8 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					if err := conn.Ping(pingWriteCtx); err != nil {
 						h.logger.Error(connCtx, "Failed to send ping", "error", err.Error())
 						pingCancel()
-						conn.Close(websocket.StatusAbnormalClosure, "Ping failure")
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
+						conn.CloseWithError(errResp, "Ping failure")
 						return
 					}
 					pingCancel()
@@ -560,7 +563,8 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
 						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "lastPong", conn.LastPongTime())
-						conn.Close(websocket.StatusPolicyViolation, "Pong timeout")
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
+						conn.CloseWithError(errResp, "Pong timeout")
 						return
 					}
 				case <-connCtx.Done():
@@ -594,8 +598,9 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			// Check if the error is due to the readCtx timeout (pong timeout)
 			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
 				h.logger.Warn(connCtx, "Pong timeout: No message received within pongWaitDuration. Closing connection.", "pong_wait_duration", pongWaitDuration)
-				conn.Close(websocket.StatusPolicyViolation, "Pong timeout") // Or a custom code
-				return                                                      // Exit manageConnection
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within the configured timeout period.")
+				conn.CloseWithError(errResp, "Pong timeout")
+				return
 			}
 
 			closeStatus := websocket.CloseStatus(errRead)
@@ -635,7 +640,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			case domain.MessageTypeSelectChat:
 				h.logger.Info(connCtx, "Handling select_chat message type")
 				// Pass the natsMessageHandler and a way to update currentNatsSubscription
-				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
+				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
 				if err != nil {
 					h.logger.Error(connCtx, "Error handling select_chat message", "error", err.Error())
 					errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to process chat selection", err.Error())
@@ -668,13 +673,12 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 func (h *Handler) handleSelectChatMessage(
 	connCtx context.Context,
 	conn *Connection,
-	rawPayload []byte,
 	companyID, agentID, userID string,
 	payloadData interface{},
 	specificChatNatsMsgHandler nats.MsgHandler, // Renamed for clarity
-	currentGeneralSub *nats.Subscription, // Pass general subscription
-	currentSpecificSub *nats.Subscription, // Pass current specific subscription
-	currentSpecificSubChatID string, // Pass current specific chat ID
+	currentGeneralSub *nats.Subscription,       // Pass general subscription
+	currentSpecificSub *nats.Subscription,      // Pass current specific subscription
+	currentSpecificSubChatID string,            // Pass current specific chat ID
 ) (*nats.Subscription, string, error) { // Returns new specific subscription, new chatID, and error
 
 	payloadMap, ok := payloadData.(map[string]interface{})

@@ -80,11 +80,15 @@ func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 	}
 }
 
-// GracefullyCloseAllConnections iterates over all active connections, sends a close frame,
-// and logs the action. It's intended to be called during graceful server shutdown.
+// GracefullyCloseAllConnections sends a graceful close frame to all active WebSocket connections.
+// This is typically called during a controlled service shutdown.
 func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.StatusCode, reason string) {
 	cm.logger.Info(context.Background(), "Initiating graceful closure of all active WebSocket connections...", "code", closeCode, "reason", reason)
 	closedCount := 0
+
+	// Create a standard error response for graceful shutdown
+	errResp := domain.NewErrorResponse(domain.ErrInternal, "Service shutting down", "The WebSocket service is being gracefully terminated.")
+
 	cm.activeConnections.Range(func(key, value interface{}) bool {
 		sessionKey, okSessionKey := key.(string)
 		conn, okConn := value.(domain.ManagedConnection)
@@ -94,13 +98,31 @@ func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.S
 		}
 
 		cm.logger.Info(conn.Context(), "Sending close frame to WebSocket connection", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
-		if err := conn.Close(closeCode, reason); err != nil {
+		if err := conn.CloseWithError(errResp, reason); err != nil {
 			// Log error, but underlying connection context cancellation should ensure cleanup via DeregisterConnection later if not already.
 			cm.logger.Warn(conn.Context(), "Error sending close frame during graceful shutdown (will be forcibly closed)", "sessionKey", sessionKey, "error", err.Error())
 		}
 		closedCount++
 		return true // Continue to next item
 	})
+
+	// Also close any admin connections
+	cm.activeAdminConnections.Range(func(key, value interface{}) bool {
+		adminSessionKey, okSessionKey := key.(string)
+		conn, okConn := value.(domain.ManagedConnection)
+		if !okSessionKey || !okConn {
+			cm.logger.Error(context.Background(), "Invalid type in activeAdminConnections map during graceful shutdown", "key_type", fmt.Sprintf("%T", key), "value_type", fmt.Sprintf("%T", value))
+			return true // Continue to next item
+		}
+
+		cm.logger.Info(conn.Context(), "Sending close frame to admin WebSocket connection", "adminSessionKey", adminSessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+		if err := conn.CloseWithError(errResp, reason); err != nil {
+			cm.logger.Warn(conn.Context(), "Error sending close frame to admin connection during graceful shutdown (will be forcibly closed)", "adminSessionKey", adminSessionKey, "error", err.Error())
+		}
+		closedCount++
+		return true // Continue to next item
+	})
+
 	cm.logger.Info(context.Background(), "Graceful close frames sent to active connections", "count", closedCount)
 	// The actual deregistration and lock release happens when each connection's manageConnection goroutine exits due to context cancellation from conn.Close().
 }

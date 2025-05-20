@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
@@ -63,7 +62,8 @@ func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message dom
 		"remoteAddr", managedConn.RemoteAddr(),
 		"conflictingPodID", message.NewPodID,
 	)
-	if err := managedConn.Close(websocket.StatusCode(4402), "SessionConflict: Session taken over by another connection"); err != nil {
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "SessionConflict: Session taken over by another connection"); err != nil {
 		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
 			"sessionKey", sessionKey,
 			"remoteAddr", managedConn.RemoteAddr(),
@@ -118,7 +118,8 @@ func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, messag
 		"remoteAddr", managedConn.RemoteAddr(),
 		"conflictingPodID", message.NewPodID,
 	)
-	if err := managedConn.Close(websocket.StatusCode(4402), "AdminSessionConflict: Session taken over by another connection"); err != nil {
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Admin session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "AdminSessionConflict: Session taken over by another connection"); err != nil {
 		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
 			"adminSessionKey", adminSessionKey,
 			"remoteAddr", managedConn.RemoteAddr(),
