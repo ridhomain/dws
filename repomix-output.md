@@ -113,7 +113,6 @@ pkg/
   safego/
     safego.go
 .gitignore
-Dockerfile
 go.mod
 ```
 
@@ -374,230 +373,6 @@ func (a *AdminTokenCacheAdapter) Set(ctx context.Context, key string, value *dom
 }
 ```
 
-## File: internal/adapters/redis/route_registry.go
-```go
-package redis
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-	"github.com/redis/go-redis/v9"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-)
-var ErrNoOwningPod = errors.New("no owning pod found for the route")
-type RouteRegistryAdapter struct {
-	redisClient *redis.Client
-	logger      domain.Logger
-}
-func NewRouteRegistryAdapter(redisClient *redis.Client, logger domain.Logger) *RouteRegistryAdapter {
-	if redisClient == nil {
-		panic("redisClient cannot be nil in NewRouteRegistryAdapter")
-	}
-	if logger == nil {
-		panic("logger cannot be nil in NewRouteRegistryAdapter")
-	}
-	return &RouteRegistryAdapter{
-		redisClient: redisClient,
-		logger:      logger,
-	}
-}
-func (a *RouteRegistryAdapter) RegisterChatRoute(ctx context.Context, companyID, agentID, podID string, ttl time.Duration) error {
-	key := rediskeys.RouteKeyChats(companyID, agentID)
-	a.logger.Debug(ctx, "Registering chat route", "key", key, "podID", podID, "ttl", ttl.String())
-	pipe := a.redisClient.Pipeline()
-	pipe.SAdd(ctx, key, podID)
-	pipe.Expire(ctx, key, ttl)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		a.logger.Error(ctx, "Failed to register chat route", "key", key, "podID", podID, "error", err.Error())
-		return fmt.Errorf("redis SADD/EXPIRE for chat route key '%s' failed: %w", key, err)
-	}
-	return nil
-}
-func (a *RouteRegistryAdapter) UnregisterChatRoute(ctx context.Context, companyID, agentID, podID string) error {
-	key := rediskeys.RouteKeyChats(companyID, agentID)
-	a.logger.Debug(ctx, "Unregistering chat route", "key", key, "podID", podID)
-	err := a.redisClient.SRem(ctx, key, podID).Err()
-	if err != nil {
-		a.logger.Error(ctx, "Failed to unregister chat route", "key", key, "podID", podID, "error", err.Error())
-		return fmt.Errorf("redis SREM for chat route key '%s' failed: %w", key, err)
-	}
-	return nil
-}
-func (a *RouteRegistryAdapter) RegisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string, ttl time.Duration) error {
-	key := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
-	a.logger.Debug(ctx, "Registering message route", "key", key, "podID", podID, "ttl", ttl.String())
-	pipe := a.redisClient.Pipeline()
-	pipe.SAdd(ctx, key, podID)
-	pipe.Expire(ctx, key, ttl)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		a.logger.Error(ctx, "Failed to register message route", "key", key, "podID", podID, "error", err.Error())
-		return fmt.Errorf("redis SADD/EXPIRE for message route key '%s' failed: %w", key, err)
-	}
-	return nil
-}
-func (a *RouteRegistryAdapter) UnregisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string) error {
-	key := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
-	a.logger.Debug(ctx, "Unregistering message route", "key", key, "podID", podID)
-	err := a.redisClient.SRem(ctx, key, podID).Err()
-	if err != nil {
-		a.logger.Error(ctx, "Failed to unregister message route", "key", key, "podID", podID, "error", err.Error())
-		return fmt.Errorf("redis SREM for message route key '%s' failed: %w", key, err)
-	}
-	return nil
-}
-func (a *RouteRegistryAdapter) GetOwningPodForMessageRoute(ctx context.Context, companyID, agentID, chatID string) (string, error) {
-	key := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
-	members, err := a.redisClient.SMembers(ctx, key).Result()
-	if err != nil {
-		a.logger.Error(ctx, "Failed to get members for message route", "key", key, "error", err.Error())
-		return "", fmt.Errorf("redis SMEMBERS for message route key '%s' failed: %w", key, err)
-	}
-	if len(members) == 0 {
-		a.logger.Debug(ctx, "No owning pod found for message route", "key", key)
-		return "", ErrNoOwningPod
-	}
-	if len(members) > 1 {
-		a.logger.Warn(ctx, "Multiple owning pods found for message route, returning first", "key", key, "pods", members)
-	}
-	return members[0], nil
-}
-func (a *RouteRegistryAdapter) GetOwningPodsForChatRoute(ctx context.Context, companyID, agentID string) ([]string, error) {
-	key := rediskeys.RouteKeyChats(companyID, agentID)
-	members, err := a.redisClient.SMembers(ctx, key).Result()
-	if err != nil {
-		a.logger.Error(ctx, "Failed to get members for chat route", "key", key, "error", err.Error())
-		return nil, fmt.Errorf("redis SMEMBERS for chat route key '%s' failed: %w", key, err)
-	}
-	if len(members) == 0 {
-		a.logger.Debug(ctx, "No owning pods found for chat route", "key", key)
-	}
-	return members, nil
-}
-func (a *RouteRegistryAdapter) RefreshRouteTTL(ctx context.Context, routeKey, podID string, ttl time.Duration) (bool, error) {
-	script := `
-        if redis.call("sismember", KEYS[1], ARGV[1]) == 1 then
-            return redis.call("expire", KEYS[1], ARGV[2])
-        else
-            return 0
-        end
-    `
-	ttlSeconds := int64(ttl.Seconds())
-	result, err := a.redisClient.Eval(ctx, script, []string{routeKey}, podID, ttlSeconds).Int64()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		a.logger.Error(ctx, "Redis EVAL (RefreshRouteTTL script) failed", "key", routeKey, "podID", podID, "error", err.Error())
-		return false, fmt.Errorf("redis EVAL for RefreshRouteTTL on key '%s' failed: %w", routeKey, err)
-	}
-	refreshed := result == 1
-	a.logger.Debug(ctx, "Redis RefreshRouteTTL result", "key", routeKey, "podID", podID, "ttl_seconds", ttlSeconds, "refreshed_by_script", refreshed, "script_result_val", result)
-	return refreshed, nil
-}
-func (a *RouteRegistryAdapter) RecordActivity(ctx context.Context, routeKey string, activityTTL time.Duration) error {
-	activityKey := routeKey + ":last_active"
-	now := time.Now().Unix()
-	err := a.redisClient.Set(ctx, activityKey, now, activityTTL).Err()
-	if err != nil {
-		a.logger.Error(ctx, "Redis SET failed for RecordActivity on route key", "key", activityKey, "error", err.Error())
-		return fmt.Errorf("redis SET for key '%s' in RecordActivity (route) failed: %w", activityKey, err)
-	}
-	a.logger.Debug(ctx, "Redis SET successful for RecordActivity on route key", "key", activityKey, "timestamp", now, "ttl", activityTTL)
-	return nil
-}
-```
-
-## File: internal/adapters/redis/session_lock_manager.go
-```go
-package redis
-import (
-	"context"
-	"errors"
-	"fmt"
-	"time"
-	"github.com/redis/go-redis/v9"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type SessionLockManagerAdapter struct {
-	redisClient *redis.Client
-	logger      domain.Logger
-}
-func NewSessionLockManagerAdapter(redisClient *redis.Client, logger domain.Logger) *SessionLockManagerAdapter {
-	if redisClient == nil {
-		logger.Error(context.Background(), "Redis client is nil in NewSessionLockManagerAdapter", "error", "nil_redis_client")
-	}
-	return &SessionLockManagerAdapter{
-		redisClient: redisClient,
-		logger:      logger,
-	}
-}
-func (a *SessionLockManagerAdapter) AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
-	acquired, err := a.redisClient.SetNX(ctx, key, value, ttl).Result()
-	if err != nil {
-		a.logger.Error(ctx, "Redis SETNX failed", "key", key, "error", err.Error())
-		return false, fmt.Errorf("redis SETNX for key '%s' failed: %w", key, err)
-	}
-	a.logger.Info(ctx, "Redis SETNX result", "key", key, "value", value, "ttl", ttl, "acquired", acquired)
-	return acquired, nil
-}
-func (a *SessionLockManagerAdapter) ReleaseLock(ctx context.Context, key string, value string) (bool, error) {
-	script := `
-		if redis.call("get", KEYS[1]) == ARGV[1] then
-			return redis.call("del", KEYS[1])
-		else
-			return 0
-		end
-	`
-	result, err := a.redisClient.Eval(ctx, script, []string{key}, value).Int64()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		a.logger.Error(ctx, "Redis EVAL (ReleaseLock script) failed", "key", key, "value", value, "error", err.Error())
-		return false, fmt.Errorf("redis EVAL for ReleaseLock on key '%s' failed: %w", key, err)
-	}
-	released := result == 1
-	a.logger.Info(ctx, "Redis ReleaseLock result", "key", key, "value", value, "released_by_script", released, "script_result_val", result)
-	return released, nil
-}
-func (a *SessionLockManagerAdapter) RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
-	script := `
-		if redis.call("get", KEYS[1]) == ARGV[1] then
-			return redis.call("expire", KEYS[1], ARGV[2])
-		else
-			return 0
-		end
-	`
-	ttlSeconds := int64(ttl.Seconds())
-	result, err := a.redisClient.Eval(ctx, script, []string{key}, value, ttlSeconds).Int64()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		a.logger.Error(ctx, "Redis EVAL (RefreshLock script) failed", "key", key, "value", value, "error", err.Error())
-		return false, fmt.Errorf("redis EVAL for RefreshLock on key '%s' failed: %w", key, err)
-	}
-	refreshed := result == 1
-	a.logger.Info(ctx, "Redis RefreshLock result", "key", key, "value", value, "ttl_seconds", ttlSeconds, "refreshed_by_script", refreshed, "script_result_val", result)
-	return refreshed, nil
-}
-func (a *SessionLockManagerAdapter) ForceAcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
-	_, err := a.redisClient.Set(ctx, key, value, ttl).Result()
-	if err != nil {
-		a.logger.Error(ctx, "Redis SET failed for ForceAcquireLock", "key", key, "error", err.Error())
-		return false, fmt.Errorf("redis SET for key '%s' in ForceAcquireLock failed: %w", key, err)
-	}
-	a.logger.Info(ctx, "Redis SET successful for ForceAcquireLock", "key", key, "value", value, "ttl", ttl)
-	return true, nil
-}
-func (a *SessionLockManagerAdapter) RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error {
-	activityKey := key + ":last_active"
-	now := time.Now().Unix()
-	err := a.redisClient.Set(ctx, activityKey, now, activityTTL).Err()
-	if err != nil {
-		a.logger.Error(ctx, "Redis SET failed for RecordActivity", "key", activityKey, "error", err.Error())
-		return fmt.Errorf("redis SET for key '%s' in RecordActivity failed: %w", activityKey, err)
-	}
-	a.logger.Debug(ctx, "Redis SET successful for RecordActivity", "key", activityKey, "timestamp", now, "ttl", activityTTL)
-	return nil
-}
-```
-
 ## File: internal/adapters/redis/token_cache_adapter.go
 ```go
 package redis
@@ -660,121 +435,6 @@ func (a *TokenCacheAdapter) Set(ctx context.Context, key string, value *domain.A
 }
 ```
 
-## File: internal/application/grpc_handler.go
-```go
-package application
-import (
-	"context"
-	"fmt"
-	"strings"
-	"time"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	"google.golang.org/grpc/metadata"
-)
-type GRPCMessageHandler struct {
-	pb.UnimplementedMessageForwardingServiceServer
-	logger         domain.Logger
-	connManager    *ConnectionManager
-	configProvider config.Provider
-}
-func NewGRPCMessageHandler(logger domain.Logger, connManager *ConnectionManager, configProvider config.Provider) *GRPCMessageHandler {
-	return &GRPCMessageHandler{
-		logger:         logger,
-		connManager:    connManager,
-		configProvider: configProvider,
-	}
-}
-func (h *GRPCMessageHandler) PushEvent(ctx context.Context, req *pb.PushEventRequest) (*pb.PushEventResponse, error) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	logCtx := ctx
-	if ok {
-		if reqIDValues := md.Get(string(contextkeys.RequestIDKey)); len(reqIDValues) > 0 {
-			logCtx = context.WithValue(ctx, contextkeys.RequestIDKey, reqIDValues[0])
-			h.logger.Debug(logCtx, "Extracted request_id from gRPC metadata", "request_id", reqIDValues[0])
-		} else {
-			h.logger.Debug(logCtx, "No request_id found in gRPC metadata")
-		}
-	} else {
-		h.logger.Debug(logCtx, "No gRPC metadata found in incoming context")
-	}
-	metrics.IncrementGrpcMessagesReceived(req.SourcePodId)
-	h.logger.Info(logCtx, "gRPC PushEvent received",
-		"target_company_id", req.TargetCompanyId,
-		"target_agent_id", req.TargetAgentId,
-		"target_chat_id", req.TargetChatId,
-		"source_event_id", req.Payload.EventId,
-	)
-	if req.Payload == nil {
-		h.logger.Warn(logCtx, "gRPC PushEvent received nil payload")
-		return &pb.PushEventResponse{Success: false, Message: "Nil payload received"}, fmt.Errorf("nil payload")
-	}
-	sessionKeyPrefix := fmt.Sprintf("session:%s:%s:", req.TargetCompanyId, req.TargetAgentId)
-	var targetConn domain.ManagedConnection
-	found := false
-	h.connManager.activeConnections.Range(func(key, value interface{}) bool {
-		sKey, okKey := key.(string)
-		conn, okConn := value.(domain.ManagedConnection)
-		if !okKey || !okConn {
-			return true
-		}
-		if strings.HasPrefix(sKey, sessionKeyPrefix) {
-			if conn.GetCurrentChatID() == req.TargetChatId {
-				targetConn = conn
-				found = true
-				return false
-			}
-		}
-		return true
-	})
-	if !found || targetConn == nil {
-		h.logger.Warn(logCtx, "gRPC PushEvent: No active local WebSocket connection found for target chat_id on this pod",
-			"target_company_id", req.TargetCompanyId, "target_agent_id", req.TargetAgentId, "target_chat_id", req.TargetChatId)
-		return &pb.PushEventResponse{Success: false, Message: "No active local connection for chat_id"}, nil
-	}
-	var mapData map[string]interface{}
-	if req.Payload.Data != nil {
-		mapData = req.Payload.Data.AsMap()
-	}
-	domainPayload := domain.EnrichedEventPayload{
-		EventID:   req.Payload.EventId,
-		EventType: req.Payload.EventType,
-		Timestamp: req.Payload.Timestamp.AsTime(),
-		Source:    req.Payload.Source,
-		Data:      mapData,
-	}
-	wsMessage := domain.NewEventMessage(domainPayload)
-	if err := targetConn.WriteJSON(wsMessage); err != nil {
-		h.logger.Error(targetConn.Context(), "gRPC PushEvent: Failed to write message to local WebSocket connection",
-			"target_company_id", req.TargetCompanyId, "target_agent_id", req.TargetAgentId, "target_chat_id", req.TargetChatId,
-			"error", err.Error(),
-		)
-		return &pb.PushEventResponse{Success: false, Message: "Failed to write to local WebSocket"}, nil
-	}
-	if h.connManager != nil && h.connManager.RouteRegistrar() != nil && h.configProvider != nil {
-		messageRouteKey := rediskeys.RouteKeyMessages(req.TargetCompanyId, req.TargetAgentId, req.TargetChatId)
-		adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
-		activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
-		if activityTTL <= 0 {
-			activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
-		}
-		if errAct := h.connManager.RouteRegistrar().RecordActivity(targetConn.Context(), messageRouteKey, activityTTL); errAct != nil {
-			h.logger.Error(targetConn.Context(), "gRPC PushEvent: Failed to record message route activity after local delivery", "messageRouteKey", messageRouteKey, "error", errAct)
-		} else {
-			h.logger.Debug(targetConn.Context(), "gRPC PushEvent: Recorded message route activity after local delivery", "messageRouteKey", messageRouteKey, "activityTTL", activityTTL.String())
-		}
-	}
-	h.logger.Info(targetConn.Context(), "gRPC PushEvent: Successfully delivered message to local WebSocket connection",
-		"target_company_id", req.TargetCompanyId, "target_agent_id", req.TargetAgentId, "target_chat_id", req.TargetChatId,
-	)
-	return &pb.PushEventResponse{Success: true, Message: "Event delivered to local WebSocket"}, nil
-}
-```
-
 ## File: internal/domain/forwarder.go
 ```go
 package domain
@@ -834,52 +494,6 @@ type NatsConsumer interface {
 	SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler NatsMessageHandler) (NatsMessageSubscription, error)
 	NatsConn() *nats.Conn
 	Close()
-}
-```
-
-## File: internal/domain/route_registry.go
-```go
-package domain
-import (
-	"context"
-	"time"
-)
-type RouteRegistry interface {
-	RegisterChatRoute(ctx context.Context, companyID, agentID, podID string, ttl time.Duration) error
-	UnregisterChatRoute(ctx context.Context, companyID, agentID, podID string) error
-	RegisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string, ttl time.Duration) error
-	UnregisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string) error
-	GetOwningPodForMessageRoute(ctx context.Context, companyID, agentID, chatID string) (string, error)
-	GetOwningPodsForChatRoute(ctx context.Context, companyID, agentID string) ([]string, error)
-	RefreshRouteTTL(ctx context.Context, routeKey, podID string, ttl time.Duration) (bool, error)
-	RecordActivity(ctx context.Context, routeKey string, activityTTL time.Duration) error
-}
-```
-
-## File: internal/domain/session.go
-```go
-package domain
-import (
-	"context"
-	"time"
-)
-type SessionLockManager interface {
-	AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
-	ReleaseLock(ctx context.Context, key string, value string) (bool, error)
-	RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
-	ForceAcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
-	RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error
-}
-type KillSwitchMessage struct {
-	NewPodID string `json:"new_pod_id"`
-}
-type KillSwitchPublisher interface {
-	PublishSessionKill(ctx context.Context, channel string, message KillSwitchMessage) error
-}
-type KillSwitchMessageHandler func(channel string, message KillSwitchMessage) error
-type KillSwitchSubscriber interface {
-	SubscribeToSessionKillPattern(ctx context.Context, pattern string, handler KillSwitchMessageHandler) error
-	Close() error
 }
 ```
 
@@ -995,64 +609,6 @@ node_modules/
 # Task files
 tasks.json
 tasks/
-```
-
-## File: Dockerfile
-```dockerfile
-# Builder Stage
-ARG GO_VERSION=1.23
-FROM golang:${GO_VERSION}-bookworm AS builder
-
-WORKDIR /app
-
-# Set CGO_ENABLED=0 for static builds
-ENV CGO_ENABLED=0
-ENV GOOS=linux
-ENV GOARCH=amd64
-
-# Copy go.mod and go.sum first to leverage Docker cache
-COPY go.mod go.sum ./
-RUN go mod download && go mod verify
-
-# Copy the rest of the application source code
-COPY . .
-
-# Build the application
-# Output binary to /app/daisi-ws-service
-RUN go build -v -o /app/daisi-ws-service ./cmd/daisi-ws-service
-
-# ---
-
-# Final Stage
-FROM debian:bookworm-slim
-
-WORKDIR /app
-
-# Create a non-root user and group
-RUN groupadd --system appuser && useradd --system --gid appuser appuser
-
-# Copy the compiled binary from the builder stage
-COPY --from=builder /app/daisi-ws-service /app/daisi-ws-service
-
-# Copy configuration (assuming it will be in /app/config)
-# We might need to adjust this later if config path changes or is mounted differently
-COPY config /app/config 
-# Ensure the config directory and file have correct permissions if they exist
-# RUN if [ -d /app/config ]; then chown -R appuser:appuser /app/config && chmod -R u+rX,g+rX /app/config; fi
-
-# Set permissions for the binary
-RUN chown appuser:appuser /app/daisi-ws-service && chmod u+x /app/daisi-ws-service
-
-# Switch to the non-root user
-USER appuser
-
-# Expose the default port the application will listen on (adjust if necessary)
-# Placeholder, will be defined by HTTP/gRPC server implementation later
-# EXPOSE 8080 
-# EXPOSE 50051
-
-# Set the entrypoint
-ENTRYPOINT ["/app/daisi-ws-service"]
 ```
 
 ## File: cmd/daisi-ws-service/main.go
@@ -1711,6 +1267,345 @@ func (a *KillSwitchPubSubAdapter) Close() error {
 }
 ```
 
+## File: internal/adapters/redis/route_registry.go
+```go
+package redis
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+)
+var ErrNoOwningPod = errors.New("no owning pod found for the route")
+type RouteRegistryAdapter struct {
+	redisClient *redis.Client
+	logger      domain.Logger
+}
+func NewRouteRegistryAdapter(redisClient *redis.Client, logger domain.Logger) *RouteRegistryAdapter {
+	if redisClient == nil {
+		panic("redisClient cannot be nil in NewRouteRegistryAdapter")
+	}
+	if logger == nil {
+		panic("logger cannot be nil in NewRouteRegistryAdapter")
+	}
+	return &RouteRegistryAdapter{
+		redisClient: redisClient,
+		logger:      logger,
+	}
+}
+func (a *RouteRegistryAdapter) RegisterChatRoute(ctx context.Context, companyID, agentID, podID string, ttl time.Duration) error {
+	key := rediskeys.RouteKeyChats(companyID, agentID)
+	a.logger.Debug(ctx, "Registering chat route", "key", key, "podID", podID, "ttl", ttl.String())
+	pipe := a.redisClient.Pipeline()
+	pipe.SAdd(ctx, key, podID)
+	pipe.Expire(ctx, key, ttl)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to register chat route", "key", key, "podID", podID, "error", err.Error())
+		return fmt.Errorf("redis SADD/EXPIRE for chat route key '%s' failed: %w", key, err)
+	}
+	return nil
+}
+func (a *RouteRegistryAdapter) UnregisterChatRoute(ctx context.Context, companyID, agentID, podID string) error {
+	key := rediskeys.RouteKeyChats(companyID, agentID)
+	a.logger.Debug(ctx, "Unregistering chat route", "key", key, "podID", podID)
+	err := a.redisClient.SRem(ctx, key, podID).Err()
+	if err != nil {
+		a.logger.Error(ctx, "Failed to unregister chat route", "key", key, "podID", podID, "error", err.Error())
+		return fmt.Errorf("redis SREM for chat route key '%s' failed: %w", key, err)
+	}
+	return nil
+}
+func (a *RouteRegistryAdapter) RegisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string, ttl time.Duration) error {
+	key := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
+	a.logger.Debug(ctx, "Registering message route", "key", key, "podID", podID, "ttl", ttl.String())
+	pipe := a.redisClient.Pipeline()
+	pipe.SAdd(ctx, key, podID)
+	pipe.Expire(ctx, key, ttl)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to register message route", "key", key, "podID", podID, "error", err.Error())
+		return fmt.Errorf("redis SADD/EXPIRE for message route key '%s' failed: %w", key, err)
+	}
+	return nil
+}
+func (a *RouteRegistryAdapter) UnregisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string) error {
+	key := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
+	a.logger.Debug(ctx, "Unregistering message route", "key", key, "podID", podID)
+	err := a.redisClient.SRem(ctx, key, podID).Err()
+	if err != nil {
+		a.logger.Error(ctx, "Failed to unregister message route", "key", key, "podID", podID, "error", err.Error())
+		return fmt.Errorf("redis SREM for message route key '%s' failed: %w", key, err)
+	}
+	return nil
+}
+func (a *RouteRegistryAdapter) GetOwningPodForMessageRoute(ctx context.Context, companyID, agentID, chatID string) (string, error) {
+	key := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
+	members, err := a.redisClient.SMembers(ctx, key).Result()
+	if err != nil {
+		a.logger.Error(ctx, "Failed to get members for message route", "key", key, "error", err.Error())
+		return "", fmt.Errorf("redis SMEMBERS for message route key '%s' failed: %w", key, err)
+	}
+	if len(members) == 0 {
+		a.logger.Debug(ctx, "No owning pod found for message route", "key", key)
+		return "", ErrNoOwningPod
+	}
+	if len(members) > 1 {
+		a.logger.Warn(ctx, "Multiple owning pods found for message route, returning first", "key", key, "pods", members)
+	}
+	return members[0], nil
+}
+func (a *RouteRegistryAdapter) GetOwningPodsForChatRoute(ctx context.Context, companyID, agentID string) ([]string, error) {
+	key := rediskeys.RouteKeyChats(companyID, agentID)
+	members, err := a.redisClient.SMembers(ctx, key).Result()
+	if err != nil {
+		a.logger.Error(ctx, "Failed to get members for chat route", "key", key, "error", err.Error())
+		return nil, fmt.Errorf("redis SMEMBERS for chat route key '%s' failed: %w", key, err)
+	}
+	if len(members) == 0 {
+		a.logger.Debug(ctx, "No owning pods found for chat route", "key", key)
+	}
+	return members, nil
+}
+func (a *RouteRegistryAdapter) RefreshRouteTTL(ctx context.Context, routeKey, podID string, ttl time.Duration) (bool, error) {
+	script := `
+        if redis.call("sismember", KEYS[1], ARGV[1]) == 1 then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        else
+            return 0
+        end
+    `
+	ttlSeconds := int64(ttl.Seconds())
+	result, err := a.redisClient.Eval(ctx, script, []string{routeKey}, podID, ttlSeconds).Int64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		a.logger.Error(ctx, "Redis EVAL (RefreshRouteTTL script) failed", "key", routeKey, "podID", podID, "error", err.Error())
+		return false, fmt.Errorf("redis EVAL for RefreshRouteTTL on key '%s' failed: %w", routeKey, err)
+	}
+	refreshed := result == 1
+	a.logger.Debug(ctx, "Redis RefreshRouteTTL result", "key", routeKey, "podID", podID, "ttl_seconds", ttlSeconds, "refreshed_by_script", refreshed, "script_result_val", result)
+	return refreshed, nil
+}
+func (a *RouteRegistryAdapter) RecordActivity(ctx context.Context, routeKey string, activityTTL time.Duration) error {
+	activityKey := routeKey + ":last_active"
+	now := time.Now().Unix()
+	err := a.redisClient.Set(ctx, activityKey, now, activityTTL).Err()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SET failed for RecordActivity on route key", "key", activityKey, "error", err.Error())
+		return fmt.Errorf("redis SET for key '%s' in RecordActivity (route) failed: %w", activityKey, err)
+	}
+	a.logger.Debug(ctx, "Redis SET successful for RecordActivity on route key", "key", activityKey, "timestamp", now, "ttl", activityTTL)
+	return nil
+}
+```
+
+## File: internal/adapters/redis/session_lock_manager.go
+```go
+package redis
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type SessionLockManagerAdapter struct {
+	redisClient *redis.Client
+	logger      domain.Logger
+}
+func NewSessionLockManagerAdapter(redisClient *redis.Client, logger domain.Logger) *SessionLockManagerAdapter {
+	if redisClient == nil {
+		logger.Error(context.Background(), "Redis client is nil in NewSessionLockManagerAdapter", "error", "nil_redis_client")
+	}
+	return &SessionLockManagerAdapter{
+		redisClient: redisClient,
+		logger:      logger,
+	}
+}
+func (a *SessionLockManagerAdapter) AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	acquired, err := a.redisClient.SetNX(ctx, key, value, ttl).Result()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SETNX failed", "key", key, "error", err.Error())
+		return false, fmt.Errorf("redis SETNX for key '%s' failed: %w", key, err)
+	}
+	a.logger.Info(ctx, "Redis SETNX result", "key", key, "value", value, "ttl", ttl, "acquired", acquired)
+	return acquired, nil
+}
+func (a *SessionLockManagerAdapter) ReleaseLock(ctx context.Context, key string, value string) (bool, error) {
+	script := `
+		if redis.call("get", KEYS[1]) == ARGV[1] then
+			return redis.call("del", KEYS[1])
+		else
+			return 0
+		end
+	`
+	result, err := a.redisClient.Eval(ctx, script, []string{key}, value).Int64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		a.logger.Error(ctx, "Redis EVAL (ReleaseLock script) failed", "key", key, "value", value, "error", err.Error())
+		return false, fmt.Errorf("redis EVAL for ReleaseLock on key '%s' failed: %w", key, err)
+	}
+	released := result == 1
+	a.logger.Info(ctx, "Redis ReleaseLock result", "key", key, "value", value, "released_by_script", released, "script_result_val", result)
+	return released, nil
+}
+func (a *SessionLockManagerAdapter) RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	script := `
+		if redis.call("get", KEYS[1]) == ARGV[1] then
+			return redis.call("expire", KEYS[1], ARGV[2])
+		else
+			return 0
+		end
+	`
+	ttlSeconds := int64(ttl.Seconds())
+	result, err := a.redisClient.Eval(ctx, script, []string{key}, value, ttlSeconds).Int64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		a.logger.Error(ctx, "Redis EVAL (RefreshLock script) failed", "key", key, "value", value, "error", err.Error())
+		return false, fmt.Errorf("redis EVAL for RefreshLock on key '%s' failed: %w", key, err)
+	}
+	refreshed := result == 1
+	a.logger.Info(ctx, "Redis RefreshLock result", "key", key, "value", value, "ttl_seconds", ttlSeconds, "refreshed_by_script", refreshed, "script_result_val", result)
+	return refreshed, nil
+}
+func (a *SessionLockManagerAdapter) ForceAcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	_, err := a.redisClient.Set(ctx, key, value, ttl).Result()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SET failed for ForceAcquireLock", "key", key, "error", err.Error())
+		return false, fmt.Errorf("redis SET for key '%s' in ForceAcquireLock failed: %w", key, err)
+	}
+	a.logger.Info(ctx, "Redis SET successful for ForceAcquireLock", "key", key, "value", value, "ttl", ttl)
+	return true, nil
+}
+func (a *SessionLockManagerAdapter) RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error {
+	activityKey := key + ":last_active"
+	now := time.Now().Unix()
+	err := a.redisClient.Set(ctx, activityKey, now, activityTTL).Err()
+	if err != nil {
+		a.logger.Error(ctx, "Redis SET failed for RecordActivity", "key", activityKey, "error", err.Error())
+		return fmt.Errorf("redis SET for key '%s' in RecordActivity failed: %w", activityKey, err)
+	}
+	a.logger.Debug(ctx, "Redis SET successful for RecordActivity", "key", activityKey, "timestamp", now, "ttl", activityTTL)
+	return nil
+}
+```
+
+## File: internal/application/grpc_handler.go
+```go
+package application
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"google.golang.org/grpc/metadata"
+)
+type GRPCMessageHandler struct {
+	pb.UnimplementedMessageForwardingServiceServer
+	logger         domain.Logger
+	connManager    *ConnectionManager
+	configProvider config.Provider
+}
+func NewGRPCMessageHandler(logger domain.Logger, connManager *ConnectionManager, configProvider config.Provider) *GRPCMessageHandler {
+	return &GRPCMessageHandler{
+		logger:         logger,
+		connManager:    connManager,
+		configProvider: configProvider,
+	}
+}
+func (h *GRPCMessageHandler) PushEvent(ctx context.Context, req *pb.PushEventRequest) (*pb.PushEventResponse, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	logCtx := ctx
+	if ok {
+		if reqIDValues := md.Get(string(contextkeys.RequestIDKey)); len(reqIDValues) > 0 {
+			logCtx = context.WithValue(ctx, contextkeys.RequestIDKey, reqIDValues[0])
+			h.logger.Debug(logCtx, "Extracted request_id from gRPC metadata", "request_id", reqIDValues[0])
+		} else {
+			h.logger.Debug(logCtx, "No request_id found in gRPC metadata")
+		}
+	} else {
+		h.logger.Debug(logCtx, "No gRPC metadata found in incoming context")
+	}
+	metrics.IncrementGrpcMessagesReceived(req.SourcePodId)
+	h.logger.Info(logCtx, "gRPC PushEvent received",
+		"target_company_id", req.TargetCompanyId,
+		"target_agent_id", req.TargetAgentId,
+		"target_chat_id", req.TargetChatId,
+		"source_event_id", req.Payload.EventId,
+	)
+	if req.Payload == nil {
+		h.logger.Warn(logCtx, "gRPC PushEvent received nil payload")
+		return &pb.PushEventResponse{Success: false, Message: "Nil payload received"}, fmt.Errorf("nil payload")
+	}
+	sessionKeyPrefix := fmt.Sprintf("session:%s:%s:", req.TargetCompanyId, req.TargetAgentId)
+	var targetConn domain.ManagedConnection
+	found := false
+	h.connManager.activeConnections.Range(func(key, value interface{}) bool {
+		sKey, okKey := key.(string)
+		conn, okConn := value.(domain.ManagedConnection)
+		if !okKey || !okConn {
+			return true
+		}
+		if strings.HasPrefix(sKey, sessionKeyPrefix) {
+			if conn.GetCurrentChatID() == req.TargetChatId {
+				targetConn = conn
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	if !found || targetConn == nil {
+		h.logger.Warn(logCtx, "gRPC PushEvent: No active local WebSocket connection found for target chat_id on this pod",
+			"target_company_id", req.TargetCompanyId, "target_agent_id", req.TargetAgentId, "target_chat_id", req.TargetChatId)
+		return &pb.PushEventResponse{Success: false, Message: "No active local connection for chat_id"}, nil
+	}
+	var mapData map[string]interface{}
+	if req.Payload.Data != nil {
+		mapData = req.Payload.Data.AsMap()
+	}
+	domainPayload := domain.EnrichedEventPayload{
+		EventID:   req.Payload.EventId,
+		EventType: req.Payload.EventType,
+		Timestamp: req.Payload.Timestamp.AsTime(),
+		Source:    req.Payload.Source,
+		Data:      mapData,
+	}
+	wsMessage := domain.NewEventMessage(domainPayload)
+	if err := targetConn.WriteJSON(wsMessage); err != nil {
+		h.logger.Error(targetConn.Context(), "gRPC PushEvent: Failed to write message to local WebSocket connection",
+			"target_company_id", req.TargetCompanyId, "target_agent_id", req.TargetAgentId, "target_chat_id", req.TargetChatId,
+			"error", err.Error(),
+		)
+		return &pb.PushEventResponse{Success: false, Message: "Failed to write to local WebSocket"}, nil
+	}
+	if h.connManager != nil && h.connManager.RouteRegistrar() != nil && h.configProvider != nil {
+		messageRouteKey := rediskeys.RouteKeyMessages(req.TargetCompanyId, req.TargetAgentId, req.TargetChatId)
+		adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
+		activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
+		if activityTTL <= 0 {
+			activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
+		}
+		if errAct := h.connManager.RouteRegistrar().RecordActivity(targetConn.Context(), messageRouteKey, activityTTL); errAct != nil {
+			h.logger.Error(targetConn.Context(), "gRPC PushEvent: Failed to record message route activity after local delivery", "messageRouteKey", messageRouteKey, "error", errAct)
+		} else {
+			h.logger.Debug(targetConn.Context(), "gRPC PushEvent: Recorded message route activity after local delivery", "messageRouteKey", messageRouteKey, "activityTTL", activityTTL.String())
+		}
+	}
+	h.logger.Info(targetConn.Context(), "gRPC PushEvent: Successfully delivered message to local WebSocket connection",
+		"target_company_id", req.TargetCompanyId, "target_agent_id", req.TargetAgentId, "target_chat_id", req.TargetChatId,
+	)
+	return &pb.PushEventResponse{Success: true, Message: "Event delivered to local WebSocket"}, nil
+}
+```
+
 ## File: internal/bootstrap/wire.go
 ```go
 package bootstrap
@@ -1738,6 +1633,52 @@ type TokenCacheStore interface {
 type AdminTokenCacheStore interface {
 	Get(ctx context.Context, key string) (*AdminUserContext, error)
 	Set(ctx context.Context, key string, value *AdminUserContext, ttl time.Duration) error
+}
+```
+
+## File: internal/domain/route_registry.go
+```go
+package domain
+import (
+	"context"
+	"time"
+)
+type RouteRegistry interface {
+	RegisterChatRoute(ctx context.Context, companyID, agentID, podID string, ttl time.Duration) error
+	UnregisterChatRoute(ctx context.Context, companyID, agentID, podID string) error
+	RegisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string, ttl time.Duration) error
+	UnregisterMessageRoute(ctx context.Context, companyID, agentID, chatID, podID string) error
+	GetOwningPodForMessageRoute(ctx context.Context, companyID, agentID, chatID string) (string, error)
+	GetOwningPodsForChatRoute(ctx context.Context, companyID, agentID string) ([]string, error)
+	RefreshRouteTTL(ctx context.Context, routeKey, podID string, ttl time.Duration) (bool, error)
+	RecordActivity(ctx context.Context, routeKey string, activityTTL time.Duration) error
+}
+```
+
+## File: internal/domain/session.go
+```go
+package domain
+import (
+	"context"
+	"time"
+)
+type SessionLockManager interface {
+	AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+	ReleaseLock(ctx context.Context, key string, value string) (bool, error)
+	RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+	ForceAcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+	RecordActivity(ctx context.Context, key string, activityTTL time.Duration) error
+}
+type KillSwitchMessage struct {
+	NewPodID string `json:"new_pod_id"`
+}
+type KillSwitchPublisher interface {
+	PublishSessionKill(ctx context.Context, channel string, message KillSwitchMessage) error
+}
+type KillSwitchMessageHandler func(channel string, message KillSwitchMessage) error
+type KillSwitchSubscriber interface {
+	SubscribeToSessionKillPattern(ctx context.Context, pattern string, handler KillSwitchMessageHandler) error
+	Close() error
 }
 ```
 
@@ -2405,307 +2346,6 @@ require (
 )
 ```
 
-## File: internal/adapters/metrics/prometheus_adapter.go
-```go
-package metrics
-import (
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-)
-var (
-	ActiveConnectionsGauge = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "dws_active_connections",
-			Help: "Number of active WebSocket connections.",
-		},
-	)
-	ConnectionsTotalCounter = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "dws_connections_total",
-			Help: "Total WebSocket connections initiated (successful handshakes).",
-		},
-	)
-	ConnectionDurationHistogram = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "dws_connection_duration_seconds",
-			Help:    "Duration of WebSocket connections.",
-			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15),
-		},
-	)
-	MessagesReceivedCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_messages_received_total",
-			Help: "Total messages received from clients, partitioned by message type.",
-		},
-		[]string{"message_type"},
-	)
-	MessagesSentCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_messages_sent_total",
-			Help: "Total messages sent to clients, partitioned by message type.",
-		},
-		[]string{"message_type"},
-	)
-	AuthSuccessTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_auth_success_total",
-			Help: "Successful token validations.",
-		},
-		[]string{"token_type"},
-	)
-	AuthFailureTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_auth_failure_total",
-			Help: "Failed token validations.",
-		},
-		[]string{"token_type", "reason"},
-	)
-	SessionConflictsTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_session_conflicts_total",
-			Help: "Number of session conflicts detected.",
-		},
-		[]string{"user_type"},
-	)
-	NatsMessagesReceivedCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_nats_messages_received_total",
-			Help: "Messages received from NATS, partitioned by NATS subject.",
-		},
-		[]string{"nats_subject"},
-	)
-	GrpcMessagesSentCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_messages_sent_total",
-			Help: "Messages forwarded via gRPC, partitioned by target pod ID.",
-		},
-		[]string{"target_pod_id"},
-	)
-	GrpcMessagesReceivedCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_messages_received_total",
-			Help: "Messages received via gRPC, partitioned by source pod ID.",
-		},
-		[]string{"source_pod_id"},
-	)
-	GrpcForwardRetryAttemptsCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_forward_retry_attempts_total",
-			Help: "Total gRPC message forwarding retry attempts.",
-		},
-		[]string{"target_pod_id"},
-	)
-	GrpcForwardRetrySuccessCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_forward_retry_success_total",
-			Help: "Total successful gRPC message forwarding retries.",
-		},
-		[]string{"target_pod_id"},
-	)
-	GrpcForwardRetryFailureCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_forward_retry_failure_total",
-			Help: "Total failed gRPC message forwarding retries.",
-		},
-		[]string{"target_pod_id"},
-	)
-	SessionLockAttemptsCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_session_lock_attempts_total",
-			Help: "Total session lock acquisition attempts.",
-		},
-		[]string{"user_type", "lock_type"},
-	)
-	SessionLockSuccessCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_session_lock_success_total",
-			Help: "Total successful session lock acquisitions.",
-		},
-		[]string{"user_type", "lock_type"},
-	)
-	SessionLockFailureCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_session_lock_failure_total",
-			Help: "Total failed session lock acquisitions.",
-		},
-		[]string{"user_type", "reason"},
-	)
-	GrpcPoolSizeGauge = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "dws_grpc_pool_size",
-			Help: "Total number of connections in the gRPC client pool.",
-		},
-	)
-	GrpcPoolConnectionsCreatedTotalCounter = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_pool_connections_created_total",
-			Help: "Total new gRPC client connections established by the pool.",
-		},
-	)
-	GrpcPoolConnectionsClosedTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_pool_connections_closed_total",
-			Help: "Total gRPC client connections closed by the pool, partitioned by reason.",
-		},
-		[]string{"reason"},
-	)
-	GrpcPoolConnectionErrorsTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_pool_connection_errors_total",
-			Help: "Total errors encountered with pooled gRPC client connections, partitioned by target pod.",
-		},
-		[]string{"target_pod_id"},
-	)
-	GrpcCircuitBreakerTrippedTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_circuitbreaker_tripped_total",
-			Help: "Total times the circuit breaker has tripped for a target pod.",
-		},
-		[]string{"target_pod_id"},
-	)
-	WebsocketBufferUsedGauge = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "dws_websocket_buffer_used_count",
-			Help: "Current number of messages in the WebSocket send buffer.",
-		},
-		[]string{"session_key"},
-	)
-	WebsocketBufferCapacityGauge = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "dws_websocket_buffer_capacity_count",
-			Help: "Capacity of the WebSocket send buffer.",
-		},
-		[]string{"session_key"},
-	)
-	WebsocketMessagesDroppedTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_websocket_messages_dropped_total",
-			Help: "Total messages dropped due to WebSocket backpressure.",
-		},
-		[]string{"session_key", "reason"},
-	)
-	WebsocketSlowClientsDisconnectedTotalCounter = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "dws_websocket_slow_clients_disconnected_total",
-			Help: "Total slow WebSocket clients disconnected.",
-		},
-	)
-	RedisTTLCalculatedSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "dws_redis_ttl_calculated_seconds",
-			Help:    "Distribution of calculated TTL values for Redis keys, partitioned by key type.",
-			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
-		},
-		[]string{"key_type"},
-	)
-	RedisTTLDecisionTotal = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_redis_ttl_decision_total",
-			Help: "Total adaptive TTL decisions made, partitioned by key type and decision outcome.",
-		},
-		[]string{"key_type", "decision"},
-	)
-	RedisActivityAgeSeconds = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "dws_redis_activity_age_seconds",
-			Help:    "Distribution of the age of the last activity timestamp when making TTL decisions.",
-			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
-		},
-		[]string{"key_type"},
-	)
-)
-func IncrementActiveConnections() {
-	ActiveConnectionsGauge.Inc()
-}
-func DecrementActiveConnections() {
-	ActiveConnectionsGauge.Dec()
-}
-func IncrementConnectionsTotal() {
-	ConnectionsTotalCounter.Inc()
-}
-func ObserveConnectionDuration(durationSeconds float64) {
-	ConnectionDurationHistogram.Observe(durationSeconds)
-}
-func IncrementMessagesReceived(messageType string) {
-	MessagesReceivedCounter.WithLabelValues(messageType).Inc()
-}
-func IncrementMessagesSent(messageType string) {
-	MessagesSentCounter.WithLabelValues(messageType).Inc()
-}
-func IncrementAuthSuccess(tokenType string) {
-	AuthSuccessTotalCounter.WithLabelValues(tokenType).Inc()
-}
-func IncrementAuthFailure(tokenType string, reason string) {
-	AuthFailureTotalCounter.WithLabelValues(tokenType, reason).Inc()
-}
-func IncrementSessionConflicts(userType string) {
-	SessionConflictsTotalCounter.WithLabelValues(userType).Inc()
-}
-func IncrementNatsMessagesReceived(natsSubject string) {
-	NatsMessagesReceivedCounter.WithLabelValues(natsSubject).Inc()
-}
-func IncrementGrpcMessagesSent(targetPodID string) {
-	GrpcMessagesSentCounter.WithLabelValues(targetPodID).Inc()
-}
-func IncrementGrpcMessagesReceived(sourcePodID string) {
-	GrpcMessagesReceivedCounter.WithLabelValues(sourcePodID).Inc()
-}
-func IncrementGrpcForwardRetryAttempts(targetPodID string) {
-	GrpcForwardRetryAttemptsCounter.WithLabelValues(targetPodID).Inc()
-}
-func IncrementGrpcForwardRetrySuccess(targetPodID string) {
-	GrpcForwardRetrySuccessCounter.WithLabelValues(targetPodID).Inc()
-}
-func IncrementGrpcForwardRetryFailure(targetPodID string) {
-	GrpcForwardRetryFailureCounter.WithLabelValues(targetPodID).Inc()
-}
-func IncrementSessionLockAttempts(userType, lockType string) {
-	SessionLockAttemptsCounter.WithLabelValues(userType, lockType).Inc()
-}
-func IncrementSessionLockSuccess(userType, lockType string) {
-	SessionLockSuccessCounter.WithLabelValues(userType, lockType).Inc()
-}
-func IncrementSessionLockFailure(userType, reason string) {
-	SessionLockFailureCounter.WithLabelValues(userType, reason).Inc()
-}
-func SetGrpcPoolSize(size float64) {
-	GrpcPoolSizeGauge.Set(size)
-}
-func IncrementGrpcPoolConnectionsCreated() {
-	GrpcPoolConnectionsCreatedTotalCounter.Inc()
-}
-func IncrementGrpcPoolConnectionsClosed(reason string) {
-	GrpcPoolConnectionsClosedTotalCounter.WithLabelValues(reason).Inc()
-}
-func IncrementGrpcPoolConnectionErrors(targetPodID string) {
-	GrpcPoolConnectionErrorsTotalCounter.WithLabelValues(targetPodID).Inc()
-}
-func IncrementGrpcCircuitBreakerTripped(targetPodID string) {
-	GrpcCircuitBreakerTrippedTotalCounter.WithLabelValues(targetPodID).Inc()
-}
-func SetWebsocketBufferUsed(sessionKey string, count float64) {
-	WebsocketBufferUsedGauge.WithLabelValues(sessionKey).Set(count)
-}
-func SetWebsocketBufferCapacity(sessionKey string, capacity float64) {
-	WebsocketBufferCapacityGauge.WithLabelValues(sessionKey).Set(capacity)
-}
-func IncrementWebsocketMessagesDropped(sessionKey, reason string) {
-	WebsocketMessagesDroppedTotalCounter.WithLabelValues(sessionKey, reason).Inc()
-}
-func IncrementWebsocketSlowClientsDisconnected() {
-	WebsocketSlowClientsDisconnectedTotalCounter.Inc()
-}
-func ObserveRedisTTLCalculated(keyType string, ttlSeconds float64) {
-	RedisTTLCalculatedSeconds.WithLabelValues(keyType).Observe(ttlSeconds)
-}
-func IncrementRedisTTLDecision(keyType string, decision string) {
-	RedisTTLDecisionTotal.WithLabelValues(keyType, decision).Inc()
-}
-func ObserveRedisActivityAge(keyType string, ageSeconds float64) {
-	RedisActivityAgeSeconds.WithLabelValues(keyType).Observe(ageSeconds)
-}
-```
-
 ## File: internal/adapters/websocket/conn.go
 ```go
 package websocket
@@ -3271,6 +2911,513 @@ func (cm *ConnectionManager) AcquireAdminSessionLockOrNotify(ctx context.Context
 }
 ```
 
+## File: internal/domain/auth.go
+```go
+package domain
+import (
+	"fmt"
+	"time"
+)
+type AuthenticatedUserContext struct {
+	CompanyID string    `json:"company_id"`
+	AgentID   string    `json:"agent_id"`
+	UserID    string    `json:"user_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Token     string    `json:"-"`
+}
+func (auc *AuthenticatedUserContext) Validate() error {
+	if auc.CompanyID == "" || auc.AgentID == "" || auc.UserID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (company_id, agent_id, user_id, expires_at)")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("token expired at %v", auc.ExpiresAt)
+	}
+	return nil
+}
+type AdminUserContext struct {
+	AdminID              string `json:"admin_id"`
+	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
+	SubscribedCompanyID string    `json:"subscribed_company_id,omitempty"`
+	SubscribedAgentID   string    `json:"subscribed_agent_id,omitempty"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	Token               string    `json:"-"`
+}
+func (auc *AdminUserContext) Validate() error {
+	if auc.AdminID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (admin_id, expires_at) in admin token")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("admin token expired at %v", auc.ExpiresAt)
+	}
+	return nil
+}
+```
+
+## File: internal/adapters/metrics/prometheus_adapter.go
+```go
+package metrics
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+var (
+	ActiveConnectionsGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dws_active_connections",
+			Help: "Number of active WebSocket connections.",
+		},
+	)
+	ConnectionsTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_connections_total",
+			Help: "Total WebSocket connections initiated (successful handshakes).",
+		},
+	)
+	ConnectionDurationHistogram = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "dws_connection_duration_seconds",
+			Help:    "Duration of WebSocket connections.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15),
+		},
+	)
+	MessagesReceivedCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_messages_received_total",
+			Help: "Total messages received from clients, partitioned by message type.",
+		},
+		[]string{"message_type"},
+	)
+	MessagesSentCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_messages_sent_total",
+			Help: "Total messages sent to clients, partitioned by message type.",
+		},
+		[]string{"message_type"},
+	)
+	AuthSuccessTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_auth_success_total",
+			Help: "Successful token validations.",
+		},
+		[]string{"token_type"},
+	)
+	AuthFailureTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_auth_failure_total",
+			Help: "Failed token validations.",
+		},
+		[]string{"token_type", "reason"},
+	)
+	SessionConflictsTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_conflicts_total",
+			Help: "Number of session conflicts detected.",
+		},
+		[]string{"user_type"},
+	)
+	NatsMessagesReceivedCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_nats_messages_received_total",
+			Help: "Messages received from NATS, partitioned by NATS subject.",
+		},
+		[]string{"nats_subject"},
+	)
+	GrpcMessagesSentCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_messages_sent_total",
+			Help: "Messages forwarded via gRPC, partitioned by target pod ID.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcMessagesReceivedCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_messages_received_total",
+			Help: "Messages received via gRPC, partitioned by source pod ID.",
+		},
+		[]string{"source_pod_id"},
+	)
+	GrpcForwardRetryAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_attempts_total",
+			Help: "Total gRPC message forwarding retry attempts.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcForwardRetrySuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_success_total",
+			Help: "Total successful gRPC message forwarding retries.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcForwardRetryFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_failure_total",
+			Help: "Total failed gRPC message forwarding retries.",
+		},
+		[]string{"target_pod_id"},
+	)
+	SessionLockAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_attempts_total",
+			Help: "Total session lock acquisition attempts.",
+		},
+		[]string{"user_type", "lock_type"},
+	)
+	SessionLockSuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_success_total",
+			Help: "Total successful session lock acquisitions.",
+		},
+		[]string{"user_type", "lock_type"},
+	)
+	SessionLockFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_failure_total",
+			Help: "Total failed session lock acquisitions.",
+		},
+		[]string{"user_type", "reason"},
+	)
+	GrpcPoolSizeGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dws_grpc_pool_size",
+			Help: "Total number of connections in the gRPC client pool.",
+		},
+	)
+	GrpcPoolConnectionsCreatedTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connections_created_total",
+			Help: "Total new gRPC client connections established by the pool.",
+		},
+	)
+	GrpcPoolConnectionsClosedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connections_closed_total",
+			Help: "Total gRPC client connections closed by the pool, partitioned by reason.",
+		},
+		[]string{"reason"},
+	)
+	GrpcPoolConnectionErrorsTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connection_errors_total",
+			Help: "Total errors encountered with pooled gRPC client connections, partitioned by target pod.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcCircuitBreakerTrippedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_circuitbreaker_tripped_total",
+			Help: "Total times the circuit breaker has tripped for a target pod.",
+		},
+		[]string{"target_pod_id"},
+	)
+	WebsocketBufferUsedGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dws_websocket_buffer_used_count",
+			Help: "Current number of messages in the WebSocket send buffer.",
+		},
+		[]string{"session_key"},
+	)
+	WebsocketBufferCapacityGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dws_websocket_buffer_capacity_count",
+			Help: "Capacity of the WebSocket send buffer.",
+		},
+		[]string{"session_key"},
+	)
+	WebsocketMessagesDroppedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_websocket_messages_dropped_total",
+			Help: "Total messages dropped due to WebSocket backpressure.",
+		},
+		[]string{"session_key", "reason"},
+	)
+	WebsocketSlowClientsDisconnectedTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_websocket_slow_clients_disconnected_total",
+			Help: "Total slow WebSocket clients disconnected.",
+		},
+	)
+	RedisTTLCalculatedSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "dws_redis_ttl_calculated_seconds",
+			Help:    "Distribution of calculated TTL values for Redis keys, partitioned by key type.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
+		},
+		[]string{"key_type"},
+	)
+	RedisTTLDecisionTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_redis_ttl_decision_total",
+			Help: "Total adaptive TTL decisions made, partitioned by key type and decision outcome.",
+		},
+		[]string{"key_type", "decision"},
+	)
+	RedisActivityAgeSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "dws_redis_activity_age_seconds",
+			Help:    "Distribution of the age of the last activity timestamp when making TTL decisions.",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 16),
+		},
+		[]string{"key_type"},
+	)
+)
+func IncrementActiveConnections() {
+	ActiveConnectionsGauge.Inc()
+}
+func DecrementActiveConnections() {
+	ActiveConnectionsGauge.Dec()
+}
+func IncrementConnectionsTotal() {
+	ConnectionsTotalCounter.Inc()
+}
+func ObserveConnectionDuration(durationSeconds float64) {
+	ConnectionDurationHistogram.Observe(durationSeconds)
+}
+func IncrementMessagesReceived(messageType string) {
+	MessagesReceivedCounter.WithLabelValues(messageType).Inc()
+}
+func IncrementMessagesSent(messageType string) {
+	MessagesSentCounter.WithLabelValues(messageType).Inc()
+}
+func IncrementAuthSuccess(tokenType string) {
+	AuthSuccessTotalCounter.WithLabelValues(tokenType).Inc()
+}
+func IncrementAuthFailure(tokenType string, reason string) {
+	AuthFailureTotalCounter.WithLabelValues(tokenType, reason).Inc()
+}
+func IncrementSessionConflicts(userType string) {
+	SessionConflictsTotalCounter.WithLabelValues(userType).Inc()
+}
+func IncrementNatsMessagesReceived(natsSubject string) {
+	NatsMessagesReceivedCounter.WithLabelValues(natsSubject).Inc()
+}
+func IncrementGrpcMessagesSent(targetPodID string) {
+	GrpcMessagesSentCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcMessagesReceived(sourcePodID string) {
+	GrpcMessagesReceivedCounter.WithLabelValues(sourcePodID).Inc()
+}
+func IncrementGrpcForwardRetryAttempts(targetPodID string) {
+	GrpcForwardRetryAttemptsCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcForwardRetrySuccess(targetPodID string) {
+	GrpcForwardRetrySuccessCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcForwardRetryFailure(targetPodID string) {
+	GrpcForwardRetryFailureCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementSessionLockAttempts(userType, lockType string) {
+	SessionLockAttemptsCounter.WithLabelValues(userType, lockType).Inc()
+}
+func IncrementSessionLockSuccess(userType, lockType string) {
+	SessionLockSuccessCounter.WithLabelValues(userType, lockType).Inc()
+}
+func IncrementSessionLockFailure(userType, reason string) {
+	SessionLockFailureCounter.WithLabelValues(userType, reason).Inc()
+}
+func SetGrpcPoolSize(size float64) {
+	GrpcPoolSizeGauge.Set(size)
+}
+func IncrementGrpcPoolConnectionsCreated() {
+	GrpcPoolConnectionsCreatedTotalCounter.Inc()
+}
+func IncrementGrpcPoolConnectionsClosed(reason string) {
+	GrpcPoolConnectionsClosedTotalCounter.WithLabelValues(reason).Inc()
+}
+func IncrementGrpcPoolConnectionErrors(targetPodID string) {
+	GrpcPoolConnectionErrorsTotalCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcCircuitBreakerTripped(targetPodID string) {
+	GrpcCircuitBreakerTrippedTotalCounter.WithLabelValues(targetPodID).Inc()
+}
+func SetWebsocketBufferUsed(sessionKey string, count float64) {
+	WebsocketBufferUsedGauge.WithLabelValues(sessionKey).Set(count)
+}
+func SetWebsocketBufferCapacity(sessionKey string, capacity float64) {
+	WebsocketBufferCapacityGauge.WithLabelValues(sessionKey).Set(capacity)
+}
+func IncrementWebsocketMessagesDropped(sessionKey, reason string) {
+	WebsocketMessagesDroppedTotalCounter.WithLabelValues(sessionKey, reason).Inc()
+}
+func IncrementWebsocketSlowClientsDisconnected() {
+	WebsocketSlowClientsDisconnectedTotalCounter.Inc()
+}
+func ObserveRedisTTLCalculated(keyType string, ttlSeconds float64) {
+	RedisTTLCalculatedSeconds.WithLabelValues(keyType).Observe(ttlSeconds)
+}
+func IncrementRedisTTLDecision(keyType string, decision string) {
+	RedisTTLDecisionTotal.WithLabelValues(keyType, decision).Inc()
+}
+func ObserveRedisActivityAge(keyType string, ageSeconds float64) {
+	RedisActivityAgeSeconds.WithLabelValues(keyType).Observe(ageSeconds)
+}
+```
+
+## File: internal/application/kill_switch.go
+```go
+package application
+import (
+	"context"
+	"fmt"
+	"strings"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+const (
+	sessionKillChannelPrefix      = "session_kill:"
+	adminSessionKillChannelPrefix = "session_kill:admin:"
+)
+func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
+		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
+	}
+	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
+	parts := strings.Split(partsStr, ":")
+	if len(parts) != 3 {
+		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
+		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
+	}
+	companyID, agentID, userID := parts[0], parts[1], parts[2]
+	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
+		"sessionKey", sessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+	val, exists := cm.activeConnections.Load(sessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
+		return nil
+	}
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
+		cm.DeregisterConnection(sessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
+	}
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
+		"sessionKey", sessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "SessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
+			"sessionKey", sessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(sessionKey)
+	return nil
+}
+func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
+		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
+	}
+	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
+	adminSessionKey := rediskeys.AdminSessionKey(adminID)
+	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
+		"adminSessionKey", adminSessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+	val, exists := cm.activeConnections.Load(adminSessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
+		return nil
+	}
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
+		cm.DeregisterConnection(adminSessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
+	}
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
+		"adminSessionKey", adminSessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Admin session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "AdminSessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
+			"adminSessionKey", adminSessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(adminSessionKey)
+	return nil
+}
+func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.SessionKillChannelKey("*", "*", "*")
+		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
+	})
+}
+func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.AdminSessionKillChannelKey("*")
+		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
+	})
+}
+func (cm *ConnectionManager) StopKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
+	if cm.killSwitchSubscriber != nil {
+		return cm.killSwitchSubscriber.Close()
+	}
+	return nil
+}
+func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
+	return nil
+}
+```
+
 ## File: internal/application/session_renewal.go
 ```go
 package application
@@ -3525,262 +3672,6 @@ func (cm *ConnectionManager) StopResourceRenewalLoop() {
 	close(cm.renewalStopChan) // Signal the loop to stop
 	cm.renewalWg.Wait()       // Wait for the goroutine to finish
 	cm.logger.Info(context.Background(), "Resource renewal loop stopped.")
-}
-```
-
-## File: internal/domain/auth.go
-```go
-package domain
-import (
-	"fmt"
-	"time"
-)
-type AuthenticatedUserContext struct {
-	CompanyID string    `json:"company_id"`
-	AgentID   string    `json:"agent_id"`
-	UserID    string    `json:"user_id"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Token     string    `json:"-"`
-}
-func (auc *AuthenticatedUserContext) Validate() error {
-	if auc.CompanyID == "" || auc.AgentID == "" || auc.UserID == "" || auc.ExpiresAt.IsZero() {
-		return fmt.Errorf("missing essential fields (company_id, agent_id, user_id, expires_at)")
-	}
-	if time.Now().After(auc.ExpiresAt) {
-		return fmt.Errorf("token expired at %v", auc.ExpiresAt)
-	}
-	return nil
-}
-type AdminUserContext struct {
-	AdminID              string `json:"admin_id"`
-	CompanyIDRestriction string `json:"company_id_restriction,omitempty"`
-	SubscribedCompanyID string    `json:"subscribed_company_id,omitempty"`
-	SubscribedAgentID   string    `json:"subscribed_agent_id,omitempty"`
-	ExpiresAt           time.Time `json:"expires_at"`
-	Token               string    `json:"-"`
-}
-func (auc *AdminUserContext) Validate() error {
-	if auc.AdminID == "" || auc.ExpiresAt.IsZero() {
-		return fmt.Errorf("missing essential fields (admin_id, expires_at) in admin token")
-	}
-	if time.Now().After(auc.ExpiresAt) {
-		return fmt.Errorf("admin token expired at %v", auc.ExpiresAt)
-	}
-	return nil
-}
-```
-
-## File: internal/application/connection_manager.go
-```go
-package application
-import (
-	"sync"
-	"github.com/redis/go-redis/v9"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type ConnectionManager struct {
-	logger                 domain.Logger
-	configProvider         config.Provider
-	sessionLocker          domain.SessionLockManager
-	killSwitchPublisher    domain.KillSwitchPublisher
-	killSwitchSubscriber   domain.KillSwitchSubscriber
-	routeRegistry          domain.RouteRegistry
-	activeConnections      sync.Map
-	activeAdminConnections sync.Map
-	renewalStopChan chan struct{}
-	renewalWg       sync.WaitGroup
-	redisClient     *redis.Client
-}
-func NewConnectionManager(
-	logger domain.Logger,
-	configProvider config.Provider,
-	sessionLocker domain.SessionLockManager,
-	killSwitchPublisher domain.KillSwitchPublisher,
-	killSwitchSubscriber domain.KillSwitchSubscriber,
-	routeRegistry domain.RouteRegistry,
-	redisClient *redis.Client,
-) *ConnectionManager {
-	return &ConnectionManager{
-		logger:                 logger,
-		configProvider:         configProvider,
-		sessionLocker:          sessionLocker,
-		killSwitchPublisher:    killSwitchPublisher,
-		killSwitchSubscriber:   killSwitchSubscriber,
-		routeRegistry:          routeRegistry,
-		activeConnections:      sync.Map{},
-		activeAdminConnections: sync.Map{},
-		renewalStopChan:        make(chan struct{}),
-		renewalWg:              sync.WaitGroup{},
-		redisClient:            redisClient,
-	}
-}
-func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
-	return cm.routeRegistry
-}
-```
-
-## File: internal/application/kill_switch.go
-```go
-package application
-import (
-	"context"
-	"fmt"
-	"strings"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
-)
-const (
-	sessionKillChannelPrefix      = "session_kill:"
-	adminSessionKillChannelPrefix = "session_kill:admin:"
-)
-func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background()
-	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
-		"channel", channel,
-		"newPodIDInMessage", message.NewPodID,
-	)
-	currentPodID := cm.configProvider.Get().Server.PodID
-	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
-		return nil
-	}
-	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
-		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
-	}
-	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
-	parts := strings.Split(partsStr, ":")
-	if len(parts) != 3 {
-		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
-		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
-	}
-	companyID, agentID, userID := parts[0], parts[1], parts[2]
-	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
-		"sessionKey", sessionKey,
-		"messageNewPodID", message.NewPodID,
-		"currentPodID", currentPodID)
-	val, exists := cm.activeConnections.Load(sessionKey)
-	if !exists {
-		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
-		return nil
-	}
-	managedConn, ok := val.(domain.ManagedConnection)
-	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
-		cm.DeregisterConnection(sessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
-	}
-	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
-		"sessionKey", sessionKey,
-		"remoteAddr", managedConn.RemoteAddr(),
-		"conflictingPodID", message.NewPodID,
-	)
-	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Session taken over by another connection")
-	if err := managedConn.CloseWithError(errResp, "SessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
-			"sessionKey", sessionKey,
-			"remoteAddr", managedConn.RemoteAddr(),
-			"error", err.Error(),
-		)
-	}
-	cm.DeregisterConnection(sessionKey)
-	return nil
-}
-func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background()
-	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
-		"channel", channel,
-		"newPodIDInMessage", message.NewPodID,
-	)
-	currentPodID := cm.configProvider.Get().Server.PodID
-	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
-		return nil
-	}
-	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
-		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
-	}
-	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
-	adminSessionKey := rediskeys.AdminSessionKey(adminID)
-	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
-		"adminSessionKey", adminSessionKey,
-		"messageNewPodID", message.NewPodID,
-		"currentPodID", currentPodID)
-	val, exists := cm.activeConnections.Load(adminSessionKey)
-	if !exists {
-		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
-		return nil
-	}
-	managedConn, ok := val.(domain.ManagedConnection)
-	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
-		cm.DeregisterConnection(adminSessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
-	}
-	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
-		"adminSessionKey", adminSessionKey,
-		"remoteAddr", managedConn.RemoteAddr(),
-		"conflictingPodID", message.NewPodID,
-	)
-	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Admin session taken over by another connection")
-	if err := managedConn.CloseWithError(errResp, "AdminSessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
-			"adminSessionKey", adminSessionKey,
-			"remoteAddr", managedConn.RemoteAddr(),
-			"error", err.Error(),
-		)
-	}
-	cm.DeregisterConnection(adminSessionKey)
-	return nil
-}
-func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
-		pattern := rediskeys.SessionKillChannelKey("*", "*", "*")
-		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
-			} else {
-				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
-			}
-		}
-		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
-	})
-}
-func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
-		pattern := rediskeys.AdminSessionKillChannelKey("*")
-		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
-			} else {
-				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
-			}
-		}
-		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
-	})
-}
-func (cm *ConnectionManager) StopKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
-	if cm.killSwitchSubscriber != nil {
-		return cm.killSwitchSubscriber.Close()
-	}
-	return nil
-}
-func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
-	return nil
 }
 ```
 
@@ -4051,6 +3942,56 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		"durable_name", durableName+"_admin_agents",
 	)
 	return &natsSubscriptionWrapper{Subscription: sub}, nil
+}
+```
+
+## File: internal/application/connection_manager.go
+```go
+package application
+import (
+	"sync"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type ConnectionManager struct {
+	logger                 domain.Logger
+	configProvider         config.Provider
+	sessionLocker          domain.SessionLockManager
+	killSwitchPublisher    domain.KillSwitchPublisher
+	killSwitchSubscriber   domain.KillSwitchSubscriber
+	routeRegistry          domain.RouteRegistry
+	activeConnections      sync.Map
+	activeAdminConnections sync.Map
+	renewalStopChan chan struct{}
+	renewalWg       sync.WaitGroup
+	redisClient     *redis.Client
+}
+func NewConnectionManager(
+	logger domain.Logger,
+	configProvider config.Provider,
+	sessionLocker domain.SessionLockManager,
+	killSwitchPublisher domain.KillSwitchPublisher,
+	killSwitchSubscriber domain.KillSwitchSubscriber,
+	routeRegistry domain.RouteRegistry,
+	redisClient *redis.Client,
+) *ConnectionManager {
+	return &ConnectionManager{
+		logger:                 logger,
+		configProvider:         configProvider,
+		sessionLocker:          sessionLocker,
+		killSwitchPublisher:    killSwitchPublisher,
+		killSwitchSubscriber:   killSwitchSubscriber,
+		routeRegistry:          routeRegistry,
+		activeConnections:      sync.Map{},
+		activeAdminConnections: sync.Map{},
+		renewalStopChan:        make(chan struct{}),
+		renewalWg:              sync.WaitGroup{},
+		redisClient:            redisClient,
+	}
+}
+func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
+	return cm.routeRegistry
 }
 ```
 

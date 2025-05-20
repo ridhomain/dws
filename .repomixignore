@@ -49,3 +49,7 @@ tasks.json
 tasks/ 
 
 **/*.pb.go
+
+Makefile
+Dockerfile
+docker-compose.yml

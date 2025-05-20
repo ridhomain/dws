@@ -47,8 +47,8 @@ USER appuser
 
 # Expose the default port the application will listen on (adjust if necessary)
 # Placeholder, will be defined by HTTP/gRPC server implementation later
-# EXPOSE 8080 
-# EXPOSE 50051
+EXPOSE 8080
+EXPOSE 50051
 
 # Set the entrypoint
 ENTRYPOINT ["/app/daisi-ws-service"] 

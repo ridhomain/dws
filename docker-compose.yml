@@ -1,0 +1,109 @@
+version: '3.8'
+
+networks:
+  daisi_network:
+    driver: bridge
+
+services:
+  daisi-ws-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: daisi-ws-service
+    ports:
+      - "8080:8080" # HTTP port
+      - "50051:50051" # gRPC port
+    volumes:
+      - ./config:/app/config:ro # Mount local config read-only
+    environment:
+      # Viper will automatically use environment variables prefixed with DAISI_WS_
+      # or by direct mapping if the ENV var name matches the key in config.yaml (e.g., NATS_URL).
+      # Server config
+      - DAISI_WS_SERVER_HTTP_PORT=8080
+      - DAISI_WS_SERVER_GRPC_PORT=50051
+      - DAISI_WS_SERVER_POD_ID=daisi-ws-service-local # For local development
+      - DAISI_WS_SERVER_ENABLE_REFLECTION=true # Useful for local gRPC debugging with grpcurl
+
+      # NATS Config (matches keys in config.yaml under 'nats')
+      - DAISI_WS_NATS_URL=nats://nats:4222
+      - DAISI_WS_NATS_STREAM_NAME=wa_stream
+      - DAISI_WS_NATS_CONSUMER_NAME=ws_fanout
+      # - DAISI_WS_NATS_CONNECT_TIMEOUT_SECONDS=5
+      # - DAISI_WS_NATS_RECONNECT_WAIT_SECONDS=2
+      # - DAISI_WS_NATS_MAX_RECONNECTS=5
+      # - DAISI_WS_NATS_PING_INTERVAL_SECONDS=120
+      # - DAISI_WS_NATS_MAX_PINGS_OUT=2
+      # - DAISI_WS_NATS_RETRY_ON_FAILED_CONNECT=true
+
+
+      # Redis Config (matches keys in config.yaml under 'redis')
+      - DAISI_WS_REDIS_ADDRESS=redis:6379
+      # - DAISI_WS_REDIS_PASSWORD=
+      # - DAISI_WS_REDIS_DB=0
+      # - DAISI_WS_REDIS_SESSION_LOCK_RETRY_DELAY_MS=250
+      # - DAISI_WS_REDIS_NATS_ACK_WAIT_SECONDS=30
+      # - DAISI_WS_REDIS_GRPC_CLIENT_FORWARD_TIMEOUT_SECONDS=5
+
+
+      # Log Config
+      - DAISI_WS_LOG_LEVEL=debug # Override for local development
+
+      # Auth Config (Sensitive values should ideally be managed via secrets in production)
+      # For local development, you can set them here or ensure they are in your mounted config.yaml
+      # These are examples; ensure they match your actual keys from config.yaml
+      - DAISI_WS_AUTH_SECRET_TOKEN=${DAISI_WS_AUTH_SECRET_TOKEN:-YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE}
+      - DAISI_WS_AUTH_TOKEN_AES_KEY=${DAISI_WS_AUTH_TOKEN_AES_KEY:-YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE}
+      - DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY=${DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY:-YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE}
+      # - DAISI_WS_AUTH_TOKEN_CACHE_TTL_SECONDS=30
+      - DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY=${DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY:-YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE}
+      # - DAISI_WS_AUTH_ADMIN_TOKEN_CACHE_TTL_SECONDS=60
+
+      # App Config
+      - DAISI_WS_APP_SERVICE_NAME=daisi-ws-service
+      - DAISI_WS_APP_VERSION=local-dev-compose
+      # - DAISI_WS_APP_PING_INTERVAL_SECONDS=20
+      # - DAISI_WS_APP_SHUTDOWN_TIMEOUT_SECONDS=30
+      # - DAISI_WS_APP_PONG_WAIT_SECONDS=60
+      # - DAISI_WS_APP_WRITE_TIMEOUT_SECONDS=10
+      # - DAISI_WS_APP_MAX_MISSED_PONGS=2
+      # - DAISI_WS_APP_SESSION_TTL_SECONDS=30
+      # - DAISI_WS_APP_ROUTE_TTL_SECONDS=30
+      # - DAISI_WS_APP_TTL_REFRESH_INTERVAL_SECONDS=10
+      # - DAISI_WS_APP_NATS_MAX_ACK_PENDING=5000
+      # - DAISI_WS_APP_READ_TIMEOUT_SECONDS=10
+      # - DAISI_WS_APP_IDLE_TIMEOUT_SECONDS=60
+      # - DAISI_WS_APP_WEBSOCKET_COMPRESSION_MODE=disabled
+      # - DAISI_WS_APP_WEBSOCKET_DEVELOPMENT_INSECURE_SKIP_VERIFY=false
+
+
+      # Example of how Viper might pick up nested keys if you prefix ENVs:
+      # DWS_SERVER_HTTP_PORT=8080 (if Viper is configured with SetEnvPrefix("DWS"))
+      # Otherwise, ensure your config loading logic handles flat ENVs or direct mapping.
+      # The Go code appears to use direct mapping (e.g. os.Getenv("NATS_URL")) or Viper's automatic env binding.
+    depends_on:
+      - nats
+      - redis
+    networks:
+      - daisi_network
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.10-alpine # Using a specific alpine version for smaller size
+    container_name: nats
+    ports:
+      - "4222:4222" # Client port
+      - "8222:8222" # HTTP management port
+      - "6222:6222" # Routing port
+    command: "-js" # Enable JetStream
+    networks:
+      - daisi_network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine # Using a specific alpine version
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - daisi_network
+    restart: unless-stopped 
