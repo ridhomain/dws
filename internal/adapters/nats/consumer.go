@@ -279,12 +279,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 	}
 	// Subject pattern: wa.<companyIDPattern>.<agentIDPattern>.agents
 	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
-	queueGroup := "ws_fanout_admin" // Potentially a different queue group for admin, or reuse existing if appropriate.
-	// For now, using a distinct queue group to isolate admin agent event consumption if needed.
-	// If it should share the same pool as user chat events, this can be changed to "ws_fanout".
-	// The PRD states "existing JetStream consumer logic (e.g., ws_fanout consumer configuration adapted...)"
-	// This implies we might reuse `ws_fanout` or use a similar config. Let's stick to `ws_fanout` to align with that.
-	queueGroup = "ws_fanout"
+	queueGroup := "ws_fanout"
 
 	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
 		"subject", subject,
