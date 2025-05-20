@@ -15,7 +15,6 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
@@ -29,12 +28,12 @@ type AdminHandler struct {
 	logger         domain.Logger
 	configProvider config.Provider
 	connManager    *application.ConnectionManager
-	natsAdapter    *appnats.ConsumerAdapter
+	natsAdapter    domain.NatsConsumer
 	// Add other dependencies like NATS adapter, connection manager for admin sessions later.
 }
 
 // NewAdminHandler creates a new AdminHandler.
-func NewAdminHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *AdminHandler {
+func NewAdminHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer) *AdminHandler {
 	return &AdminHandler{
 		logger:         logger,
 		configProvider: cfgProvider,
@@ -166,8 +165,7 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 	metrics.IncrementMessagesSent(domain.MessageTypeReady) // Sent to admin
 	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
 
-	// NATS Subscription for Agent Events (FR-ADMIN-2)
-	var natsSubscription *nats.Subscription
+	var natsSubscription domain.NatsMessageSubscription
 	if h.natsAdapter != nil {
 		companyPattern := adminInfo.SubscribedCompanyID
 		agentPattern := adminInfo.SubscribedAgentID

@@ -54,18 +54,19 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
-	consumerAdapter, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger, routeRegistry)
+	natsConsumer, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger)
 	if err != nil {
 		cleanup2()
 		cleanup()
 		return nil, nil, err
 	}
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
+	messageForwarder := MessageForwarderProvider(domainLogger, provider)
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, routeRegistry, messageForwarder)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
-	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
-	conn := NatsConnectionProvider(consumerAdapter)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler, conn, client)
+	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
+	conn := NatsConnectionProvider(natsConsumer)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()

@@ -8,26 +8,20 @@ import (
 	"time"
 
 	"github.com/google/wire"
+	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
-
-	// ws "github.com/coder/websocket" // Alias for the websocket library - Not directly used in this file after simplification
-	// "github.com/nats-io/nats.go" // Temporarily commented out
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	appgrpc "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc" // Added for gRPC Server
 	apphttp "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/http"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/logger"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-
 	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 	wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-
-	// "gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys" // Not directly used in this file
-	"github.com/nats-io/nats.go"
 )
 
 // Define distinct types for middlewares to help Wire differentiate them
@@ -80,11 +74,11 @@ type App struct {
 	tokenGenerationMiddleware TokenGenerationMiddleware       // This is a type alias already func(http.Handler) http.Handler
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
-	natsConsumerAdapter       *appnats.ConsumerAdapter // Added NATS Consumer Adapter
-	adminAuthMiddleware       AdminAuthMiddleware      // Middleware for /ws/admin
-	adminWsHandler            *wsadapter.AdminHandler  // Handler for /ws/admin
-	natsConn                  *nats.Conn               // Added for readiness check
-	redisClient               *redis.Client            // Added for readiness check
+	natsConsumerAdapter       domain.NatsConsumer     // Changed from *appnats.ConsumerAdapter
+	adminAuthMiddleware       AdminAuthMiddleware     // Middleware for /ws/admin
+	adminWsHandler            *wsadapter.AdminHandler // Handler for /ws/admin
+	natsConn                  *nats.Conn              // Added for readiness check
+	redisClient               *redis.Client           // Added for readiness check
 	// natsCleanup            func() // Temporarily commented out
 }
 
@@ -101,7 +95,7 @@ func NewApp(
 	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
-	natsAdapter *appnats.ConsumerAdapter, // Added NATS Consumer Adapter
+	natsAdapter domain.NatsConsumer, // Changed from *appnats.ConsumerAdapter
 	adminAuthMid AdminAuthMiddleware, // Added AdminAuthMiddleware
 	adminHandler *wsadapter.AdminHandler, // Added AdminHandler
 	natsConn *nats.Conn, // Added for readiness check
@@ -210,14 +204,14 @@ func AdminAuthMiddlewareProvider(authService *application.AuthService, logger do
 }
 
 // AdminWebsocketHandlerProvider provides the admin websocket handler.
-func AdminWebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *wsadapter.AdminHandler {
+func AdminWebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer) *wsadapter.AdminHandler {
 	return wsadapter.NewAdminHandler(logger, cfgProvider, connManager, natsAdapter)
 }
 
 // WebsocketHandlerProvider provides the websocket handler.
 // Now also takes NatsConsumerAdapter as a dependency.
-func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *wsadapter.Handler {
-	return wsadapter.NewHandler(logger, cfgProvider, connManager, natsAdapter)
+func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *wsadapter.Handler {
+	return wsadapter.NewHandler(logger, cfgProvider, connManager, natsAdapter, routeRegistry, messageForwarder)
 }
 
 // WebsocketRouterProvider provides the websocket router.
@@ -285,8 +279,12 @@ func AdminTokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logge
 }
 
 // NatsConsumerAdapterProvider provides the NATS ConsumerAdapter.
-func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger, routeRegistry domain.RouteRegistry) (*appnats.ConsumerAdapter, func(), error) {
-	return appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger, routeRegistry)
+func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (domain.NatsConsumer, func(), error) {
+	adapter, cleanup, err := appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger)
+	if err != nil {
+		return nil, nil, err // Propagate the error
+	}
+	return adapter, cleanup, nil
 }
 
 // Provider for RouteRegistry
@@ -305,11 +303,15 @@ func GRPCServerProvider(appCtx context.Context, logger domain.Logger, cfgProvide
 }
 
 // Provider for *nats.Conn from NatsConsumerAdapter
-func NatsConnectionProvider(adapter *appnats.ConsumerAdapter) *nats.Conn {
+func NatsConnectionProvider(adapter domain.NatsConsumer) *nats.Conn {
 	if adapter == nil {
 		return nil
 	}
 	return adapter.NatsConn()
+}
+
+func MessageForwarderProvider(logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
+	return appgrpc.NewForwarderAdapter(logger, cfgProvider)
 }
 
 // ProviderSet is the Wire provider set for the entire application.
@@ -355,6 +357,7 @@ var ProviderSet = wire.NewSet(
 	AdminWebsocketHandlerProvider, // Added for admin websocket
 	AdminTokenCacheStoreProvider,  // Added for admin token caching
 	RouteRegistryProvider,         // Added RouteRegistryProvider
+	MessageForwarderProvider,      // Added MessageForwarderProvider
 	NewApp,
 	NatsConsumerAdapterProvider,
 	NatsConnectionProvider, // Added NatsConnectionProvider

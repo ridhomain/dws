@@ -12,20 +12,40 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 )
 
+// natsSubscriptionWrapper wraps nats.Subscription to implement domain.NatsMessageSubscription.
+// This allows the domain layer to remain independent of the concrete NATS library types.
+type natsSubscriptionWrapper struct {
+	*nats.Subscription
+}
+
+// Drain calls Drain on the underlying nats.Subscription.
+func (nsw *natsSubscriptionWrapper) Drain() error {
+	return nsw.Subscription.Drain()
+}
+
+// IsValid calls IsValid on the underlying nats.Subscription.
+func (nsw *natsSubscriptionWrapper) IsValid() bool {
+	return nsw.Subscription.IsValid()
+}
+
+// Subject calls Subject on the underlying nats.Subscription.
+func (nsw *natsSubscriptionWrapper) Subject() string {
+	return nsw.Subscription.Subject
+}
+
 // ConsumerAdapter handles connections and subscriptions to NATS JetStream.
 type ConsumerAdapter struct {
 	nc                *nats.Conn
 	js                nats.JetStreamContext
 	logger            domain.Logger
 	cfgProvider       config.Provider
-	RouteRegistry     domain.RouteRegistry
 	appName           string
 	natsMaxAckPending int // Added to store this specific config value
 }
 
 // NewConsumerAdapter creates a new NATS ConsumerAdapter.
 // It establishes a connection to the NATS server and gets a JetStream context.
-func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger, routeRegistry domain.RouteRegistry) (*ConsumerAdapter, func(), error) {
+func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (*ConsumerAdapter, func(), error) {
 	appFullCfg := cfgProvider.Get()
 	natsCfg := appFullCfg.NATS
 	appName := appFullCfg.App.ServiceName
@@ -99,7 +119,6 @@ func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLog
 		js:                js,
 		logger:            appLogger,
 		cfgProvider:       cfgProvider,
-		RouteRegistry:     routeRegistry,
 		appName:           appName,
 		natsMaxAckPending: natsMaxAckPending, // Store it
 	}
@@ -139,7 +158,7 @@ func (a *ConsumerAdapter) NatsConn() *nats.Conn {
 // SubscribeToChats subscribes to the chat events for a specific company and agent.
 // It uses QueueSubscribe with DeliverAllPolicy and ManualAckPolicy.
 // The provided nats.MsgHandler will be called for each received message.
-func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agentID string, handler nats.MsgHandler) (*nats.Subscription, error) {
+func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agentID string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
@@ -166,10 +185,12 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		ackWait = 30 * time.Second // Fallback default
 	}
 
+	natsHandler := nats.MsgHandler(handler) // Convert domain.NatsMessageHandler to nats.MsgHandler
+
 	sub, err := a.js.QueueSubscribe(
 		subject,
 		queueGroup,
-		handler, // The message handler function passed in
+		natsHandler, // The message handler function passed in
 		nats.Durable(durableName),
 		nats.DeliverAll(), // DeliverPolicy=All
 		nats.ManualAck(),  // We will manually ack messages
@@ -193,12 +214,12 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		"durable_name", durableName,
 	)
 
-	return sub, nil
+	return &natsSubscriptionWrapper{Subscription: sub}, nil
 }
 
 // SubscribeToChatMessages subscribes to specific chat message subjects (e.g., wa.<company>.<agent>.messages.<chat_id>).
 // The provided handler is responsible for processing messages, including ownership checks.
-func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler nats.MsgHandler) (*nats.Subscription, error) {
+func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
@@ -222,10 +243,12 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		"durable_name", durableName,
 	)
 
+	natsHandler := nats.MsgHandler(handler) // Convert domain.NatsMessageHandler to nats.MsgHandler
+
 	sub, err := a.js.QueueSubscribe(
 		subject,
 		queueGroup,
-		handler,
+		natsHandler,
 		nats.Durable(durableName+"_messages"), // Ensure durable name is unique per type of subscription if needed or managed carefully
 		nats.DeliverAll(),
 		nats.ManualAck(),
@@ -248,7 +271,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		"queue_group", queueGroup,
 		"durable_name", durableName+"_messages",
 	)
-	return sub, nil
+	return &natsSubscriptionWrapper{Subscription: sub}, nil
 }
 
 // Helper function to parse NATS subject for message streams
@@ -273,7 +296,7 @@ func ParseNATSMessageSubject(subject string) (companyID, agentID, chatID string,
 // SubscribeToAgentEvents subscribes to the agent events for a specific company and agent pattern.
 // It uses QueueSubscribe with DeliverAllPolicy and ManualAckPolicy.
 // The provided nats.MsgHandler will be called for each received message.
-func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler nats.MsgHandler) (*nats.Subscription, error) {
+func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
@@ -295,10 +318,12 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		ackWaitAdmin = 30 * time.Second // Fallback default
 	}
 
+	natsHandler := nats.MsgHandler(handler) // Convert domain.NatsMessageHandler to nats.MsgHandler
+
 	sub, err := a.js.QueueSubscribe(
 		subject,
 		queueGroup,
-		handler,
+		natsHandler,
 		nats.Durable(durableName+"_admin_agents"), // Make durable name distinct for this type of subscription to avoid conflicts if same base consumer name is used.
 		nats.DeliverAll(),
 		nats.ManualAck(),
@@ -321,5 +346,5 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		"queue_group", queueGroup,
 		"durable_name", durableName+"_admin_agents",
 	)
-	return sub, nil
+	return &natsSubscriptionWrapper{Subscription: sub}, nil
 }

@@ -13,17 +13,13 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	// Imports for App struct fields if defined here, but App struct is in providers.go
-	// "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	// wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
-	// "gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	// "gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 
 // NOTE: The App struct and NewApp function are defined in providers.go for Wire.

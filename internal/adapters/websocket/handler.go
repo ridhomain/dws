@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	// "time" // Not strictly needed for basic upgrade, can be added for timeouts later
@@ -25,38 +24,30 @@ import (
 	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 
-	// gRPC related imports
-	"github.com/google/uuid"                                                               // Added for request_id generation
-	dws_message_fwd "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto" // Alias for your generated proto package
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"                 // For XRequestIDHeader
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"                // Added for gRPC status codes
-	"google.golang.org/grpc/connectivity"         // Added for health check
-	"google.golang.org/grpc/credentials/insecure" // For now, will add mTLS later
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status" // Added for gRPC error codes
-	structpb "google.golang.org/protobuf/types/known/structpb"
-	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	"github.com/google/uuid"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 )
 
 // Handler handles WebSocket connection upgrades and subsequent communication.
 type Handler struct {
-	logger         domain.Logger
-	configProvider config.Provider
-	connManager    *application.ConnectionManager
-	natsAdapter    *appnats.ConsumerAdapter
-	grpcClientPool *sync.Map // Map targetAddress (string) to *grpc.ClientConn
+	logger           domain.Logger
+	configProvider   config.Provider
+	connManager      *application.ConnectionManager
+	natsAdapter      domain.NatsConsumer
+	routeRegistry    domain.RouteRegistry
+	messageForwarder domain.MessageForwarder
 	// Future dependencies: connectionManager domain.ConnectionManager
 }
 
 // NewHandler creates a new WebSocket Handler.
-func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *Handler {
+func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *Handler {
 	return &Handler{
-		logger:         logger,
-		configProvider: cfgProvider,
-		connManager:    connManager,
-		natsAdapter:    natsAdapter,
-		grpcClientPool: &sync.Map{},
+		logger:           logger,
+		configProvider:   cfgProvider,
+		connManager:      connManager,
+		natsAdapter:      natsAdapter,
+		routeRegistry:    routeRegistry,
+		messageForwarder: messageForwarder,
 	}
 }
 
@@ -266,10 +257,9 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	metrics.IncrementMessagesSent(domain.MessageTypeReady)
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
 
-	// NATS Subscription management
-	var generalNatsSubscription *nats.Subscription
-	var specificNatsSubscription *nats.Subscription // Renamed from currentNatsSubscription
-	var currentSpecificChatID string                // Renamed from currentSubscriptionChatID
+	var generalNatsSubscription domain.NatsMessageSubscription  // Changed type
+	var specificNatsSubscription domain.NatsMessageSubscription // Changed type
+	var currentSpecificChatID string
 
 	// Handler for general chat events (e.g., chat list updates)
 	generalChatEventsNatsHandler := func(msg *nats.Msg) {
@@ -310,7 +300,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			}
 			// Depending on policy, might close connection if initial subscription fails
 		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject)
+			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject())
 		}
 	} else {
 		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general chat events.")
@@ -318,10 +308,9 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 	// Renamed specificChatNatsMessageHandler from natsMessageHandler for clarity
 	specificChatNatsMessageHandler := func(msg *nats.Msg) {
-		metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric
+		metrics.IncrementNatsMessagesReceived(msg.Subject)
 
-		// Start: request_id handling for NATS message
-		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader) // Using const from middleware package
+		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
 		if natsRequestID == "" {
 			natsRequestID = uuid.NewString()
 			h.logger.Debug(connCtx, "Generated new request_id for NATS message", "subject", msg.Subject, "new_request_id", natsRequestID)
@@ -329,61 +318,47 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			h.logger.Debug(connCtx, "Using existing request_id from NATS message header", "subject", msg.Subject, "request_id", natsRequestID)
 		}
 		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
-		// End: request_id handling for NATS message
 
 		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject)
 		if err != nil {
 			h.logger.Error(msgCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
-			_ = msg.Ack() // Ack to prevent redelivery of malformed subjects
+			_ = msg.Ack()
 			return
 		}
 
 		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID == "" {
 			h.logger.Error(connCtx, "Current PodID is not configured, cannot determine message ownership.", "subject", msg.Subject)
-			_ = msg.Ack() // Ack as we can't process further
+			_ = msg.Ack()
 			return
 		}
 
-		// Check ownership using RouteRegistry from NATS adapter
-		// This check needs to be against the chatID from the NATS message subject itself.
-		ownerPodID, err := h.natsAdapter.RouteRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID) // Correctly using exported field
+		ownerPodID, err := h.routeRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
 		if err != nil {
-			if errors.Is(err, appredis.ErrNoOwningPod) { // Correctly using imported package for error
+			if errors.Is(err, appredis.ErrNoOwningPod) {
 				h.logger.Warn(connCtx, "No owning pod found for message route in Redis, potential race or cleanup issue. NACKing message.", "subject", msg.Subject, "chat_id_from_subject", msgChatID)
-				// FR-8A: NACK the message if no owning pod is found to prevent message loss.
-				// NATS will attempt redelivery or send to a dead-letter queue if configured.
 				if nakErr := msg.Nak(); nakErr != nil {
 					h.logger.Error(connCtx, "Failed to NACK NATS message for ErrNoOwningPod", "subject", msg.Subject, "error", nakErr.Error())
 				}
-				return // Stop processing this message
+				return
 			} else {
 				h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
-				_ = msg.Ack() // Ack as we can't determine ownership, to prevent blocking the consumer on this message.
+				_ = msg.Ack()
 				return
 			}
 		}
-
-		// If we reach here, err is nil, and ownerPodID is the ID of the owning pod.
-		// It cannot be empty if a route was found, because GetOwningPodForMessageRoute returns members[0].
-		// If no route was found, ErrNoOwningPod would have been returned and handled above.
 
 		var isOwner bool
 		if ownerPodID == currentPodID {
 			isOwner = true
 		} else {
-			// If ownerPodID is not currentPodID, it implies another specific pod owns it.
-			// ownerPodID should not be empty here due to the logic in GetOwningPodForMessageRoute
-			// and the ErrNoOwningPod handling above.
 			isOwner = false
 			if ownerPodID == "" {
-				// This case is defensive and should ideally not be reached if GetOwningPodForMessageRoute behaves as expected (returning error for no owner).
 				h.logger.Error(connCtx, "Internal logic inconsistency: ownerPodID is empty after GetOwningPodForMessageRoute succeeded. Assuming not owner.", "subject", msg.Subject)
 			}
 		}
 
 		if isOwner {
-			// Subtask 8.2: Implement Local Message Delivery for Owner Pod
 			h.logger.Info(msgCtx, "Current pod IS THE OWNER of the message route. Delivering locally.", "subject", msg.Subject, "podID", currentPodID)
 			var eventPayload domain.EnrichedEventPayload
 			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
@@ -398,148 +373,25 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
 				)
 			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeEvent) // NATS event forwarded to client
+				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 			}
 		} else {
-			// Subtask 8.3: Forward Messages via gRPC to Owner Pod(s) When Not Owner
-			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop.",
+			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop via MessageForwarder.",
 				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
-
 			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
 				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
-				h.logger.Info(msgCtx, "Attempting to forward message via gRPC", "target_address", gprcTargetAddress)
-
-				var grpcConn *grpc.ClientConn
-				var errClient error
-				var connFromPool bool
-
-				if connVal, okPool := h.grpcClientPool.Load(gprcTargetAddress); okPool {
-					grpcConn, connFromPool = connVal.(*grpc.ClientConn)
-					if !connFromPool {
-						h.logger.Error(msgCtx, "Invalid type in gRPC client pool, removing entry.", "target_address", gprcTargetAddress, "type", fmt.Sprintf("%T", connVal))
-						h.grpcClientPool.Delete(gprcTargetAddress)
-						grpcConn = nil
+				var domainPayload domain.EnrichedEventPayload
+				if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
+					h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding (MessageForwarder)", "subject", msg.Subject, "error", errUnmarshal.Error())
+				} else {
+					if errFwd := h.messageForwarder.ForwardEvent(msgCtx, gprcTargetAddress, &domainPayload, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
+						h.logger.Error(msgCtx, "Failed to forward event via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID, "error", errFwd.Error())
 					} else {
-						// Basic health check for pooled connection
-						connState := grpcConn.GetState()
-						if connState != connectivity.Ready && connState != connectivity.Idle {
-							h.logger.Warn(msgCtx, "Pooled gRPC connection is not Ready or Idle, discarding.", "target_address", gprcTargetAddress, "state", connState.String())
-							h.grpcClientPool.Delete(gprcTargetAddress)
-							grpcConn.Close()     // Close the unhealthy connection
-							grpcConn = nil       // Force creation of a new connection
-							connFromPool = false // No longer considered from pool for error handling later if new one fails
-						} else {
-							h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress, "state", connState.String())
-						}
-					}
-				}
-
-				if grpcConn == nil { // If not found in pool, type assertion failed, or explicitly nilled due to bad type
-					h.logger.Info(msgCtx, "Creating new gRPC client connection", "target_address", gprcTargetAddress)
-					connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-					newlyCreatedConn, newErrClient := grpc.NewClient(gprcTargetAddress, connOpts...)
-					if newErrClient == nil {
-						grpcConn = newlyCreatedConn                         // Use the newly created connection
-						h.grpcClientPool.Store(gprcTargetAddress, grpcConn) // Store the new connection
-					} else {
-						errClient = newErrClient // Store the error to be handled below
-					}
-				}
-
-				if errClient != nil { // This error is from grpc.NewClient if pool retrieval failed and new connection also failed
-					h.logger.Error(msgCtx, "Failed to establish gRPC connection to owner pod",
-						"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errClient.Error())
-				} else if grpcConn != nil { // If we have a connection (either from pool or newly created)
-					// defer grpcConn.Close() // DO NOT CLOSE HERE - it's pooled. Lifecycle managed elsewhere (e.g. app shutdown or eviction strategy)
-					client := dws_message_fwd.NewMessageForwardingServiceClient(grpcConn)
-
-					var domainPayload domain.EnrichedEventPayload
-					if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
-						h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding", "subject", msg.Subject, "error", errUnmarshal.Error())
-					} else {
-						protoData, errProtoStruct := structpb.NewStruct(domainPayload.Data.(map[string]interface{}))
-						if errProtoStruct != nil {
-							h.logger.Error(msgCtx, "Failed to convert domainPayload.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
-						} else {
-							grpcRequest := &dws_message_fwd.PushEventRequest{
-								Payload: &dws_message_fwd.EnrichedEventPayloadMessage{
-									EventId:   domainPayload.EventID,
-									EventType: domainPayload.EventType,
-									Timestamp: timestamppb.New(domainPayload.Timestamp),
-									Source:    domainPayload.Source,
-									Data:      protoData,
-								},
-								TargetCompanyId: msgCompanyID,
-								TargetAgentId:   msgAgentID,
-								TargetChatId:    msgChatID,
-								SourcePodId:     currentPodID,
-							}
-
-							md := metadata.New(nil)
-							if reqID, okCtxVal := msgCtx.Value(contextkeys.RequestIDKey).(string); okCtxVal && reqID != "" {
-								md.Set(string(contextkeys.RequestIDKey), reqID)
-							}
-							pushCtxWithMetadata := metadata.NewOutgoingContext(msgCtx, md)
-
-							grpcClientTimeoutSeconds := h.configProvider.Get().App.GRPCCLientForwardTimeoutSeconds
-							grpcClientTimeout := 5 * time.Second
-							if grpcClientTimeoutSeconds > 0 {
-								grpcClientTimeout = time.Duration(grpcClientTimeoutSeconds) * time.Second
-							}
-
-							pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
-							resp, errPush := client.PushEvent(pushCtx, grpcRequest)
-							pushCancel()
-
-							if errPush != nil {
-								st, ok := status.FromError(errPush)
-								if ok && (st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded) {
-									h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod failed with retryable error, attempting retry", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "grpc_code", st.Code().String(), "is_pooled_conn", connFromPool, "retry_attempt", 1)
-									metrics.IncrementGrpcForwardRetryAttempts(ownerPodID)
-
-									// Short delay before retry
-									time.Sleep(200 * time.Millisecond) // Configurable delay can be added later
-
-									pushCtxRetry, pushCancelRetry := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
-									resp, errPush = client.PushEvent(pushCtxRetry, grpcRequest) // Retry the call
-									pushCancelRetry()
-
-									if errPush != nil {
-										h.logger.Error(msgCtx, "gRPC PushEvent to owner pod failed after retry", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
-										metrics.IncrementGrpcForwardRetryFailure(ownerPodID)
-										if connFromPool {
-											h.grpcClientPool.Delete(gprcTargetAddress)
-											grpcConn.Close()
-											h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool after retry", "target_address", gprcTargetAddress)
-										}
-									} else if resp != nil && !resp.Success {
-										h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful after retry", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
-										metrics.IncrementGrpcForwardRetryFailure(ownerPodID) // Technically a failure of the retry if GRPC itself succeeded but operation was not successful
-									} else if resp != nil && resp.Success {
-										h.logger.Info(msgCtx, "Successfully forwarded message via gRPC after retry", "target_pod", ownerPodID, "event_id", domainPayload.EventID, "is_pooled_conn", connFromPool)
-										metrics.IncrementGrpcMessagesSent(ownerPodID)        // This still counts as one message sent from the service's perspective
-										metrics.IncrementGrpcForwardRetrySuccess(ownerPodID) // Specifically count successful retries
-									}
-								} else {
-									// Non-retryable error or parsing gRPC status failed
-									h.logger.Error(msgCtx, "gRPC PushEvent to owner pod failed with non-retryable error", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
-									if connFromPool {
-										h.grpcClientPool.Delete(gprcTargetAddress)
-										grpcConn.Close()
-										h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool due to non-retryable error", "target_address", gprcTargetAddress)
-									}
-								}
-							} else if resp != nil && !resp.Success {
-								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
-							} else if resp != nil && resp.Success {
-								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC", "target_pod", ownerPodID, "event_id", domainPayload.EventID, "is_pooled_conn", connFromPool)
-								metrics.IncrementGrpcMessagesSent(ownerPodID)
-							}
-						}
+						h.logger.Info(msgCtx, "Successfully initiated event forwarding via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID)
 					}
 				}
 			} else {
-				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop, message will not be forwarded.", "subject", msg.Subject)
+				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop (MessageForwarder), message will not be forwarded.", "subject", msg.Subject)
 			}
 		}
 
@@ -550,16 +402,16 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 	// Defer cleanup for all subscriptions
 	defer func() {
-		if generalNatsSubscription != nil {
-			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject)
+		if generalNatsSubscription != nil && generalNatsSubscription.IsValid() { // Added IsValid check
+			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject())
 			if unsubErr := generalNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject, "error", unsubErr.Error())
+				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject(), "error", unsubErr.Error())
 			}
 		}
-		if specificNatsSubscription != nil {
-			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject, "chatID", currentSpecificChatID)
+		if specificNatsSubscription != nil && specificNatsSubscription.IsValid() { // Added IsValid check
+			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject(), "chatID", currentSpecificChatID)
 			if unsubErr := specificNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject, "error", unsubErr.Error())
+				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject(), "error", unsubErr.Error())
 			}
 		}
 	}()
@@ -706,11 +558,11 @@ func (h *Handler) handleSelectChatMessage(
 	conn *Connection,
 	companyID, agentID, userID string,
 	payloadData interface{},
-	specificChatNatsMsgHandler nats.MsgHandler, // Renamed for clarity
-	currentGeneralSub *nats.Subscription, // Pass general subscription
-	currentSpecificSub *nats.Subscription, // Pass current specific subscription
-	currentSpecificSubChatID string, // Pass current specific chat ID
-) (*nats.Subscription, string, error) { // Returns new specific subscription, new chatID, and error
+	specificChatNatsMsgHandler domain.NatsMessageHandler, // Changed type
+	currentGeneralSub domain.NatsMessageSubscription, // Changed type
+	currentSpecificSub domain.NatsMessageSubscription, // Changed type
+	currentSpecificSubChatID string,
+) (domain.NatsMessageSubscription, string, error) { // Changed return type
 
 	payloadMap, ok := payloadData.(map[string]interface{})
 	if !ok {
@@ -821,26 +673,26 @@ func (h *Handler) handleSelectChatMessage(
 
 	// Manage NATS Subscription
 	// 1. Drain general subscription if it exists
-	if currentGeneralSub != nil {
-		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject)
+	if currentGeneralSub != nil && currentGeneralSub.IsValid() { // Added IsValid check
+		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject())
 		if err := currentGeneralSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject, "error", err.Error())
+			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject(), "error", err.Error())
 			// Log and continue, attempt to subscribe to new one
 		}
 		// currentGeneralSub = nil // It will be nil-ed out by the caller if this function succeeds
 	}
 
 	// 2. Drain old specific subscription if it exists and is for a different chat
-	if currentSpecificSub != nil && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID {
-		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject)
+	if currentSpecificSub != nil && currentSpecificSub.IsValid() && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID { // Added IsValid check
+		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject())
 		if err := currentSpecificSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject, "error", err.Error())
+			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject(), "error", err.Error())
 			// Log and continue, attempt to subscribe to new one
 		}
 	}
 
 	// 3. Subscribe to new chat message subject
-	var newSpecificSubscription *nats.Subscription
+	var newSpecificSubscription domain.NatsMessageSubscription // Changed type
 	var newSubErr error
 	if h.natsAdapter != nil {
 		h.logger.Info(connCtx, "Subscribing to NATS for new chat_id", "companyID", companyID, "agentID", agentID, "new_chat_id", chatID)
@@ -858,7 +710,7 @@ func (h *Handler) handleSelectChatMessage(
 			conn.SetCurrentChatID(oldChatID) // Revert to old chat ID if new subscription fails
 			return currentSpecificSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
 		}
-		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject)
+		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject())
 	} else {
 		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to new chat messages.", "new_chat_id", chatID)
 	}

@@ -52,6 +52,7 @@ internal/
     grpc/
       proto/
         dws_message_fwd.proto
+      forwarder_adapter.go
       server.go
     http/
       admin_handlers.go
@@ -93,8 +94,10 @@ internal/
     auth.go
     cache.go
     errors.go
+    forwarder.go
     logger.go
     nats_payloads.go
+    nats.go
     route_registry.go
     session.go
     websocket_protocol.go
@@ -115,6 +118,191 @@ go.mod
 ```
 
 # Files
+
+## File: internal/adapters/grpc/forwarder_adapter.go
+```go
+package grpc
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	structpb "google.golang.org/protobuf/types/known/structpb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+)
+type ForwarderAdapter struct {
+	logger         domain.Logger
+	configProvider config.Provider
+	grpcClientPool *sync.Map
+}
+func NewForwarderAdapter(logger domain.Logger, configProvider config.Provider) *ForwarderAdapter {
+	return &ForwarderAdapter{
+		logger:         logger,
+		configProvider: configProvider,
+		grpcClientPool: &sync.Map{},
+	}
+}
+func (fa *ForwarderAdapter) ForwardEvent(ctx context.Context, targetPodAddress string, event *domain.EnrichedEventPayload, targetCompanyID, targetAgentID, targetChatID, sourcePodID string) error {
+	fa.logger.Info(ctx, "Attempting to forward message via gRPC using ForwarderAdapter", "target_address", targetPodAddress, "event_id", event.EventID)
+	var grpcConn *grpc.ClientConn
+	var errClient error
+	var connFromPool bool
+	if connVal, okPool := fa.grpcClientPool.Load(targetPodAddress); okPool {
+		grpcConn, connFromPool = connVal.(*grpc.ClientConn)
+		if !connFromPool {
+			fa.logger.Error(ctx, "Invalid type in gRPC client pool, removing entry.", "target_address", targetPodAddress, "type", fmt.Sprintf("%T", connVal))
+			fa.grpcClientPool.Delete(targetPodAddress)
+			grpcConn = nil
+		} else {
+			connState := grpcConn.GetState()
+			if connState != connectivity.Ready && connState != connectivity.Idle {
+				fa.logger.Warn(ctx, "Pooled gRPC connection is not Ready or Idle, discarding.", "target_address", targetPodAddress, "state", connState.String())
+				fa.grpcClientPool.Delete(targetPodAddress)
+				grpcConn.Close()
+				grpcConn = nil
+				connFromPool = false
+			} else {
+				fa.logger.Debug(ctx, "Reusing gRPC client connection from pool", "target_address", targetPodAddress, "state", connState.String())
+			}
+		}
+	}
+	if grpcConn == nil {
+		fa.logger.Info(ctx, "Creating new gRPC client connection via ForwarderAdapter", "target_address", targetPodAddress)
+		connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+		newlyCreatedConn, newErrClient := grpc.NewClient(targetPodAddress, connOpts...)
+		if newErrClient == nil {
+			grpcConn = newlyCreatedConn
+			fa.grpcClientPool.Store(targetPodAddress, grpcConn)
+		} else {
+			errClient = newErrClient
+		}
+	}
+	if errClient != nil {
+		fa.logger.Error(ctx, "Failed to establish gRPC connection to owner pod via ForwarderAdapter",
+			"target_pod_address", targetPodAddress, "error", errClient.Error())
+		return errClient
+	}
+	if grpcConn == nil {
+		fa.logger.Error(ctx, "gRPC connection is nil after creation attempt without error ForwarderAdapter", "target_pod_address", targetPodAddress)
+		return fmt.Errorf("gRPC connection is nil for %s", targetPodAddress)
+	}
+	client := pb.NewMessageForwardingServiceClient(grpcConn)
+	protoData, errProtoStruct := structpb.NewStruct(event.Data.(map[string]interface{}))
+	if errProtoStruct != nil {
+		fa.logger.Error(ctx, "Failed to convert event.Data to proto.Struct for gRPC via ForwarderAdapter", "error", errProtoStruct.Error())
+		return errProtoStruct
+	}
+	grpcRequest := &pb.PushEventRequest{
+		Payload: &pb.EnrichedEventPayloadMessage{
+			EventId:   event.EventID,
+			EventType: event.EventType,
+			Timestamp: timestamppb.New(event.Timestamp),
+			Source:    event.Source,
+			Data:      protoData,
+		},
+		TargetCompanyId: targetCompanyID,
+		TargetAgentId:   targetAgentID,
+		TargetChatId:    targetChatID,
+		SourcePodId:     sourcePodID,
+	}
+	mdOut := metadata.New(nil)
+	if reqID, okCtxVal := ctx.Value(contextkeys.RequestIDKey).(string); okCtxVal && reqID != "" {
+		mdOut.Set(string(contextkeys.RequestIDKey), reqID)
+	}
+	pushCtxWithMetadata := metadata.NewOutgoingContext(ctx, mdOut)
+	grpcClientTimeoutSeconds := fa.configProvider.Get().App.GRPCCLientForwardTimeoutSeconds
+	grpcClientTimeout := 5 * time.Second // Default timeout
+	if grpcClientTimeoutSeconds > 0 {
+		grpcClientTimeout = time.Duration(grpcClientTimeoutSeconds) * time.Second
+	}
+	var finalErr error
+	for i := 0; i < 2; i++ { // 0: initial attempt, 1: retry attempt
+		pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
+		resp, errPush := client.PushEvent(pushCtx, grpcRequest)
+		pushCancel()
+		if errPush == nil {
+			if resp != nil && resp.Success {
+				fa.logger.Info(ctx, "Successfully forwarded message via gRPC using ForwarderAdapter", "target_pod_address", targetPodAddress, "event_id", event.EventID, "attempt", i)
+				metrics.IncrementGrpcMessagesSent(targetPodAddress)
+				if i > 0 {
+					metrics.IncrementGrpcForwardRetrySuccess(targetPodAddress)
+				}
+				return nil
+			}
+			finalErr = fmt.Errorf("gRPC PushEvent to %s was not successful via ForwarderAdapter: %s (attempt %d)", targetPodAddress, resp.Message, i)
+			fa.logger.Warn(ctx, finalErr.Error())
+			break
+		}
+		finalErr = errPush
+		st, ok := status.FromError(errPush)
+		if ok && (st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded) {
+			fa.logger.Warn(ctx, "gRPC PushEvent to owner pod failed with retryable error via ForwarderAdapter", "target_pod_address", targetPodAddress, "error", errPush.Error(), "grpc_code", st.Code().String(), "is_pooled_conn", connFromPool, "attempt", i)
+			if i == 0 {
+				metrics.IncrementGrpcForwardRetryAttempts(targetPodAddress)
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+		} else {
+			fa.logger.Error(ctx, "gRPC PushEvent to owner pod failed with non-retryable error via ForwarderAdapter", "target_pod_address", targetPodAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool, "attempt", i)
+			break
+		}
+	}
+	if finalErr != nil {
+		metrics.IncrementGrpcForwardRetryFailure(targetPodAddress)
+		if connFromPool && grpcConn != nil {
+			fa.grpcClientPool.Delete(targetPodAddress)
+			grpcConn.Close()
+			fa.logger.Info(ctx, "Removed and closed failed gRPC connection from pool in ForwarderAdapter", "target_pod_address", targetPodAddress)
+		}
+		return finalErr
+	}
+	return nil
+}
+```
+
+## File: internal/domain/forwarder.go
+```go
+package domain
+import (
+	"context"
+)
+type MessageForwarder interface {
+	ForwardEvent(ctx context.Context, targetPodAddress string, event *EnrichedEventPayload, targetCompanyID, targetAgentID, targetChatID, sourcePodID string) error
+}
+```
+
+## File: internal/domain/nats.go
+```go
+package domain
+import (
+	"context"
+	"github.com/nats-io/nats.go"
+)
+type NatsMessageSubscription interface {
+	Drain() error
+	IsValid() bool
+	Subject() string
+}
+type NatsMessageHandler func(msg *nats.Msg)
+type NatsConsumer interface {
+	SubscribeToChats(ctx context.Context, companyID, agentID string, handler NatsMessageHandler) (NatsMessageSubscription, error)
+	SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler NatsMessageHandler) (NatsMessageSubscription, error)
+	SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler NatsMessageHandler) (NatsMessageSubscription, error)
+	NatsConn() *nats.Conn
+	Close()
+}
+```
 
 ## File: internal/adapters/grpc/proto/dws_message_fwd.proto
 ```protobuf
@@ -1214,128 +1402,6 @@ func GenerateAdminTokenHandler(cfgProvider config.Provider, logger domain.Logger
 }
 ```
 
-## File: internal/adapters/metrics/prometheus_adapter.go
-```go
-package metrics
-import (
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-)
-var (
-	ActiveConnectionsGauge = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "dws_active_connections",
-			Help: "Number of active WebSocket connections.",
-		},
-	)
-	ConnectionsTotalCounter = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "dws_connections_total",
-			Help: "Total WebSocket connections initiated (successful handshakes).",
-		},
-	)
-	ConnectionDurationHistogram = promauto.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "dws_connection_duration_seconds",
-			Help:    "Duration of WebSocket connections.",
-			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15),
-		},
-	)
-	MessagesReceivedCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_messages_received_total",
-			Help: "Total messages received from clients, partitioned by message type.",
-		},
-		[]string{"message_type"},
-	)
-	MessagesSentCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_messages_sent_total",
-			Help: "Total messages sent to clients, partitioned by message type.",
-		},
-		[]string{"message_type"},
-	)
-	AuthSuccessTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_auth_success_total",
-			Help: "Successful token validations.",
-		},
-		[]string{"token_type"},
-	)
-	AuthFailureTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_auth_failure_total",
-			Help: "Failed token validations.",
-		},
-		[]string{"token_type", "reason"},
-	)
-	SessionConflictsTotalCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_session_conflicts_total",
-			Help: "Number of session conflicts detected.",
-		},
-		[]string{"user_type"},
-	)
-	NatsMessagesReceivedCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_nats_messages_received_total",
-			Help: "Messages received from NATS, partitioned by NATS subject.",
-		},
-		[]string{"nats_subject"},
-	)
-	GrpcMessagesSentCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_messages_sent_total",
-			Help: "Messages forwarded via gRPC, partitioned by target pod ID.",
-		},
-		[]string{"target_pod_id"},
-	)
-	GrpcMessagesReceivedCounter = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "dws_grpc_messages_received_total",
-			Help: "Messages received via gRPC, partitioned by source pod ID.",
-		},
-		[]string{"source_pod_id"},
-	)
-)
-func IncrementActiveConnections() {
-	ActiveConnectionsGauge.Inc()
-}
-func DecrementActiveConnections() {
-	ActiveConnectionsGauge.Dec()
-}
-func IncrementConnectionsTotal() {
-	ConnectionsTotalCounter.Inc()
-}
-func ObserveConnectionDuration(durationSeconds float64) {
-	ConnectionDurationHistogram.Observe(durationSeconds)
-}
-func IncrementMessagesReceived(messageType string) {
-	MessagesReceivedCounter.WithLabelValues(messageType).Inc()
-}
-func IncrementMessagesSent(messageType string) {
-	MessagesSentCounter.WithLabelValues(messageType).Inc()
-}
-func IncrementAuthSuccess(tokenType string) {
-	AuthSuccessTotalCounter.WithLabelValues(tokenType).Inc()
-}
-func IncrementAuthFailure(tokenType string, reason string) {
-	AuthFailureTotalCounter.WithLabelValues(tokenType, reason).Inc()
-}
-func IncrementSessionConflicts(userType string) {
-	SessionConflictsTotalCounter.WithLabelValues(userType).Inc()
-}
-func IncrementNatsMessagesReceived(natsSubject string) {
-	NatsMessagesReceivedCounter.WithLabelValues(natsSubject).Inc()
-}
-func IncrementGrpcMessagesSent(targetPodID string) {
-	GrpcMessagesSentCounter.WithLabelValues(targetPodID).Inc()
-}
-func IncrementGrpcMessagesReceived(sourcePodID string) {
-	GrpcMessagesReceivedCounter.WithLabelValues(sourcePodID).Inc()
-}
-```
-
 ## File: internal/adapters/redis/kill_switch_pubsub.go
 ```go
 package redis
@@ -1433,129 +1499,6 @@ func (a *KillSwitchPubSubAdapter) Close() error {
 }
 ```
 
-## File: internal/adapters/websocket/conn.go
-```go
-package websocket
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"sync"
-	"time"
-	"github.com/coder/websocket"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type Connection struct {
-	wsConn              *websocket.Conn
-	logger              domain.Logger
-	config              *config.AppConfig
-	mu                  sync.Mutex
-	lastPongTime        time.Time
-	connCtx             context.Context
-	cancelConnCtxFunc   context.CancelFunc
-	writeTimeoutSeconds int
-	pingIntervalSeconds int
-	pongWaitSeconds     int
-	remoteAddrStr       string
-	currentChatID       string
-	currentChatIDMu     sync.Mutex
-}
-func NewConnection(
-	connCtx context.Context,
-	cancelFunc context.CancelFunc,
-	wsConn *websocket.Conn,
-	remoteAddr string,
-	logger domain.Logger,
-	cfgProvider config.Provider,
-) *Connection {
-	appCfg := cfgProvider.Get().App
-	return &Connection{
-		wsConn:              wsConn,
-		logger:              logger,
-		config:              &appCfg,
-		lastPongTime:        time.Now(),
-		connCtx:             connCtx,
-		cancelConnCtxFunc:   cancelFunc,
-		writeTimeoutSeconds: appCfg.WriteTimeoutSeconds,
-		pingIntervalSeconds: appCfg.PingIntervalSeconds,
-		pongWaitSeconds:     appCfg.PongWaitSeconds,
-		remoteAddrStr:       remoteAddr,
-		currentChatID:       "",         // currentChatID is initialized as empty string
-	}
-}
-// Context returns the context associated with this connection.
-func (c *Connection) Context() context.Context {
-	return c.connCtx
-}
-// Close attempts to close the WebSocket connection with a specified status code and reason.
-func (c *Connection) Close(statusCode websocket.StatusCode, reason string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cancelConnCtxFunc != nil {
-		c.cancelConnCtxFunc()
-	}
-	return c.wsConn.Close(statusCode, reason)
-}
-// WriteJSON sends a JSON-encoded message to the client with a timeout.
-func (c *Connection) WriteJSON(v interface{}) error {
-	payload, err := json.Marshal(v)
-	if err != nil {
-		c.logger.Error(c.connCtx, "Failed to marshal JSON for WriteJSON", "error", err.Error())
-		return fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ctxToWrite := c.connCtx
-	var cancel context.CancelFunc
-	if c.writeTimeoutSeconds > 0 {
-		ctxToWrite, cancel = context.WithTimeout(c.connCtx, time.Duration(c.writeTimeoutSeconds)*time.Second)
-		defer cancel()
-	}
-	return c.wsConn.Write(ctxToWrite, websocket.MessageText, payload)
-}
-func (c *Connection) ReadMessage(ctx context.Context) (websocket.MessageType, []byte, error) {
-	return c.wsConn.Read(ctx)
-}
-func (c *Connection) RemoteAddr() string {
-	return c.remoteAddrStr
-}
-func (c *Connection) UnderlyingConn() *websocket.Conn {
-	return c.wsConn
-}
-func (c *Connection) LastPongTime() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastPongTime
-}
-func (c *Connection) UpdateLastPongTime() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lastPongTime = time.Now()
-}
-func (c *Connection) Ping(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ctxToWrite := c.connCtx
-	var cancel context.CancelFunc
-	if c.writeTimeoutSeconds > 0 {
-		ctxToWrite, cancel = context.WithTimeout(c.connCtx, time.Duration(c.writeTimeoutSeconds)*time.Second)
-		defer cancel()
-	}
-	return c.wsConn.Ping(ctxToWrite)
-}
-func (c *Connection) GetCurrentChatID() string {
-	c.currentChatIDMu.Lock()
-	defer c.currentChatIDMu.Unlock()
-	return c.currentChatID
-}
-func (c *Connection) SetCurrentChatID(chatID string) {
-	c.currentChatIDMu.Lock()
-	defer c.currentChatIDMu.Unlock()
-	c.currentChatID = chatID
-}
-```
-
 ## File: internal/application/auth_service.go
 ```go
 package application
@@ -1564,6 +1507,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
@@ -1607,11 +1551,11 @@ func (s *AuthService) ParseAndValidateDecryptedToken(decryptedPayload []byte, ra
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to unmarshal token JSON: %v", ErrTokenPayloadInvalid, err)
 	}
-	if ctx.CompanyID == "" || ctx.AgentID == "" || ctx.UserID == "" || ctx.ExpiresAt.IsZero() {
-		return nil, fmt.Errorf("%w: missing essential fields (company_id, agent_id, user_id, expires_at)", ErrTokenPayloadInvalid)
-	}
-	if time.Now().After(ctx.ExpiresAt) {
-		return nil, fmt.Errorf("%w: token expired at %v", ErrTokenExpired, ctx.ExpiresAt)
+	if err := ctx.Validate(); err != nil {
+		if strings.Contains(err.Error(), "expired") {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
 	}
 	ctx.Token = rawTokenB64
 	return &ctx, nil
@@ -1622,11 +1566,11 @@ func (s *AuthService) ParseAndValidateAdminDecryptedToken(decryptedPayload []byt
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to unmarshal admin token JSON: %v", ErrTokenPayloadInvalid, err)
 	}
-	if adminCtx.AdminID == "" || adminCtx.ExpiresAt.IsZero() {
-		return nil, fmt.Errorf("%w: missing essential fields (admin_id, expires_at) in admin token", ErrTokenPayloadInvalid)
-	}
-	if time.Now().After(adminCtx.ExpiresAt) {
-		return nil, fmt.Errorf("%w: admin token expired at %v", ErrTokenExpired, adminCtx.ExpiresAt)
+	if err := adminCtx.Validate(); err != nil {
+		if strings.Contains(err.Error(), "expired") {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
 	}
 	adminCtx.Token = rawTokenB64
 	return &adminCtx, nil
@@ -1742,61 +1686,6 @@ type TokenCacheStore interface {
 type AdminTokenCacheStore interface {
 	Get(ctx context.Context, key string) (*AdminUserContext, error)
 	Set(ctx context.Context, key string, value *AdminUserContext, ttl time.Duration) error
-}
-```
-
-## File: internal/domain/errors.go
-```go
-package domain
-import (
-	"encoding/json"
-	"net/http"
-)
-type ErrorCode string
-const (
-	ErrInvalidAPIKey       ErrorCode = "InvalidAPIKey"
-	ErrInvalidToken        ErrorCode = "InvalidToken"
-	ErrSessionConflict     ErrorCode = "SessionConflict"
-	ErrSubscriptionFailure ErrorCode = "SubscriptionFailure"
-	ErrRateLimitExceeded   ErrorCode = "RateLimitExceeded"
-	ErrBadRequest          ErrorCode = "BadRequest"
-	ErrInternal            ErrorCode = "InternalServerError"
-	ErrMethodNotAllowed    ErrorCode = "E4005"
-	ErrUnauthorized ErrorCode = "E4001"
-	ErrForbidden    ErrorCode = "E4003"
-)
-type ErrorResponse struct {
-	Code    ErrorCode `json:"code"`
-	Message string    `json:"message"`
-	Details string    `json:"details,omitempty"`
-}
-func NewErrorResponse(code ErrorCode, message string, details string) ErrorResponse {
-	return ErrorResponse{
-		Code:    code,
-		Message: message,
-		Details: details,
-	}
-}
-func (er ErrorResponse) WriteJSON(w http.ResponseWriter, httpStatusCode int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(httpStatusCode)
-	json.NewEncoder(w).Encode(er)
-}
-```
-
-## File: internal/domain/websocket.go
-```go
-package domain
-import (
-	"context"
-	"github.com/coder/websocket"
-)
-type ManagedConnection interface {
-	Close(statusCode websocket.StatusCode, reason string) error
-	WriteJSON(v interface{}) error
-	RemoteAddr() string
-	Context() context.Context
-	GetCurrentChatID() string
 }
 ```
 
@@ -1927,6 +1816,188 @@ func AdminSessionKey(adminID string) string {
 }
 func AdminSessionKillChannelKey(adminID string) string {
 	return fmt.Sprintf("session_kill:admin:%s", adminID)
+}
+```
+
+## File: internal/adapters/metrics/prometheus_adapter.go
+```go
+package metrics
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+var (
+	ActiveConnectionsGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dws_active_connections",
+			Help: "Number of active WebSocket connections.",
+		},
+	)
+	ConnectionsTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_connections_total",
+			Help: "Total WebSocket connections initiated (successful handshakes).",
+		},
+	)
+	ConnectionDurationHistogram = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "dws_connection_duration_seconds",
+			Help:    "Duration of WebSocket connections.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 15),
+		},
+	)
+	MessagesReceivedCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_messages_received_total",
+			Help: "Total messages received from clients, partitioned by message type.",
+		},
+		[]string{"message_type"},
+	)
+	MessagesSentCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_messages_sent_total",
+			Help: "Total messages sent to clients, partitioned by message type.",
+		},
+		[]string{"message_type"},
+	)
+	AuthSuccessTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_auth_success_total",
+			Help: "Successful token validations.",
+		},
+		[]string{"token_type"},
+	)
+	AuthFailureTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_auth_failure_total",
+			Help: "Failed token validations.",
+		},
+		[]string{"token_type", "reason"},
+	)
+	SessionConflictsTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_conflicts_total",
+			Help: "Number of session conflicts detected.",
+		},
+		[]string{"user_type"},
+	)
+	NatsMessagesReceivedCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_nats_messages_received_total",
+			Help: "Messages received from NATS, partitioned by NATS subject.",
+		},
+		[]string{"nats_subject"},
+	)
+	GrpcMessagesSentCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_messages_sent_total",
+			Help: "Messages forwarded via gRPC, partitioned by target pod ID.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcMessagesReceivedCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_messages_received_total",
+			Help: "Messages received via gRPC, partitioned by source pod ID.",
+		},
+		[]string{"source_pod_id"},
+	)
+	GrpcForwardRetryAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_attempts_total",
+			Help: "Total gRPC message forwarding retry attempts.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcForwardRetrySuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_success_total",
+			Help: "Total successful gRPC message forwarding retries.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcForwardRetryFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_failure_total",
+			Help: "Total failed gRPC message forwarding retries.",
+		},
+		[]string{"target_pod_id"},
+	)
+	SessionLockAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_attempts_total",
+			Help: "Total session lock acquisition attempts.",
+		},
+		[]string{"user_type", "lock_type"},
+	)
+	SessionLockSuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_success_total",
+			Help: "Total successful session lock acquisitions.",
+		},
+		[]string{"user_type", "lock_type"},
+	)
+	SessionLockFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_failure_total",
+			Help: "Total failed session lock acquisitions.",
+		},
+		[]string{"user_type", "reason"},
+	)
+)
+func IncrementActiveConnections() {
+	ActiveConnectionsGauge.Inc()
+}
+func DecrementActiveConnections() {
+	ActiveConnectionsGauge.Dec()
+}
+func IncrementConnectionsTotal() {
+	ConnectionsTotalCounter.Inc()
+}
+func ObserveConnectionDuration(durationSeconds float64) {
+	ConnectionDurationHistogram.Observe(durationSeconds)
+}
+func IncrementMessagesReceived(messageType string) {
+	MessagesReceivedCounter.WithLabelValues(messageType).Inc()
+}
+func IncrementMessagesSent(messageType string) {
+	MessagesSentCounter.WithLabelValues(messageType).Inc()
+}
+func IncrementAuthSuccess(tokenType string) {
+	AuthSuccessTotalCounter.WithLabelValues(tokenType).Inc()
+}
+func IncrementAuthFailure(tokenType string, reason string) {
+	AuthFailureTotalCounter.WithLabelValues(tokenType, reason).Inc()
+}
+func IncrementSessionConflicts(userType string) {
+	SessionConflictsTotalCounter.WithLabelValues(userType).Inc()
+}
+func IncrementNatsMessagesReceived(natsSubject string) {
+	NatsMessagesReceivedCounter.WithLabelValues(natsSubject).Inc()
+}
+func IncrementGrpcMessagesSent(targetPodID string) {
+	GrpcMessagesSentCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcMessagesReceived(sourcePodID string) {
+	GrpcMessagesReceivedCounter.WithLabelValues(sourcePodID).Inc()
+}
+func IncrementGrpcForwardRetryAttempts(targetPodID string) {
+	GrpcForwardRetryAttemptsCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcForwardRetrySuccess(targetPodID string) {
+	GrpcForwardRetrySuccessCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcForwardRetryFailure(targetPodID string) {
+	GrpcForwardRetryFailureCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementSessionLockAttempts(userType, lockType string) {
+	SessionLockAttemptsCounter.WithLabelValues(userType, lockType).Inc()
+}
+func IncrementSessionLockSuccess(userType, lockType string) {
+	SessionLockSuccessCounter.WithLabelValues(userType, lockType).Inc()
+}
+func IncrementSessionLockFailure(userType, reason string) {
+	SessionLockFailureCounter.WithLabelValues(userType, reason).Inc()
 }
 ```
 
@@ -2155,436 +2226,167 @@ func CompanyTokenAuthMiddleware(authService *application.AuthService, logger dom
 }
 ```
 
-## File: internal/adapters/nats/consumer.go
+## File: internal/adapters/websocket/conn.go
 ```go
-package nats
+package websocket
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"strings"
+	"sync"
 	"time"
-	"github.com/nats-io/nats.go"
+	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 )
-type ConsumerAdapter struct {
-	nc                *nats.Conn
-	js                nats.JetStreamContext
-	logger            domain.Logger
-	cfgProvider       config.Provider
-	RouteRegistry     domain.RouteRegistry
-	appName           string
-	natsMaxAckPending int
+type Connection struct {
+	wsConn              *websocket.Conn
+	logger              domain.Logger
+	config              *config.AppConfig
+	mu                  sync.Mutex
+	lastPongTime        time.Time
+	connCtx             context.Context
+	cancelConnCtxFunc   context.CancelFunc
+	writeTimeoutSeconds int
+	pingIntervalSeconds int
+	pongWaitSeconds     int
+	remoteAddrStr       string
+	currentChatID       string
+	currentChatIDMu     sync.Mutex
 }
-func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger, routeRegistry domain.RouteRegistry) (*ConsumerAdapter, func(), error) {
-	appFullCfg := cfgProvider.Get()
-	natsCfg := appFullCfg.NATS
-	appName := appFullCfg.App.ServiceName
-	natsMaxAckPending := appFullCfg.App.NATSMaxAckPending
-	natsAckWaitSeconds := appFullCfg.App.NatsAckWaitSeconds
-	if natsAckWaitSeconds <= 0 {
-		natsAckWaitSeconds = 30
-		appLogger.Warn(ctx, "NatsAckWaitSeconds not configured or invalid, defaulting to 30s")
+func NewConnection(
+	connCtx context.Context,
+	cancelFunc context.CancelFunc,
+	wsConn *websocket.Conn,
+	remoteAddr string,
+	logger domain.Logger,
+	cfgProvider config.Provider,
+) *Connection {
+	appCfg := cfgProvider.Get().App
+	return &Connection{
+		wsConn:              wsConn,
+		logger:              logger,
+		config:              &appCfg,
+		lastPongTime:        time.Now(),
+		connCtx:             connCtx,
+		cancelConnCtxFunc:   cancelFunc,
+		writeTimeoutSeconds: appCfg.WriteTimeoutSeconds,
+		pingIntervalSeconds: appCfg.PingIntervalSeconds,
+		pongWaitSeconds:     appCfg.PongWaitSeconds,
+		remoteAddrStr:       remoteAddr,
+		currentChatID:       "",         // currentChatID is initialized as empty string
 	}
-	appLogger.Info(ctx, "Attempting to connect to NATS server", "url", natsCfg.URL)
-	natsOptions := []nats.Option{
-		nats.Name(fmt.Sprintf("%s-consumer-%s", appName, appFullCfg.Server.PodID)),
-		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
-			appLogger.Error(ctx, "NATS error", "subscription", s.Subject, "error", err.Error())
-		}),
-		nats.ClosedHandler(func(c *nats.Conn) {
-			appLogger.Info(ctx, "NATS connection closed")
-		}),
-		nats.ReconnectHandler(func(c *nats.Conn) {
-			appLogger.Info(ctx, "NATS reconnected", "url", c.ConnectedUrl())
-		}),
-		nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
-			appLogger.Warn(ctx, "NATS disconnected", "error", err)
-		}),
+}
+// Context returns the context associated with this connection.
+func (c *Connection) Context() context.Context {
+	return c.connCtx
+}
+// Close attempts to close the WebSocket connection with a specified status code and reason.
+func (c *Connection) Close(statusCode websocket.StatusCode, reason string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelConnCtxFunc != nil {
+		c.cancelConnCtxFunc()
 	}
-	if natsCfg.RetryOnFailedConnect {
-		natsOptions = append(natsOptions, nats.RetryOnFailedConnect(true))
+	return c.wsConn.Close(statusCode, reason)
+}
+// CloseWithError sends an error message to the client and then closes the WebSocket connection
+// with the appropriate close code derived from the error response.
+func (c *Connection) CloseWithError(errResp domain.ErrorResponse, reason string) error {
+	// First send the error message to the client
+	errorMsg := domain.NewErrorMessage(errResp)
+	if err := c.WriteJSON(errorMsg); err != nil {
+		c.logger.Error(c.connCtx, "Failed to send error message before closing connection",
+			"error", err.Error(),
+			"error_code", string(errResp.Code),
+			"message", errResp.Message)
 	} else {
+		metrics.IncrementMessagesSent(domain.MessageTypeError)
 	}
-	if natsCfg.MaxReconnects != 0 {
-		natsOptions = append(natsOptions, nats.MaxReconnects(natsCfg.MaxReconnects))
-	}
-	if natsCfg.ReconnectWaitSeconds > 0 {
-		natsOptions = append(natsOptions, nats.ReconnectWait(time.Duration(natsCfg.ReconnectWaitSeconds)*time.Second))
-	}
-	if natsCfg.ConnectTimeoutSeconds > 0 {
-		natsOptions = append(natsOptions, nats.Timeout(time.Duration(natsCfg.ConnectTimeoutSeconds)*time.Second))
-	}
-	if natsCfg.PingIntervalSeconds > 0 {
-		natsOptions = append(natsOptions, nats.PingInterval(time.Duration(natsCfg.PingIntervalSeconds)*time.Second))
-	}
-	if natsCfg.MaxPingsOut > 0 {
-		natsOptions = append(natsOptions, nats.MaxPingsOutstanding(natsCfg.MaxPingsOut))
-	}
-	nc, err := nats.Connect(natsCfg.URL, natsOptions...)
-	if err != nil {
-		appLogger.Error(ctx, "Failed to connect to NATS", "url", natsCfg.URL, "error", err.Error())
-		return nil, nil, fmt.Errorf("failed to connect to NATS at %s: %w", natsCfg.URL, err)
-	}
-	appLogger.Info(ctx, "Successfully connected to NATS server", "url", nc.ConnectedUrl())
-	js, err := nc.JetStream(nats.PublishAsyncMaxPending(256))
-	if err != nil {
-		appLogger.Error(ctx, "Failed to get JetStream context", "error", err.Error())
-		nc.Close()
-		return nil, nil, fmt.Errorf("failed to get JetStream context: %w", err)
-	}
-	appLogger.Info(ctx, "Successfully obtained JetStream context")
-	adapter := &ConsumerAdapter{
-		nc:                nc,
-		js:                js,
-		logger:            appLogger,
-		cfgProvider:       cfgProvider,
-		RouteRegistry:     routeRegistry,
-		appName:           appName,
-		natsMaxAckPending: natsMaxAckPending,
-	}
-	cleanup := func() {
-		appLogger.Info(context.Background(), "Closing NATS connection...")
-		adapter.Close()
-	}
-	return adapter, cleanup, nil
+	closeCode := errResp.ToWebSocketCloseCode()
+	return c.Close(closeCode, reason)
 }
-func (a *ConsumerAdapter) Close() {
-	if a.nc != nil && !a.nc.IsClosed() {
-		a.logger.Info(context.Background(), "Draining NATS connection...")
-		if err := a.nc.Drain(); err != nil {
-			a.logger.Error(context.Background(), "Error draining NATS connection", "error", err.Error())
-		} else {
-			a.logger.Info(context.Background(), "NATS connection drained successfully.")
-		}
-	}
-}
-func (a *ConsumerAdapter) JetStreamContext() nats.JetStreamContext {
-	return a.js
-}
-func (a *ConsumerAdapter) NatsConn() *nats.Conn {
-	return a.nc
-}
-func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agentID string, handler nats.MsgHandler) (*nats.Subscription, error) {
-	if a.js == nil {
-		return nil, fmt.Errorf("JetStream context is not initialized")
-	}
-	subject := fmt.Sprintf("wa.%s.%s.chats", companyID, agentID)
-	queueGroup := "ws_fanout"
-	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
-		"subject", subject,
-		"queue_group", queueGroup,
-		"stream_name", a.cfgProvider.Get().NATS.StreamName,
-		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName,
-	)
-	durableName := a.cfgProvider.Get().NATS.ConsumerName
-	ackWait := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
-	if ackWait <= 0 {
-		ackWait = 30 * time.Second
-	}
-	sub, err := a.js.QueueSubscribe(
-		subject,
-		queueGroup,
-		handler,
-		nats.Durable(durableName),
-		nats.DeliverAll(),
-		nats.ManualAck(),
-		nats.AckWait(ackWait),
-		nats.MaxAckPending(a.natsMaxAckPending),
-	)
+func (c *Connection) WriteJSON(v interface{}) error {
+	payload, err := json.Marshal(v)
 	if err != nil {
-		a.logger.Error(ctx, "Failed to subscribe to NATS subject",
-			"subject", subject,
-			"queue_group", queueGroup,
-			"durable_name", durableName,
-			"error", err.Error(),
-		)
-		return nil, fmt.Errorf("failed to subscribe to NATS subject %s: %w", subject, err)
+		c.logger.Error(c.connCtx, "Failed to marshal JSON for WriteJSON", "error", err.Error())
+		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-	a.logger.Info(ctx, "Successfully subscribed to NATS subject with queue group",
-		"subject", subject,
-		"queue_group", queueGroup,
-		"durable_name", durableName,
-	)
-	return sub, nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ctxToWrite := c.connCtx
+	var cancel context.CancelFunc
+	if c.writeTimeoutSeconds > 0 {
+		ctxToWrite, cancel = context.WithTimeout(c.connCtx, time.Duration(c.writeTimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+	return c.wsConn.Write(ctxToWrite, websocket.MessageText, payload)
 }
-func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler nats.MsgHandler) (*nats.Subscription, error) {
-	if a.js == nil {
-		return nil, fmt.Errorf("JetStream context is not initialized")
-	}
-	subject := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
-	subject = fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
-	queueGroup := "ws_fanout"
-	durableName := a.cfgProvider.Get().NATS.ConsumerName
-	ackWaitMessages := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
-	if ackWaitMessages <= 0 {
-		ackWaitMessages = 30 * time.Second
-	}
-	a.logger.Info(ctx, "Attempting to subscribe to NATS chat messages subject",
-		"subject", subject,
-		"queue_group", queueGroup,
-		"durable_name", durableName,
-	)
-	sub, err := a.js.QueueSubscribe(
-		subject,
-		queueGroup,
-		handler,
-		nats.Durable(durableName+"_messages"),
-		nats.DeliverAll(),
-		nats.ManualAck(),
-		nats.AckWait(ackWaitMessages),
-		nats.MaxAckPending(a.natsMaxAckPending),
-	)
-	if err != nil {
-		a.logger.Error(ctx, "Failed to subscribe to NATS chat messages subject",
-			"subject", subject,
-			"queue_group", queueGroup,
-			"durable_name", durableName+"_messages",
-			"error", err.Error(),
-		)
-		return nil, fmt.Errorf("failed to subscribe to NATS chat messages subject %s: %w", subject, err)
-	}
-	a.logger.Info(ctx, "Successfully subscribed to NATS chat messages subject",
-		"subject", subject,
-		"queue_group", queueGroup,
-		"durable_name", durableName+"_messages",
-	)
-	return sub, nil
+func (c *Connection) ReadMessage(ctx context.Context) (websocket.MessageType, []byte, error) {
+	return c.wsConn.Read(ctx)
 }
-func ParseNATSMessageSubject(subject string) (companyID, agentID, chatID string, err error) {
-	parts := strings.Split(subject, ".")
-	if len(parts) != 5 || parts[0] != "wa" || parts[3] != "messages" {
-		err = fmt.Errorf("invalid NATS message subject format: %s", subject)
-		return
-	}
-	companyID = parts[1]
-	agentID = parts[2]
-	chatID = parts[4]
-	if companyID == "" || agentID == "" || chatID == "" {
-		err = fmt.Errorf("empty companyID, agentID, or chatID in NATS subject: %s", subject)
-		return
-	}
-	return
+func (c *Connection) RemoteAddr() string {
+	return c.remoteAddrStr
 }
-func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler nats.MsgHandler) (*nats.Subscription, error) {
-	if a.js == nil {
-		return nil, fmt.Errorf("JetStream context is not initialized")
-	}
-	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
-	queueGroup := "ws_fanout_admin"
-	queueGroup = "ws_fanout"
-	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
-		"subject", subject,
-		"queue_group", queueGroup,
-		"stream_name", a.cfgProvider.Get().NATS.StreamName,
-		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName,
-	)
-	durableName := a.cfgProvider.Get().NATS.ConsumerName
-	ackWaitAdmin := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
-	if ackWaitAdmin <= 0 {
-		ackWaitAdmin = 30 * time.Second
-	}
-	sub, err := a.js.QueueSubscribe(
-		subject,
-		queueGroup,
-		handler,
-		nats.Durable(durableName+"_admin_agents"),
-		nats.DeliverAll(),
-		nats.ManualAck(),
-		nats.AckWait(ackWaitAdmin),
-		nats.MaxAckPending(a.natsMaxAckPending),
-	)
-	if err != nil {
-		a.logger.Error(ctx, "Failed to subscribe to NATS agent events subject",
-			"subject", subject,
-			"queue_group", queueGroup,
-			"durable_name", durableName+"_admin_agents",
-			"error", err.Error(),
-		)
-		return nil, fmt.Errorf("failed to subscribe to NATS agent events subject %s: %w", subject, err)
-	}
-	a.logger.Info(ctx, "Successfully subscribed to NATS agent events subject with queue group",
-		"subject", subject,
-		"queue_group", queueGroup,
-		"durable_name", durableName+"_admin_agents",
-	)
-	return sub, nil
+func (c *Connection) UnderlyingConn() *websocket.Conn {
+	return c.wsConn
 }
-```
-
-## File: internal/application/session_locking.go
-```go
-package application
-import (
-	"context"
-	"fmt"
-	"time"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-)
-func (cm *ConnectionManager) SessionLocker() domain.SessionLockManager {
-	return cm.sessionLocker
+func (c *Connection) LastPongTime() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastPongTime
 }
-func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, companyID, agentID, userID string) (bool, error) {
-	cfg := cm.configProvider.Get()
-	podID := cfg.Server.PodID
-	if podID == "" {
-		cm.logger.Error(ctx, "PodID is not configured. Session locking/notification will not work correctly.", "operation", "AcquireSessionLockOrNotify")
-		return false, fmt.Errorf("podID is not configured")
-	}
-	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-	sessionTTL := time.Duration(cfg.App.SessionTTLSeconds) * time.Second
-	cm.logger.Info(ctx, "Attempting to acquire session lock",
-		"sessionKey", sessionKey,
-		"podID", podID,
-		"ttlSeconds", sessionTTL.Seconds(),
-	)
-	acquired, err := cm.sessionLocker.AcquireLock(ctx, sessionKey, podID, sessionTTL)
-	if err != nil {
-		cm.logger.Error(ctx, "Failed to acquire session lock from store",
-			"error", err.Error(),
-			"sessionKey", sessionKey,
-		)
-		return false, fmt.Errorf("failed to acquire session lock: %w", err)
-	}
-	if acquired {
-		cm.logger.Info(ctx, "Session lock acquired successfully",
-			"sessionKey", sessionKey,
-			"podID", podID,
-		)
-		return true, nil
-	}
-	cm.logger.Warn(ctx, "Failed to acquire session lock (already held). Publishing kill message.",
-		"sessionKey", sessionKey,
-		"newPodIDAttempting", podID,
-	)
-	killChannel := rediskeys.SessionKillChannelKey(companyID, agentID, userID)
-	killMsg := domain.KillSwitchMessage{NewPodID: podID}
-	if pubErr := cm.killSwitchPublisher.PublishSessionKill(ctx, killChannel, killMsg); pubErr != nil {
-		cm.logger.Error(ctx, "Failed to publish session kill message",
-			"channel", killChannel,
-			"error", pubErr.Error(),
-		)
-	}
-	cm.logger.Info(ctx, "Attempting retry for session lock acquisition after kill message", "sessionKey", sessionKey)
-	retryDelayMs := cfg.App.SessionLockRetryDelayMs
-	if retryDelayMs <= 0 {
-		retryDelayMs = 250
-		cm.logger.Warn(ctx, "SessionLockRetryDelayMs not configured or invalid, defaulting", "default_ms", retryDelayMs, "sessionKey", sessionKey)
-	}
-	retryDelayDuration := time.Duration(retryDelayMs) * time.Millisecond
-	select {
-	case <-time.After(retryDelayDuration):
-		cm.logger.Debug(ctx, "Retry delay completed", "sessionKey", sessionKey, "delay", retryDelayDuration)
-	case <-ctx.Done():
-		cm.logger.Warn(ctx, "Context cancelled during retry delay for session lock", "sessionKey", sessionKey, "error", ctx.Err())
-		return false, ctx.Err()
-	}
-	cm.logger.Info(ctx, "Retrying AcquireLock (SETNX) for session", "sessionKey", sessionKey, "podID", podID)
-	acquired, err = cm.sessionLocker.AcquireLock(ctx, sessionKey, podID, sessionTTL)
-	if err != nil {
-		cm.logger.Error(ctx, "Failed to retry AcquireLock (SETNX)", "sessionKey", sessionKey, "error", err.Error())
-		return false, fmt.Errorf("failed to retry AcquireLock (SETNX): %w", err)
-	}
-	if acquired {
-		cm.logger.Info(ctx, "Session lock acquired successfully on SETNX retry", "sessionKey", sessionKey, "podID", podID)
-		return true, nil
-	}
-	cm.logger.Warn(ctx, "SETNX retry failed. Attempting ForceAcquireLock (SET) for session.", "sessionKey", sessionKey, "podID", podID)
-	acquired, err = cm.sessionLocker.ForceAcquireLock(ctx, sessionKey, podID, sessionTTL)
-	if err != nil {
-		cm.logger.Error(ctx, "Failed to ForceAcquireLock (SET)", "sessionKey", sessionKey, "error", err.Error())
-		return false, fmt.Errorf("failed to ForceAcquireLock (SET): %w", err)
-	}
-	if acquired {
-		cm.logger.Info(ctx, "Session lock acquired successfully using ForceAcquireLock (SET)", "sessionKey", sessionKey, "podID", podID)
-		return true, nil
-	}
-	cm.logger.Error(ctx, "All attempts to acquire session lock failed, including ForceAcquireLock.", "sessionKey", sessionKey)
-	return false, fmt.Errorf("all attempts to acquire session lock failed for key %s", sessionKey)
+func (c *Connection) UpdateLastPongTime() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastPongTime = time.Now()
 }
-func (cm *ConnectionManager) AcquireAdminSessionLockOrNotify(ctx context.Context, adminID string) (bool, error) {
-	cfg := cm.configProvider.Get()
-	podID := cfg.Server.PodID
-	if podID == "" {
-		cm.logger.Error(ctx, "PodID is not configured. Admin session locking will not work correctly.", "operation", "AcquireAdminSessionLockOrNotify")
-		return false, fmt.Errorf("podID is not configured")
+func (c *Connection) Ping(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ctxToWrite := c.connCtx
+	var cancel context.CancelFunc
+	if c.writeTimeoutSeconds > 0 {
+		ctxToWrite, cancel = context.WithTimeout(c.connCtx, time.Duration(c.writeTimeoutSeconds)*time.Second)
+		defer cancel()
 	}
-	adminSessionKey := rediskeys.AdminSessionKey(adminID)
-	sessionTTL := time.Duration(cfg.App.SessionTTLSeconds) * time.Second
-	cm.logger.Info(ctx, "Attempting to acquire admin session lock",
-		"adminSessionKey", adminSessionKey,
-		"podID", podID,
-		"ttlSeconds", sessionTTL.Seconds(),
-	)
-	acquired, err := cm.sessionLocker.AcquireLock(ctx, adminSessionKey, podID, sessionTTL)
-	if err != nil {
-		cm.logger.Error(ctx, "Failed to acquire admin session lock from store", "error", err.Error(), "adminSessionKey", adminSessionKey)
-		return false, fmt.Errorf("failed to acquire admin session lock: %w", err)
-	}
-	if acquired {
-		cm.logger.Info(ctx, "Admin session lock acquired successfully", "adminSessionKey", adminSessionKey, "podID", podID)
-		return true, nil
-	}
-	cm.logger.Warn(ctx, "Failed to acquire admin session lock (already held). Publishing admin kill message.",
-		"adminSessionKey", adminSessionKey,
-		"newPodIDAttempting", podID,
-	)
-	killChannel := rediskeys.AdminSessionKillChannelKey(adminID)
-	killMsg := domain.KillSwitchMessage{NewPodID: podID}
-	if pubErr := cm.killSwitchPublisher.PublishSessionKill(ctx, killChannel, killMsg); pubErr != nil {
-		cm.logger.Error(ctx, "Failed to publish admin session kill message", "channel", killChannel, "error", pubErr.Error())
-	}
-	cm.logger.Info(ctx, "Attempting retry for admin session lock acquisition after kill message", "adminSessionKey", adminSessionKey)
-	retryDelayMs := cfg.App.SessionLockRetryDelayMs
-	if retryDelayMs <= 0 {
-		retryDelayMs = 250
-		cm.logger.Warn(ctx, "SessionLockRetryDelayMs not configured or invalid for admin, defaulting", "default_ms", retryDelayMs, "adminSessionKey", adminSessionKey)
-	}
-	retryDelayDuration := time.Duration(retryDelayMs) * time.Millisecond
-	select {
-	case <-time.After(retryDelayDuration):
-		cm.logger.Debug(ctx, "Admin retry delay completed", "adminSessionKey", adminSessionKey, "delay", retryDelayDuration)
-	case <-ctx.Done():
-		cm.logger.Warn(ctx, "Context cancelled during retry delay for admin session lock", "adminSessionKey", adminSessionKey, "error", ctx.Err())
-		return false, ctx.Err()
-	}
-	cm.logger.Info(ctx, "Retrying AcquireLock (SETNX) for admin session", "adminSessionKey", adminSessionKey, "podID", podID)
-	acquired, err = cm.sessionLocker.AcquireLock(ctx, adminSessionKey, podID, sessionTTL)
-	if err != nil {
-		cm.logger.Error(ctx, "Failed to retry AcquireLock (SETNX) for admin session", "adminSessionKey", adminSessionKey, "error", err.Error())
-		return false, fmt.Errorf("failed to retry AcquireLock (SETNX) for admin: %w", err)
-	}
-	if acquired {
-		cm.logger.Info(ctx, "Admin session lock acquired successfully on SETNX retry", "adminSessionKey", adminSessionKey, "podID", podID)
-		return true, nil
-	}
-	cm.logger.Warn(ctx, "Admin SETNX retry failed. Attempting ForceAcquireLock (SET) for admin session.", "adminSessionKey", adminSessionKey, "podID", podID)
-	acquired, err = cm.sessionLocker.ForceAcquireLock(ctx, adminSessionKey, podID, sessionTTL)
-	if err != nil {
-		cm.logger.Error(ctx, "Failed to ForceAcquireLock (SET) for admin session", "adminSessionKey", adminSessionKey, "error", err.Error())
-		return false, fmt.Errorf("failed to ForceAcquireLock (SET) for admin: %w", err)
-	}
-	if acquired {
-		cm.logger.Info(ctx, "Admin session lock acquired successfully using ForceAcquireLock (SET)", "adminSessionKey", adminSessionKey, "podID", podID)
-		return true, nil
-	}
-	cm.logger.Error(ctx, "All attempts to acquire admin session lock failed, including ForceAcquireLock.", "adminSessionKey", adminSessionKey)
-	return false, fmt.Errorf("all attempts to acquire admin session lock failed for key %s", adminSessionKey)
+	return c.wsConn.Ping(ctxToWrite)
+}
+func (c *Connection) GetCurrentChatID() string {
+	c.currentChatIDMu.Lock()
+	defer c.currentChatIDMu.Unlock()
+	return c.currentChatID
+}
+func (c *Connection) SetCurrentChatID(chatID string) {
+	c.currentChatIDMu.Lock()
+	defer c.currentChatIDMu.Unlock()
+	c.currentChatID = chatID
 }
 ```
 
 ## File: internal/domain/auth.go
 ```go
 package domain
-import "time"
+import (
+	"fmt"
+	"time"
+)
 type AuthenticatedUserContext struct {
 	CompanyID string    `json:"company_id"`
 	AgentID   string    `json:"agent_id"`
 	UserID    string    `json:"user_id"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Token     string    `json:"-"`
+}
+func (auc *AuthenticatedUserContext) Validate() error {
+	if auc.CompanyID == "" || auc.AgentID == "" || auc.UserID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (company_id, agent_id, user_id, expires_at)")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("token expired at %v", auc.ExpiresAt)
+	}
+	return nil
 }
 type AdminUserContext struct {
 	AdminID              string `json:"admin_id"`
@@ -2593,6 +2395,113 @@ type AdminUserContext struct {
 	SubscribedAgentID   string    `json:"subscribed_agent_id,omitempty"`
 	ExpiresAt           time.Time `json:"expires_at"`
 	Token               string    `json:"-"`
+}
+func (auc *AdminUserContext) Validate() error {
+	if auc.AdminID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (admin_id, expires_at) in admin token")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("admin token expired at %v", auc.ExpiresAt)
+	}
+	return nil
+}
+```
+
+## File: internal/domain/errors.go
+```go
+package domain
+import (
+	"encoding/json"
+	"net/http"
+	"github.com/coder/websocket"
+)
+type ErrorCode string
+const (
+	ErrInvalidAPIKey       ErrorCode = "InvalidAPIKey"
+	ErrInvalidToken        ErrorCode = "InvalidToken"
+	ErrSessionConflict     ErrorCode = "SessionConflict"
+	ErrSubscriptionFailure ErrorCode = "SubscriptionFailure"
+	ErrRateLimitExceeded   ErrorCode = "RateLimitExceeded"
+	ErrBadRequest          ErrorCode = "BadRequest"
+	ErrInternal            ErrorCode = "InternalServerError"
+	ErrMethodNotAllowed    ErrorCode = "E4005"
+	ErrUnauthorized ErrorCode = "E4001"
+	ErrForbidden    ErrorCode = "E4003"
+)
+type ErrorResponse struct {
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+	Details string    `json:"details,omitempty"`
+}
+func NewErrorResponse(code ErrorCode, message string, details string) ErrorResponse {
+	return ErrorResponse{
+		Code:    code,
+		Message: message,
+		Details: details,
+	}
+}
+func (er ErrorResponse) WriteJSON(w http.ResponseWriter, httpStatusCode int) {
+	w.Header().Set("Content-Type", "application/json")
+	if httpStatusCode <= 0 {
+		httpStatusCode = er.ToHTTPStatus()
+	}
+	w.WriteHeader(httpStatusCode)
+	json.NewEncoder(w).Encode(er)
+}
+func (er ErrorResponse) ToWebSocketCloseCode() websocket.StatusCode {
+	switch er.Code {
+	case ErrInvalidAPIKey:
+		return websocket.StatusCode(4401)
+	case ErrInvalidToken, ErrUnauthorized, ErrForbidden:
+		return websocket.StatusCode(4403)
+	case ErrSessionConflict:
+		return websocket.StatusCode(4402)
+	case ErrRateLimitExceeded:
+		return websocket.StatusCode(4429)
+	case ErrBadRequest, ErrMethodNotAllowed:
+		return websocket.StatusCode(4400)
+	case ErrInternal, ErrSubscriptionFailure:
+		return websocket.StatusCode(1011)
+	default:
+		return websocket.StatusCode(1011)
+	}
+}
+func (er ErrorResponse) ToHTTPStatus() int {
+	switch er.Code {
+	case ErrInvalidAPIKey, ErrUnauthorized:
+		return http.StatusUnauthorized
+	case ErrInvalidToken, ErrForbidden:
+		return http.StatusForbidden
+	case ErrSessionConflict:
+		return http.StatusConflict
+	case ErrRateLimitExceeded:
+		return http.StatusTooManyRequests
+	case ErrBadRequest:
+		return http.StatusBadRequest
+	case ErrMethodNotAllowed:
+		return http.StatusMethodNotAllowed
+	case ErrInternal, ErrSubscriptionFailure:
+		return http.StatusInternalServerError
+	default:
+		return http.StatusInternalServerError
+	}
+}
+```
+
+## File: internal/domain/websocket.go
+```go
+package domain
+import (
+	"context"
+	"github.com/coder/websocket"
+)
+type ManagedConnection interface {
+	Close(statusCode websocket.StatusCode, reason string) error
+	CloseWithError(errResp ErrorResponse, reason string) error
+	WriteJSON(v interface{}) error
+	RemoteAddr() string
+	Context() context.Context
+	GetCurrentChatID() string
 }
 ```
 
@@ -2647,282 +2556,6 @@ require (
 )
 ```
 
-## File: internal/adapters/websocket/admin_handler.go
-```go
-package websocket
-import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"net/http"
-	"strings"
-	"time"
-	"github.com/coder/websocket"
-	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
-)
-type AdminHandler struct {
-	logger         domain.Logger
-	configProvider config.Provider
-	connManager    *application.ConnectionManager
-	natsAdapter    *appnats.ConsumerAdapter
-}
-func NewAdminHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *AdminHandler {
-	return &AdminHandler{
-		logger:         logger,
-		configProvider: cfgProvider,
-		connManager:    connManager,
-		natsAdapter:    natsAdapter,
-	}
-}
-func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	adminCtx, ok := r.Context().Value(contextkeys.AdminUserContextKey).(*domain.AdminUserContext)
-	if !ok || adminCtx == nil {
-		h.logger.Error(r.Context(), "AdminUserContext not found after middleware chain for /ws/admin")
-		domain.NewErrorResponse(domain.ErrInternal, "Authentication context missing", "Server configuration error.").WriteJSON(w, http.StatusInternalServerError)
-		return
-	}
-	h.logger.Info(r.Context(), "/ws/admin endpoint hit by admin", "admin_id", adminCtx.AdminID)
-	adminSessionKey := rediskeys.AdminSessionKey(adminCtx.AdminID)
-	currentPodID := h.configProvider.Get().Server.PodID
-	lockAcqCtx, lockAcqCancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer lockAcqCancel()
-	acquired, err := h.connManager.AcquireAdminSessionLockOrNotify(lockAcqCtx, adminCtx.AdminID)
-	if err != nil {
-		h.logger.Error(r.Context(), "Failed during admin session lock acquisition attempt via ConnectionManager", "error", err, "admin_id", adminCtx.AdminID)
-		domain.NewErrorResponse(domain.ErrInternal, "Failed to process admin session.", err.Error()).WriteJSON(w, http.StatusInternalServerError)
-		return
-	}
-	if !acquired {
-		h.logger.Warn(r.Context(), "Admin session lock not acquired (conflict)", "admin_id", adminCtx.AdminID)
-		metrics.IncrementSessionConflicts("admin")
-		domain.NewErrorResponse(domain.ErrSessionConflict, "Admin session already active elsewhere.", "").WriteJSON(w, http.StatusConflict)
-		return
-	}
-	h.logger.Info(r.Context(), "Admin session lock successfully acquired", "admin_session_key", adminSessionKey)
-	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(r.Context())
-	var wrappedConn *Connection
-	startTime := time.Now()
-	opts := websocket.AcceptOptions{
-		Subprotocols: []string{"json.v1"},
-		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
-			if wrappedConn != nil {
-				h.logger.Debug(wrappedConn.Context(), "Admin Pong received")
-				wrappedConn.UpdateLastPongTime()
-			}
-		},
-	}
-	c, err := websocket.Accept(w, r, &opts)
-	if err != nil {
-		h.logger.Error(r.Context(), "Admin WebSocket upgrade failed", "error", err, "admin_id", adminCtx.AdminID)
-		if currentPodID != "" {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer releaseCancel()
-			// This should use the actual podID that acquired the lock
-			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
-				h.logger.Error(r.Context(), "Failed to release admin session lock after upgrade failure", "sessionKey", adminSessionKey, "error", releaseErr)
-			} else if released {
-				h.logger.Info(r.Context(), "Successfully released admin session lock after upgrade failure", "sessionKey", adminSessionKey)
-			}
-		}
-		cancelWsConnLifetimeCtx()
-		return
-	}
-	metrics.IncrementConnectionsTotal()
-	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
-	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
-		"remoteAddr", wrappedConn.RemoteAddr(),
-		"subprotocol", c.Subprotocol(),
-		"admin_id", adminCtx.AdminID,
-		"admin_session_key", adminSessionKey,
-	)
-	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "") // Pass empty strings for company/agent for admin conns
-	defer func() {
-		h.logger.Info(wrappedConn.Context(), "Admin connection management goroutine finished. Deregistering admin connection.", "admin_session_key", adminSessionKey)
-		duration := time.Since(startTime).Seconds()
-		metrics.ObserveConnectionDuration(duration)
-		h.connManager.DeregisterConnection(adminSessionKey)
-		if currentPodID != "" {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer releaseCancel()
-			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
-				h.logger.Error(wrappedConn.Context(), "Failed to release admin session lock on connection close", "admin_session_key", adminSessionKey, "error", releaseErr)
-			} else if released {
-				h.logger.Info(wrappedConn.Context(), "Successfully released admin session lock on connection close", "admin_session_key", adminSessionKey)
-			} else {
-				h.logger.Warn(wrappedConn.Context(), "Failed to release admin session lock on connection close (not held or value mismatch)", "admin_session_key", adminSessionKey)
-			}
-		}
-	}()
-	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("AdminWebSocketConnectionManager-%s", adminSessionKey), func() {
-		h.manageAdminConnection(wsConnLifetimeCtx, wrappedConn, adminCtx)
-	})
-}
-func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Connection, adminInfo *domain.AdminUserContext) {
-	defer conn.Close(websocket.StatusNormalClosure, "admin connection ended")
-	h.logger.Info(connCtx, "Admin WebSocket connection management started",
-		"admin_id", adminInfo.AdminID,
-		"remote_addr", conn.RemoteAddr(),
-	)
-	readyMessage := domain.NewReadyMessage()
-	if err := conn.WriteJSON(readyMessage); err != nil {
-		h.logger.Error(connCtx, "Failed to send 'ready' message to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
-		return
-	}
-	metrics.IncrementMessagesSent(domain.MessageTypeReady)
-	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
-	var natsSubscription *nats.Subscription
-	if h.natsAdapter != nil {
-		companyPattern := adminInfo.SubscribedCompanyID
-		agentPattern := adminInfo.SubscribedAgentID
-		if companyPattern == "" {
-			companyPattern = "*"
-		} // Default to wildcard if not specified
-		if agentPattern == "" {
-			agentPattern = "*"
-		} // Default to wildcard if not specified
-		natsMsgHandler := func(msg *nats.Msg) {
-			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
-			// Start: request_id handling for NATS message
-			natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
-			if natsRequestID == "" {
-				natsRequestID = uuid.NewString()
-				h.logger.Debug(connCtx, "Generated new request_id for Admin NATS message", "subject", msg.Subject, "new_request_id", natsRequestID, "admin_id", adminInfo.AdminID)
-			} else {
-				h.logger.Debug(connCtx, "Using existing request_id from Admin NATS message header", "subject", msg.Subject, "request_id", natsRequestID, "admin_id", adminInfo.AdminID)
-			}
-			msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
-			h.logger.Info(msgCtx, "Admin NATS: Received message on agent events subject",
-				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
-			)
-			var eventPayload domain.EnrichedEventPayload
-			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
-				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-				_ = msg.Ack()
-				return
-			}
-			wsMessage := domain.NewEventMessage(eventPayload)
-			if err := conn.WriteJSON(wsMessage); err != nil {
-				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-			}
-			_ = msg.Ack()
-		}
-		var subErr error
-		natsSubscription, subErr = h.natsAdapter.SubscribeToAgentEvents(connCtx, companyPattern, agentPattern, natsMsgHandler)
-		if subErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events for admin",
-				"companyPattern", companyPattern, "agentPattern", agentPattern, "error", subErr.Error(), "admin_id", adminInfo.AdminID,
-			)
-			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to agent events", subErr.Error())
-			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
-				h.logger.Error(connCtx, "Failed to send NATS subscription error to admin client", "error", sendErr.Error())
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeError)
-			}
-		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events for admin",
-				"companyPattern", companyPattern, "agentPattern", agentPattern, "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID,
-			)
-			defer func() {
-				if natsSubscription != nil {
-					h.logger.Info(connCtx, "Unsubscribing from NATS agent events for admin", "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID)
-					if unsubErr := natsSubscription.Drain(); unsubErr != nil {
-						h.logger.Error(connCtx, "Error draining NATS admin subscription", "subject", natsSubscription.Subject, "error", unsubErr.Error())
-					}
-				}
-			}()
-		}
-	} else {
-		h.logger.Warn(connCtx, "NATS adapter not available for admin handler, cannot subscribe to agent events.", "admin_id", adminInfo.AdminID)
-	}
-	appCfg := conn.config
-	pingInterval := time.Duration(appCfg.PingIntervalSeconds) * time.Second
-	pongWaitDuration := time.Duration(appCfg.PongWaitSeconds) * time.Second
-	writeTimeout := time.Duration(appCfg.WriteTimeoutSeconds) * time.Second
-	if writeTimeout <= 0 {
-		writeTimeout = 10 * time.Second
-	}
-	if pingInterval > 0 {
-		pinger := time.NewTicker(pingInterval)
-		defer pinger.Stop()
-		safego.Execute(connCtx, conn.logger, fmt.Sprintf("AdminWebSocketPinger-%s", conn.RemoteAddr()), func() {
-			for {
-				select {
-				case <-pinger.C:
-					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
-					if err := conn.Ping(pingWriteCtx); err != nil {
-						h.logger.Error(connCtx, "Failed to send ping to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
-						pingCancel()
-						conn.Close(websocket.StatusAbnormalClosure, "Admin Ping failure")
-						return
-					}
-					pingCancel()
-					h.logger.Debug(connCtx, "Sent ping to admin client", "admin_id", adminInfo.AdminID)
-					if time.Since(conn.LastPongTime()) > pongWaitDuration {
-						h.logger.Warn(connCtx, "Admin Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "admin_id", adminInfo.AdminID)
-						conn.Close(websocket.StatusPolicyViolation, "Admin Pong timeout")
-						return
-					}
-				case <-connCtx.Done():
-					h.logger.Info(connCtx, "Admin connection context done in pinger, stopping pinger.", "admin_id", adminInfo.AdminID)
-					return
-				}
-			}
-		})
-	}
-	for {
-		var readCtx context.Context
-		var cancelRead context.CancelFunc
-		if pongWaitDuration > 0 {
-			readCtx, cancelRead = context.WithTimeout(connCtx, pongWaitDuration)
-		} else {
-			readCtx = connCtx
-		}
-		msgType, p, errRead := conn.ReadMessage(readCtx)
-		if cancelRead != nil {
-			cancelRead()
-		}
-		if errRead != nil {
-			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
-				h.logger.Warn(connCtx, "Admin Pong timeout: No message received. Closing connection.", "admin_id", adminInfo.AdminID)
-				conn.Close(websocket.StatusPolicyViolation, "Admin Pong timeout")
-				return
-			}
-			closeStatus := websocket.CloseStatus(errRead)
-			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
-				h.logger.Info(connCtx, "Admin WebSocket connection closed by peer", "status_code", closeStatus, "admin_id", adminInfo.AdminID)
-			} else if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
-				h.logger.Info(connCtx, "Admin WebSocket connection context canceled.", "admin_id", adminInfo.AdminID)
-			} else if closeStatus == -1 && (strings.Contains(strings.ToLower(errRead.Error()), "eof") || strings.Contains(strings.ToLower(errRead.Error()), "closed")) {
-				h.logger.Info(connCtx, "Admin WebSocket read EOF or closed. Peer disconnected.", "admin_id", adminInfo.AdminID, "error", errRead.Error())
-			} else {
-				h.logger.Error(connCtx, "Error reading from admin WebSocket", "error", errRead.Error(), "admin_id", adminInfo.AdminID)
-			}
-			return
-		}
-		h.logger.Debug(connCtx, "Received message from admin WebSocket", "type", msgType.String(), "payload_len", len(p), "admin_id", adminInfo.AdminID)
-		if msgType == websocket.MessageText {
-			metrics.IncrementMessagesReceived("admin_text_message")
-			h.logger.Info(connCtx, "Admin client sent a text message.", "payload", string(p))
-		} else if msgType == websocket.MessageBinary {
-			metrics.IncrementMessagesReceived("admin_binary_message")
-		}
-	}
-}
-```
-
 ## File: internal/adapters/websocket/router.go
 ```go
 package websocket
@@ -2957,209 +2590,201 @@ func (r *Router) RegisterRoutes(ctx context.Context, mux *http.ServeMux) {
 }
 ```
 
-## File: internal/application/connection_manager.go
-```go
-package application
-import (
-	"sync"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type ConnectionManager struct {
-	logger               domain.Logger
-	configProvider       config.Provider
-	sessionLocker        domain.SessionLockManager
-	killSwitchPublisher  domain.KillSwitchPublisher
-	killSwitchSubscriber domain.KillSwitchSubscriber
-	routeRegistry        domain.RouteRegistry
-	activeConnections    sync.Map
-	renewalStopChan chan struct{}
-	renewalWg       sync.WaitGroup
-}
-func NewConnectionManager(
-	logger domain.Logger,
-	configProvider config.Provider,
-	sessionLocker domain.SessionLockManager,
-	killSwitchPublisher domain.KillSwitchPublisher,
-	killSwitchSubscriber domain.KillSwitchSubscriber,
-	routeRegistry domain.RouteRegistry,
-) *ConnectionManager {
-	return &ConnectionManager{
-		logger:               logger,
-		configProvider:       configProvider,
-		sessionLocker:        sessionLocker,
-		killSwitchPublisher:  killSwitchPublisher,
-		killSwitchSubscriber: killSwitchSubscriber,
-		routeRegistry:        routeRegistry,
-		activeConnections:    sync.Map{},
-		renewalStopChan:      make(chan struct{}),
-	}
-}
-func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
-	return cm.routeRegistry
-}
-```
-
-## File: internal/application/kill_switch.go
+## File: internal/application/session_locking.go
 ```go
 package application
 import (
 	"context"
 	"fmt"
-	"strings"
-	"github.com/coder/websocket"
+	"time"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 const (
-	sessionKillChannelPrefix      = "session_kill:"
-	adminSessionKillChannelPrefix = "session_kill:admin:"
+	maxSessionLockRetries   = 3
+	initialLockRetryDelayMs = 50
+	maxLockRetryDelayMs     = 500
+	lockForceAcquireDelayMs = 100
 )
-func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background()
-	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
-		"channel", channel,
-		"newPodIDInMessage", message.NewPodID,
-	)
-	currentPodID := cm.configProvider.Get().Server.PodID
-	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
-		return nil
+func (cm *ConnectionManager) SessionLocker() domain.SessionLockManager {
+	return cm.sessionLocker
+}
+func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, companyID, agentID, userID string) (bool, error) {
+	cfg := cm.configProvider.Get()
+	podID := cfg.Server.PodID
+	if podID == "" {
+		cm.logger.Error(ctx, "PodID is not configured. Session locking/notification will not work correctly.", "operation", "AcquireSessionLockOrNotify")
+		return false, fmt.Errorf("podID is not configured")
 	}
-	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
-		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
-	}
-	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
-	parts := strings.Split(partsStr, ":")
-	if len(parts) != 3 {
-		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
-		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
-	}
-	companyID, agentID, userID := parts[0], parts[1], parts[2]
 	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
+	sessionTTL := time.Duration(cfg.App.SessionTTLSeconds) * time.Second
+	cm.logger.Info(ctx, "Attempting to acquire session lock",
 		"sessionKey", sessionKey,
-		"messageNewPodID", message.NewPodID,
-		"currentPodID", currentPodID)
-	val, exists := cm.activeConnections.Load(sessionKey)
-	if !exists {
-		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
-		return nil
-	}
-	managedConn, ok := val.(domain.ManagedConnection)
-	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
-		cm.DeregisterConnection(sessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
-	}
-	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
-		"sessionKey", sessionKey,
-		"remoteAddr", managedConn.RemoteAddr(),
-		"conflictingPodID", message.NewPodID,
+		"podID", podID,
+		"ttlSeconds", sessionTTL.Seconds(),
 	)
-	if err := managedConn.Close(websocket.StatusCode(4402), "SessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
+	metrics.IncrementSessionLockAttempts("user", "initial_setnx")
+	acquired, err := cm.sessionLocker.AcquireLock(ctx, sessionKey, podID, sessionTTL)
+	if err != nil {
+		cm.logger.Error(ctx, "Failed to acquire session lock from store (initial attempt)",
+			"error", err.Error(),
 			"sessionKey", sessionKey,
-			"remoteAddr", managedConn.RemoteAddr(),
-			"error", err.Error(),
+		)
+		metrics.IncrementSessionLockFailure("user", "redis_error_initial")
+		return false, fmt.Errorf("failed to acquire session lock: %w", err)
+	}
+	if acquired {
+		cm.logger.Info(ctx, "Session lock acquired successfully (initial attempt)",
+			"sessionKey", sessionKey,
+			"podID", podID,
+		)
+		metrics.IncrementSessionLockSuccess("user", "initial_setnx")
+		return true, nil
+	}
+	cm.logger.Warn(ctx, "Failed to acquire session lock (already held). Publishing kill message and starting retry logic.",
+		"sessionKey", sessionKey,
+		"newPodIDAttempting", podID,
+	)
+	killChannel := rediskeys.SessionKillChannelKey(companyID, agentID, userID)
+	killMsg := domain.KillSwitchMessage{NewPodID: podID}
+	if pubErr := cm.killSwitchPublisher.PublishSessionKill(ctx, killChannel, killMsg); pubErr != nil {
+		cm.logger.Error(ctx, "Failed to publish session kill message",
+			"channel", killChannel,
+			"error", pubErr.Error(),
 		)
 	}
-	cm.DeregisterConnection(sessionKey)
-	return nil
+	currentDelayMs := initialLockRetryDelayMs
+	for i := 0; i < maxSessionLockRetries; i++ {
+		select {
+		case <-time.After(time.Duration(currentDelayMs) * time.Millisecond):
+			cm.logger.Info(ctx, "Retrying AcquireLock (SETNX) for session", "sessionKey", sessionKey, "podID", podID, "attempt", i+1, "delay_ms", currentDelayMs)
+			metrics.IncrementSessionLockAttempts("user", "retry_setnx")
+			acquired, err = cm.sessionLocker.AcquireLock(ctx, sessionKey, podID, sessionTTL)
+			if err != nil {
+				cm.logger.Error(ctx, fmt.Sprintf("Failed to retry AcquireLock (SETNX) on attempt %d", i+1), "sessionKey", sessionKey, "error", err.Error())
+			} else if acquired {
+				cm.logger.Info(ctx, fmt.Sprintf("Session lock acquired successfully on SETNX retry attempt %d", i+1), "sessionKey", sessionKey, "podID", podID)
+				metrics.IncrementSessionLockSuccess("user", "retry_setnx")
+				return true, nil
+			}
+			currentDelayMs *= 2
+			if currentDelayMs > maxLockRetryDelayMs {
+				currentDelayMs = maxLockRetryDelayMs
+			}
+		case <-ctx.Done():
+			cm.logger.Warn(ctx, "Context cancelled during retry delay for session lock", "sessionKey", sessionKey, "error", ctx.Err())
+			metrics.IncrementSessionLockFailure("user", "timeout_context_cancelled")
+			return false, ctx.Err()
+		}
+	}
+	cm.logger.Warn(ctx, "All SETNX retries failed. Attempting ForceAcquireLock (SET) for session after final delay.", "sessionKey", sessionKey, "podID", podID)
+	select {
+	case <-time.After(time.Duration(lockForceAcquireDelayMs) * time.Millisecond):
+		metrics.IncrementSessionLockAttempts("user", "force_set")
+		acquired, err = cm.sessionLocker.ForceAcquireLock(ctx, sessionKey, podID, sessionTTL)
+		if err != nil {
+			cm.logger.Error(ctx, "Failed to ForceAcquireLock (SET)", "sessionKey", sessionKey, "error", err.Error())
+			metrics.IncrementSessionLockFailure("user", "redis_error_force_set")
+			return false, fmt.Errorf("failed to ForceAcquireLock (SET): %w", err)
+		}
+		if acquired {
+			cm.logger.Info(ctx, "Session lock acquired successfully using ForceAcquireLock (SET)", "sessionKey", sessionKey, "podID", podID)
+			metrics.IncrementSessionLockSuccess("user", "force_set")
+			return true, nil
+		}
+	case <-ctx.Done():
+		cm.logger.Warn(ctx, "Context cancelled during final delay before ForceAcquireLock", "sessionKey", sessionKey, "error", ctx.Err())
+		metrics.IncrementSessionLockFailure("user", "timeout_context_cancelled")
+		return false, ctx.Err()
+	}
+	cm.logger.Error(ctx, "All attempts to acquire session lock failed, including ForceAcquireLock.", "sessionKey", sessionKey)
+	metrics.IncrementSessionLockFailure("user", "all_attempts_failed")
+	return false, fmt.Errorf("all attempts to acquire session lock failed for key %s", sessionKey)
 }
-func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
-	ctx := context.Background()
-	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
-		"channel", channel,
-		"newPodIDInMessage", message.NewPodID,
-	)
-	currentPodID := cm.configProvider.Get().Server.PodID
-	if message.NewPodID == currentPodID {
-		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
-		return nil
+func (cm *ConnectionManager) AcquireAdminSessionLockOrNotify(ctx context.Context, adminID string) (bool, error) {
+	cfg := cm.configProvider.Get()
+	podID := cfg.Server.PodID
+	if podID == "" {
+		cm.logger.Error(ctx, "PodID is not configured. Admin session locking will not work correctly.", "operation", "AcquireAdminSessionLockOrNotify")
+		metrics.IncrementSessionLockFailure("admin", "config_error_podid")
+		return false, fmt.Errorf("podID is not configured")
 	}
-	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
-		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
-		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
-	}
-	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
 	adminSessionKey := rediskeys.AdminSessionKey(adminID)
-	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
+	sessionTTL := time.Duration(cfg.App.SessionTTLSeconds) * time.Second
+	cm.logger.Info(ctx, "Attempting to acquire admin session lock",
 		"adminSessionKey", adminSessionKey,
-		"messageNewPodID", message.NewPodID,
-		"currentPodID", currentPodID)
-	val, exists := cm.activeConnections.Load(adminSessionKey)
-	if !exists {
-		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
-		return nil
-	}
-	managedConn, ok := val.(domain.ManagedConnection)
-	if !ok {
-		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
-		cm.DeregisterConnection(adminSessionKey)
-		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
-	}
-	logCtx := managedConn.Context()
-	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
-		"adminSessionKey", adminSessionKey,
-		"remoteAddr", managedConn.RemoteAddr(),
-		"conflictingPodID", message.NewPodID,
+		"podID", podID,
+		"ttlSeconds", sessionTTL.Seconds(),
 	)
-	if err := managedConn.Close(websocket.StatusCode(4402), "AdminSessionConflict: Session taken over by another connection"); err != nil {
-		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
-			"adminSessionKey", adminSessionKey,
-			"remoteAddr", managedConn.RemoteAddr(),
-			"error", err.Error(),
-		)
+	metrics.IncrementSessionLockAttempts("admin", "initial_setnx")
+	acquired, err := cm.sessionLocker.AcquireLock(ctx, adminSessionKey, podID, sessionTTL)
+	if err != nil {
+		cm.logger.Error(ctx, "Failed to acquire admin session lock from store (initial attempt)", "error", err.Error(), "adminSessionKey", adminSessionKey)
+		metrics.IncrementSessionLockFailure("admin", "redis_error_initial")
+		return false, fmt.Errorf("failed to acquire admin session lock: %w", err)
 	}
-	cm.DeregisterConnection(adminSessionKey)
-	return nil
-}
-func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
-		pattern := rediskeys.SessionKillChannelKey("*", "*", "*")
-		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
-			} else {
-				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
-			}
-		}
-		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
-	})
-}
-func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
-	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
-	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
-		pattern := rediskeys.AdminSessionKillChannelKey("*")
-		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
-		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
-		if err != nil {
-			if ctx.Err() == context.Canceled {
-				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
-			} else {
-				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
-			}
-		}
-		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
-	})
-}
-func (cm *ConnectionManager) StopKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
-	if cm.killSwitchSubscriber != nil {
-		return cm.killSwitchSubscriber.Close()
+	if acquired {
+		cm.logger.Info(ctx, "Admin session lock acquired successfully (initial attempt)", "adminSessionKey", adminSessionKey, "podID", podID)
+		metrics.IncrementSessionLockSuccess("admin", "initial_setnx")
+		return true, nil
 	}
-	return nil
-}
-func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
-	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
-	return nil
+	cm.logger.Warn(ctx, "Failed to acquire admin session lock (already held). Publishing admin kill message and starting retry logic.",
+		"adminSessionKey", adminSessionKey,
+		"newPodIDAttempting", podID,
+	)
+	killChannel := rediskeys.AdminSessionKillChannelKey(adminID)
+	killMsg := domain.KillSwitchMessage{NewPodID: podID}
+	if pubErr := cm.killSwitchPublisher.PublishSessionKill(ctx, killChannel, killMsg); pubErr != nil {
+		cm.logger.Error(ctx, "Failed to publish admin session kill message", "channel", killChannel, "error", pubErr.Error())
+	}
+	currentDelayMs := initialLockRetryDelayMs
+	for i := 0; i < maxSessionLockRetries; i++ {
+		select {
+		case <-time.After(time.Duration(currentDelayMs) * time.Millisecond):
+			cm.logger.Info(ctx, "Retrying AcquireLock (SETNX) for admin session", "adminSessionKey", adminSessionKey, "podID", podID, "attempt", i+1, "delay_ms", currentDelayMs)
+			metrics.IncrementSessionLockAttempts("admin", "retry_setnx")
+			acquired, err = cm.sessionLocker.AcquireLock(ctx, adminSessionKey, podID, sessionTTL)
+			if err != nil {
+				cm.logger.Error(ctx, fmt.Sprintf("Failed to retry AcquireLock (SETNX) for admin on attempt %d", i+1), "adminSessionKey", adminSessionKey, "error", err.Error())
+			} else if acquired {
+				cm.logger.Info(ctx, fmt.Sprintf("Admin session lock acquired successfully on SETNX retry attempt %d", i+1), "adminSessionKey", adminSessionKey, "podID", podID)
+				metrics.IncrementSessionLockSuccess("admin", "retry_setnx")
+				return true, nil
+			}
+			currentDelayMs *= 2
+			if currentDelayMs > maxLockRetryDelayMs {
+				currentDelayMs = maxLockRetryDelayMs
+			}
+		case <-ctx.Done():
+			cm.logger.Warn(ctx, "Context cancelled during retry delay for admin session lock", "adminSessionKey", adminSessionKey, "error", ctx.Err())
+			metrics.IncrementSessionLockFailure("admin", "timeout_context_cancelled")
+			return false, ctx.Err()
+		}
+	}
+	cm.logger.Warn(ctx, "All SETNX retries failed for admin. Attempting ForceAcquireLock (SET) after final delay.", "adminSessionKey", adminSessionKey, "podID", podID)
+	select {
+	case <-time.After(time.Duration(lockForceAcquireDelayMs) * time.Millisecond):
+		metrics.IncrementSessionLockAttempts("admin", "force_set")
+		acquired, err = cm.sessionLocker.ForceAcquireLock(ctx, adminSessionKey, podID, sessionTTL)
+		if err != nil {
+			cm.logger.Error(ctx, "Failed to ForceAcquireLock (SET) for admin session", "adminSessionKey", adminSessionKey, "error", err.Error())
+			metrics.IncrementSessionLockFailure("admin", "redis_error_force_set")
+			return false, fmt.Errorf("failed to ForceAcquireLock (SET) for admin: %w", err)
+		}
+		if acquired {
+			cm.logger.Info(ctx, "Admin session lock acquired successfully using ForceAcquireLock (SET)", "adminSessionKey", adminSessionKey, "podID", podID)
+			metrics.IncrementSessionLockSuccess("admin", "force_set")
+			return true, nil
+		}
+	case <-ctx.Done():
+		cm.logger.Warn(ctx, "Context cancelled during final delay before ForceAcquireLock for admin", "adminSessionKey", adminSessionKey, "error", ctx.Err())
+		metrics.IncrementSessionLockFailure("admin", "timeout_context_cancelled")
+		return false, ctx.Err()
+	}
+	cm.logger.Error(ctx, "All attempts to acquire admin session lock failed, including ForceAcquireLock.", "adminSessionKey", adminSessionKey)
+	metrics.IncrementSessionLockFailure("admin", "all_attempts_failed")
+	return false, fmt.Errorf("all attempts to acquire admin session lock failed for key %s", adminSessionKey)
 }
 ```
 
@@ -3283,6 +2908,763 @@ func (cm *ConnectionManager) StopResourceRenewalLoop() {
 }
 ```
 
+## File: internal/adapters/nats/consumer.go
+```go
+package nats
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+	"github.com/nats-io/nats.go"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+)
+type natsSubscriptionWrapper struct {
+	*nats.Subscription
+}
+func (nsw *natsSubscriptionWrapper) Drain() error {
+	return nsw.Subscription.Drain()
+}
+func (nsw *natsSubscriptionWrapper) IsValid() bool {
+	return nsw.Subscription.IsValid()
+}
+func (nsw *natsSubscriptionWrapper) Subject() string {
+	return nsw.Subscription.Subject
+}
+type ConsumerAdapter struct {
+	nc                *nats.Conn
+	js                nats.JetStreamContext
+	logger            domain.Logger
+	cfgProvider       config.Provider
+	appName           string
+	natsMaxAckPending int
+}
+func NewConsumerAdapter(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (*ConsumerAdapter, func(), error) {
+	appFullCfg := cfgProvider.Get()
+	natsCfg := appFullCfg.NATS
+	appName := appFullCfg.App.ServiceName
+	natsMaxAckPending := appFullCfg.App.NATSMaxAckPending
+	natsAckWaitSeconds := appFullCfg.App.NatsAckWaitSeconds
+	if natsAckWaitSeconds <= 0 {
+		natsAckWaitSeconds = 30
+		appLogger.Warn(ctx, "NatsAckWaitSeconds not configured or invalid, defaulting to 30s")
+	}
+	appLogger.Info(ctx, "Attempting to connect to NATS server", "url", natsCfg.URL)
+	natsOptions := []nats.Option{
+		nats.Name(fmt.Sprintf("%s-consumer-%s", appName, appFullCfg.Server.PodID)),
+		nats.ErrorHandler(func(c *nats.Conn, s *nats.Subscription, err error) {
+			appLogger.Error(ctx, "NATS error", "subscription", s.Subject, "error", err.Error())
+		}),
+		nats.ClosedHandler(func(c *nats.Conn) {
+			appLogger.Info(ctx, "NATS connection closed")
+		}),
+		nats.ReconnectHandler(func(c *nats.Conn) {
+			appLogger.Info(ctx, "NATS reconnected", "url", c.ConnectedUrl())
+		}),
+		nats.DisconnectErrHandler(func(c *nats.Conn, err error) {
+			appLogger.Warn(ctx, "NATS disconnected", "error", err)
+		}),
+	}
+	if natsCfg.RetryOnFailedConnect {
+		natsOptions = append(natsOptions, nats.RetryOnFailedConnect(true))
+	} else {
+	}
+	if natsCfg.MaxReconnects != 0 {
+		natsOptions = append(natsOptions, nats.MaxReconnects(natsCfg.MaxReconnects))
+	}
+	if natsCfg.ReconnectWaitSeconds > 0 {
+		natsOptions = append(natsOptions, nats.ReconnectWait(time.Duration(natsCfg.ReconnectWaitSeconds)*time.Second))
+	}
+	if natsCfg.ConnectTimeoutSeconds > 0 {
+		natsOptions = append(natsOptions, nats.Timeout(time.Duration(natsCfg.ConnectTimeoutSeconds)*time.Second))
+	}
+	if natsCfg.PingIntervalSeconds > 0 {
+		natsOptions = append(natsOptions, nats.PingInterval(time.Duration(natsCfg.PingIntervalSeconds)*time.Second))
+	}
+	if natsCfg.MaxPingsOut > 0 {
+		natsOptions = append(natsOptions, nats.MaxPingsOutstanding(natsCfg.MaxPingsOut))
+	}
+	nc, err := nats.Connect(natsCfg.URL, natsOptions...)
+	if err != nil {
+		appLogger.Error(ctx, "Failed to connect to NATS", "url", natsCfg.URL, "error", err.Error())
+		return nil, nil, fmt.Errorf("failed to connect to NATS at %s: %w", natsCfg.URL, err)
+	}
+	appLogger.Info(ctx, "Successfully connected to NATS server", "url", nc.ConnectedUrl())
+	js, err := nc.JetStream(nats.PublishAsyncMaxPending(256))
+	if err != nil {
+		appLogger.Error(ctx, "Failed to get JetStream context", "error", err.Error())
+		nc.Close()
+		return nil, nil, fmt.Errorf("failed to get JetStream context: %w", err)
+	}
+	appLogger.Info(ctx, "Successfully obtained JetStream context")
+	adapter := &ConsumerAdapter{
+		nc:                nc,
+		js:                js,
+		logger:            appLogger,
+		cfgProvider:       cfgProvider,
+		appName:           appName,
+		natsMaxAckPending: natsMaxAckPending,
+	}
+	cleanup := func() {
+		appLogger.Info(context.Background(), "Closing NATS connection...")
+		adapter.Close()
+	}
+	return adapter, cleanup, nil
+}
+func (a *ConsumerAdapter) Close() {
+	if a.nc != nil && !a.nc.IsClosed() {
+		a.logger.Info(context.Background(), "Draining NATS connection...")
+		if err := a.nc.Drain(); err != nil {
+			a.logger.Error(context.Background(), "Error draining NATS connection", "error", err.Error())
+		} else {
+			a.logger.Info(context.Background(), "NATS connection drained successfully.")
+		}
+	}
+}
+func (a *ConsumerAdapter) JetStreamContext() nats.JetStreamContext {
+	return a.js
+}
+func (a *ConsumerAdapter) NatsConn() *nats.Conn {
+	return a.nc
+}
+func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agentID string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
+	if a.js == nil {
+		return nil, fmt.Errorf("JetStream context is not initialized")
+	}
+	subject := fmt.Sprintf("wa.%s.%s.chats", companyID, agentID)
+	queueGroup := "ws_fanout"
+	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"stream_name", a.cfgProvider.Get().NATS.StreamName,
+		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName,
+	)
+	durableName := a.cfgProvider.Get().NATS.ConsumerName
+	ackWait := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
+	if ackWait <= 0 {
+		ackWait = 30 * time.Second
+	}
+	natsHandler := nats.MsgHandler(handler)
+	sub, err := a.js.QueueSubscribe(
+		subject,
+		queueGroup,
+		natsHandler,
+		nats.Durable(durableName),
+		nats.DeliverAll(),
+		nats.ManualAck(),
+		nats.AckWait(ackWait),
+		nats.MaxAckPending(a.natsMaxAckPending),
+	)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to subscribe to NATS subject",
+			"subject", subject,
+			"queue_group", queueGroup,
+			"durable_name", durableName,
+			"error", err.Error(),
+		)
+		return nil, fmt.Errorf("failed to subscribe to NATS subject %s: %w", subject, err)
+	}
+	a.logger.Info(ctx, "Successfully subscribed to NATS subject with queue group",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName,
+	)
+	return &natsSubscriptionWrapper{Subscription: sub}, nil
+}
+func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
+	if a.js == nil {
+		return nil, fmt.Errorf("JetStream context is not initialized")
+	}
+	subject := rediskeys.RouteKeyMessages(companyID, agentID, chatID)
+	subject = fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
+	queueGroup := "ws_fanout"
+	durableName := a.cfgProvider.Get().NATS.ConsumerName
+	ackWaitMessages := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
+	if ackWaitMessages <= 0 {
+		ackWaitMessages = 30 * time.Second
+	}
+	a.logger.Info(ctx, "Attempting to subscribe to NATS chat messages subject",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName,
+	)
+	natsHandler := nats.MsgHandler(handler)
+	sub, err := a.js.QueueSubscribe(
+		subject,
+		queueGroup,
+		natsHandler,
+		nats.Durable(durableName+"_messages"),
+		nats.DeliverAll(),
+		nats.ManualAck(),
+		nats.AckWait(ackWaitMessages),
+		nats.MaxAckPending(a.natsMaxAckPending),
+	)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to subscribe to NATS chat messages subject",
+			"subject", subject,
+			"queue_group", queueGroup,
+			"durable_name", durableName+"_messages",
+			"error", err.Error(),
+		)
+		return nil, fmt.Errorf("failed to subscribe to NATS chat messages subject %s: %w", subject, err)
+	}
+	a.logger.Info(ctx, "Successfully subscribed to NATS chat messages subject",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName+"_messages",
+	)
+	return &natsSubscriptionWrapper{Subscription: sub}, nil
+}
+func ParseNATSMessageSubject(subject string) (companyID, agentID, chatID string, err error) {
+	parts := strings.Split(subject, ".")
+	if len(parts) != 5 || parts[0] != "wa" || parts[3] != "messages" {
+		err = fmt.Errorf("invalid NATS message subject format: %s", subject)
+		return
+	}
+	companyID = parts[1]
+	agentID = parts[2]
+	chatID = parts[4]
+	if companyID == "" || agentID == "" || chatID == "" {
+		err = fmt.Errorf("empty companyID, agentID, or chatID in NATS subject: %s", subject)
+		return
+	}
+	return
+}
+func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDPattern, agentIDPattern string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
+	if a.js == nil {
+		return nil, fmt.Errorf("JetStream context is not initialized")
+	}
+	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
+	queueGroup := "ws_fanout"
+	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"stream_name", a.cfgProvider.Get().NATS.StreamName,
+		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName,
+	)
+	durableName := a.cfgProvider.Get().NATS.ConsumerName
+	ackWaitAdmin := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
+	if ackWaitAdmin <= 0 {
+		ackWaitAdmin = 30 * time.Second
+	}
+	natsHandler := nats.MsgHandler(handler)
+	sub, err := a.js.QueueSubscribe(
+		subject,
+		queueGroup,
+		natsHandler,
+		nats.Durable(durableName+"_admin_agents"),
+		nats.DeliverAll(),
+		nats.ManualAck(),
+		nats.AckWait(ackWaitAdmin),
+		nats.MaxAckPending(a.natsMaxAckPending),
+	)
+	if err != nil {
+		a.logger.Error(ctx, "Failed to subscribe to NATS agent events subject",
+			"subject", subject,
+			"queue_group", queueGroup,
+			"durable_name", durableName+"_admin_agents",
+			"error", err.Error(),
+		)
+		return nil, fmt.Errorf("failed to subscribe to NATS agent events subject %s: %w", subject, err)
+	}
+	a.logger.Info(ctx, "Successfully subscribed to NATS agent events subject with queue group",
+		"subject", subject,
+		"queue_group", queueGroup,
+		"durable_name", durableName+"_admin_agents",
+	)
+	return &natsSubscriptionWrapper{Subscription: sub}, nil
+}
+```
+
+## File: internal/adapters/websocket/admin_handler.go
+```go
+package websocket
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+type AdminHandler struct {
+	logger         domain.Logger
+	configProvider config.Provider
+	connManager    *application.ConnectionManager
+	natsAdapter    domain.NatsConsumer
+}
+func NewAdminHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer) *AdminHandler {
+	return &AdminHandler{
+		logger:         logger,
+		configProvider: cfgProvider,
+		connManager:    connManager,
+		natsAdapter:    natsAdapter,
+	}
+}
+func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	adminCtx, ok := r.Context().Value(contextkeys.AdminUserContextKey).(*domain.AdminUserContext)
+	if !ok || adminCtx == nil {
+		h.logger.Error(r.Context(), "AdminUserContext not found after middleware chain for /ws/admin")
+		domain.NewErrorResponse(domain.ErrInternal, "Authentication context missing", "Server configuration error.").WriteJSON(w, http.StatusInternalServerError)
+		return
+	}
+	h.logger.Info(r.Context(), "/ws/admin endpoint hit by admin", "admin_id", adminCtx.AdminID)
+	adminSessionKey := rediskeys.AdminSessionKey(adminCtx.AdminID)
+	currentPodID := h.configProvider.Get().Server.PodID
+	lockAcqCtx, lockAcqCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer lockAcqCancel()
+	acquired, err := h.connManager.AcquireAdminSessionLockOrNotify(lockAcqCtx, adminCtx.AdminID)
+	if err != nil {
+		h.logger.Error(r.Context(), "Failed during admin session lock acquisition attempt via ConnectionManager", "error", err, "admin_id", adminCtx.AdminID)
+		domain.NewErrorResponse(domain.ErrInternal, "Failed to process admin session.", err.Error()).WriteJSON(w, http.StatusInternalServerError)
+		return
+	}
+	if !acquired {
+		h.logger.Warn(r.Context(), "Admin session lock not acquired (conflict)", "admin_id", adminCtx.AdminID)
+		metrics.IncrementSessionConflicts("admin")
+		domain.NewErrorResponse(domain.ErrSessionConflict, "Admin session already active elsewhere.", "").WriteJSON(w, http.StatusConflict)
+		return
+	}
+	h.logger.Info(r.Context(), "Admin session lock successfully acquired", "admin_session_key", adminSessionKey)
+	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(r.Context())
+	var wrappedConn *Connection
+	startTime := time.Now()
+	opts := websocket.AcceptOptions{
+		Subprotocols: []string{"json.v1"},
+		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
+			if wrappedConn != nil {
+				h.logger.Debug(wrappedConn.Context(), "Admin Pong received")
+				wrappedConn.UpdateLastPongTime()
+			}
+		},
+	}
+	c, err := websocket.Accept(w, r, &opts)
+	if err != nil {
+		h.logger.Error(r.Context(), "Admin WebSocket upgrade failed", "error", err, "admin_id", adminCtx.AdminID)
+		if currentPodID != "" {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer releaseCancel()
+			// This should use the actual podID that acquired the lock
+			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
+				h.logger.Error(r.Context(), "Failed to release admin session lock after upgrade failure", "sessionKey", adminSessionKey, "error", releaseErr)
+			} else if released {
+				h.logger.Info(r.Context(), "Successfully released admin session lock after upgrade failure", "sessionKey", adminSessionKey)
+			}
+		}
+		cancelWsConnLifetimeCtx()
+		return
+	}
+	metrics.IncrementConnectionsTotal()
+	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
+	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
+		"remoteAddr", wrappedConn.RemoteAddr(),
+		"subprotocol", c.Subprotocol(),
+		"admin_id", adminCtx.AdminID,
+		"admin_session_key", adminSessionKey,
+	)
+	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "") // Pass empty strings for company/agent for admin conns
+	defer func() {
+		h.logger.Info(wrappedConn.Context(), "Admin connection management goroutine finished. Deregistering admin connection.", "admin_session_key", adminSessionKey)
+		duration := time.Since(startTime).Seconds()
+		metrics.ObserveConnectionDuration(duration)
+		h.connManager.DeregisterConnection(adminSessionKey)
+		if currentPodID != "" {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer releaseCancel()
+			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
+				h.logger.Error(wrappedConn.Context(), "Failed to release admin session lock on connection close", "admin_session_key", adminSessionKey, "error", releaseErr)
+			} else if released {
+				h.logger.Info(wrappedConn.Context(), "Successfully released admin session lock on connection close", "admin_session_key", adminSessionKey)
+			} else {
+				h.logger.Warn(wrappedConn.Context(), "Failed to release admin session lock on connection close (not held or value mismatch)", "admin_session_key", adminSessionKey)
+			}
+		}
+	}()
+	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("AdminWebSocketConnectionManager-%s", adminSessionKey), func() {
+		h.manageAdminConnection(wsConnLifetimeCtx, wrappedConn, adminCtx)
+	})
+}
+func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Connection, adminInfo *domain.AdminUserContext) {
+	defer conn.Close(websocket.StatusNormalClosure, "admin connection ended")
+	h.logger.Info(connCtx, "Admin WebSocket connection management started",
+		"admin_id", adminInfo.AdminID,
+		"remote_addr", conn.RemoteAddr(),
+	)
+	readyMessage := domain.NewReadyMessage()
+	if err := conn.WriteJSON(readyMessage); err != nil {
+		h.logger.Error(connCtx, "Failed to send 'ready' message to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
+		return
+	}
+	metrics.IncrementMessagesSent(domain.MessageTypeReady)
+	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
+	var natsSubscription domain.NatsMessageSubscription
+	if h.natsAdapter != nil {
+		companyPattern := adminInfo.SubscribedCompanyID
+		agentPattern := adminInfo.SubscribedAgentID
+		if companyPattern == "" {
+			companyPattern = "*"
+		} // Default to wildcard if not specified
+		if agentPattern == "" {
+			agentPattern = "*"
+		} // Default to wildcard if not specified
+		natsMsgHandler := func(msg *nats.Msg) {
+			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
+			// Start: request_id handling for NATS message
+			natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
+			if natsRequestID == "" {
+				natsRequestID = uuid.NewString()
+				h.logger.Debug(connCtx, "Generated new request_id for Admin NATS message", "subject", msg.Subject, "new_request_id", natsRequestID, "admin_id", adminInfo.AdminID)
+			} else {
+				h.logger.Debug(connCtx, "Using existing request_id from Admin NATS message header", "subject", msg.Subject, "request_id", natsRequestID, "admin_id", adminInfo.AdminID)
+			}
+			msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
+			h.logger.Info(msgCtx, "Admin NATS: Received message on agent events subject",
+				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
+			)
+			var eventPayload domain.EnrichedEventPayload
+			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
+				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+				_ = msg.Ack()
+				return
+			}
+			wsMessage := domain.NewEventMessage(eventPayload)
+			if err := conn.WriteJSON(wsMessage); err != nil {
+				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+			}
+			_ = msg.Ack()
+		}
+		var subErr error
+		natsSubscription, subErr = h.natsAdapter.SubscribeToAgentEvents(connCtx, companyPattern, agentPattern, natsMsgHandler)
+		if subErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events for admin",
+				"companyPattern", companyPattern, "agentPattern", agentPattern, "error", subErr.Error(), "admin_id", adminInfo.AdminID,
+			)
+			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to agent events", subErr.Error())
+			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
+				h.logger.Error(connCtx, "Failed to send NATS subscription error to admin client", "error", sendErr.Error())
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeError)
+			}
+		} else {
+			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events for admin",
+				"companyPattern", companyPattern, "agentPattern", agentPattern, "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID,
+			)
+			defer func() {
+				if natsSubscription != nil {
+					h.logger.Info(connCtx, "Unsubscribing from NATS agent events for admin", "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID)
+					if unsubErr := natsSubscription.Drain(); unsubErr != nil {
+						h.logger.Error(connCtx, "Error draining NATS admin subscription", "subject", natsSubscription.Subject, "error", unsubErr.Error())
+					}
+				}
+			}()
+		}
+	} else {
+		h.logger.Warn(connCtx, "NATS adapter not available for admin handler, cannot subscribe to agent events.", "admin_id", adminInfo.AdminID)
+	}
+	appCfg := conn.config
+	pingInterval := time.Duration(appCfg.PingIntervalSeconds) * time.Second
+	pongWaitDuration := time.Duration(appCfg.PongWaitSeconds) * time.Second
+	writeTimeout := time.Duration(appCfg.WriteTimeoutSeconds) * time.Second
+	if writeTimeout <= 0 {
+		writeTimeout = 10 * time.Second
+	}
+	if pingInterval > 0 {
+		pinger := time.NewTicker(pingInterval)
+		defer pinger.Stop()
+		safego.Execute(connCtx, conn.logger, fmt.Sprintf("AdminWebSocketPinger-%s", conn.RemoteAddr()), func() {
+			for {
+				select {
+				case <-pinger.C:
+					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
+					if err := conn.Ping(pingWriteCtx); err != nil {
+						h.logger.Error(connCtx, "Failed to send admin ping", "error", err.Error(), "admin_id", adminInfo.AdminID)
+						pingCancel()
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
+						conn.CloseWithError(errResp, "Admin Ping failure")
+						return
+					}
+					pingCancel()
+					h.logger.Debug(connCtx, "Sent ping to admin client", "admin_id", adminInfo.AdminID)
+					if time.Since(conn.LastPongTime()) > pongWaitDuration {
+						h.logger.Warn(connCtx, "Admin Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "admin_id", adminInfo.AdminID)
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
+						conn.CloseWithError(errResp, "Admin Pong timeout")
+						return
+					}
+				case <-connCtx.Done():
+					h.logger.Info(connCtx, "Admin connection context done in pinger, stopping pinger.", "admin_id", adminInfo.AdminID)
+					return
+				}
+			}
+		})
+	}
+	for {
+		var readCtx context.Context
+		var cancelRead context.CancelFunc
+		if pongWaitDuration > 0 {
+			readCtx, cancelRead = context.WithTimeout(connCtx, pongWaitDuration)
+		} else {
+			readCtx = connCtx
+		}
+		msgType, p, errRead := conn.ReadMessage(readCtx)
+		if cancelRead != nil {
+			cancelRead()
+		}
+		if errRead != nil {
+			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
+				h.logger.Warn(connCtx, "Admin Pong timeout: No message received. Closing connection.", "admin_id", adminInfo.AdminID)
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within configured timeout period.")
+				conn.CloseWithError(errResp, "Admin Pong timeout")
+				return
+			}
+			closeStatus := websocket.CloseStatus(errRead)
+			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
+				h.logger.Info(connCtx, "Admin WebSocket connection closed by peer", "status_code", closeStatus, "admin_id", adminInfo.AdminID)
+			} else if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
+				h.logger.Info(connCtx, "Admin WebSocket connection context canceled.", "admin_id", adminInfo.AdminID)
+			} else if closeStatus == -1 && (strings.Contains(strings.ToLower(errRead.Error()), "eof") || strings.Contains(strings.ToLower(errRead.Error()), "closed")) {
+				h.logger.Info(connCtx, "Admin WebSocket read EOF or closed. Peer disconnected.", "admin_id", adminInfo.AdminID, "error", errRead.Error())
+			} else {
+				h.logger.Error(connCtx, "Error reading from admin WebSocket", "error", errRead.Error(), "admin_id", adminInfo.AdminID)
+			}
+			return
+		}
+		h.logger.Debug(connCtx, "Received message from admin WebSocket", "type", msgType.String(), "payload_len", len(p), "admin_id", adminInfo.AdminID)
+		if msgType == websocket.MessageText {
+			metrics.IncrementMessagesReceived("admin_text_message")
+			h.logger.Info(connCtx, "Admin client sent a text message.", "payload", string(p))
+		} else if msgType == websocket.MessageBinary {
+			metrics.IncrementMessagesReceived("admin_binary_message")
+		}
+	}
+}
+```
+
+## File: internal/application/connection_manager.go
+```go
+package application
+import (
+	"sync"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type ConnectionManager struct {
+	logger                 domain.Logger
+	configProvider         config.Provider
+	sessionLocker          domain.SessionLockManager
+	killSwitchPublisher    domain.KillSwitchPublisher
+	killSwitchSubscriber   domain.KillSwitchSubscriber
+	routeRegistry          domain.RouteRegistry
+	activeConnections      sync.Map
+	activeAdminConnections sync.Map
+	renewalStopChan chan struct{}
+	renewalWg       sync.WaitGroup
+}
+func NewConnectionManager(
+	logger domain.Logger,
+	configProvider config.Provider,
+	sessionLocker domain.SessionLockManager,
+	killSwitchPublisher domain.KillSwitchPublisher,
+	killSwitchSubscriber domain.KillSwitchSubscriber,
+	routeRegistry domain.RouteRegistry,
+) *ConnectionManager {
+	return &ConnectionManager{
+		logger:                 logger,
+		configProvider:         configProvider,
+		sessionLocker:          sessionLocker,
+		killSwitchPublisher:    killSwitchPublisher,
+		killSwitchSubscriber:   killSwitchSubscriber,
+		routeRegistry:          routeRegistry,
+		activeConnections:      sync.Map{},
+		activeAdminConnections: sync.Map{},
+		renewalStopChan:        make(chan struct{}),
+	}
+}
+func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
+	return cm.routeRegistry
+}
+```
+
+## File: internal/application/kill_switch.go
+```go
+package application
+import (
+	"context"
+	"fmt"
+	"strings"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+const (
+	sessionKillChannelPrefix      = "session_kill:"
+	adminSessionKillChannelPrefix = "session_kill:admin:"
+)
+func (cm *ConnectionManager) handleKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received user kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "User kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+	if !strings.HasPrefix(channel, sessionKillChannelPrefix) || strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleKillSwitchMessage received message on unexpected channel format or admin channel", "channel", channel)
+		return fmt.Errorf("invalid user channel format for handleKillSwitchMessage: %s", channel)
+	}
+	partsStr := strings.TrimPrefix(channel, sessionKillChannelPrefix)
+	parts := strings.Split(partsStr, ":")
+	if len(parts) != 3 {
+		cm.logger.Error(ctx, "Could not parse company/agent/user from user kill switch channel", "channel", channel, "parsedParts", partsStr)
+		return fmt.Errorf("could not parse identifiers from user channel: %s", channel)
+	}
+	companyID, agentID, userID := parts[0], parts[1], parts[2]
+	sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+	cm.logger.Info(ctx, "Processing user kill message for potential local connection termination",
+		"sessionKey", sessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+	val, exists := cm.activeConnections.Load(sessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local user connection found for session key, no action needed.", "sessionKey", sessionKey)
+		return nil
+	}
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for user session key", "sessionKey", sessionKey)
+		cm.DeregisterConnection(sessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for user key %s", sessionKey)
+	}
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local user WebSocket connection due to session conflict (taken over by another pod)",
+		"sessionKey", sessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "SessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing user WebSocket connection after session conflict",
+			"sessionKey", sessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(sessionKey)
+	return nil
+}
+func (cm *ConnectionManager) handleAdminKillSwitchMessage(channel string, message domain.KillSwitchMessage) error {
+	ctx := context.Background()
+	cm.logger.Info(ctx, "Received admin kill switch message via pub/sub",
+		"channel", channel,
+		"newPodIDInMessage", message.NewPodID,
+	)
+	currentPodID := cm.configProvider.Get().Server.PodID
+	if message.NewPodID == currentPodID {
+		cm.logger.Info(ctx, "Admin kill message originated from this pod or is for a session this pod just acquired. No action needed.", "channel", channel, "currentPodID", currentPodID)
+		return nil
+	}
+	if !strings.HasPrefix(channel, adminSessionKillChannelPrefix) {
+		cm.logger.Error(ctx, "handleAdminKillSwitchMessage received message on unexpected channel format", "channel", channel)
+		return fmt.Errorf("invalid admin channel format for handleAdminKillSwitchMessage: %s", channel)
+	}
+	adminID := strings.TrimPrefix(channel, adminSessionKillChannelPrefix)
+	adminSessionKey := rediskeys.AdminSessionKey(adminID)
+	cm.logger.Info(ctx, "Processing admin kill message for potential local admin connection termination",
+		"adminSessionKey", adminSessionKey,
+		"messageNewPodID", message.NewPodID,
+		"currentPodID", currentPodID)
+	val, exists := cm.activeConnections.Load(adminSessionKey)
+	if !exists {
+		cm.logger.Info(ctx, "No active local admin connection found for session key, no action needed.", "adminSessionKey", adminSessionKey)
+		return nil
+	}
+	managedConn, ok := val.(domain.ManagedConnection)
+	if !ok {
+		cm.logger.Error(ctx, "Found non-ManagedConnection type in activeConnections map for admin session key", "adminSessionKey", adminSessionKey)
+		cm.DeregisterConnection(adminSessionKey)
+		return fmt.Errorf("invalid type in activeConnections map for admin key %s", adminSessionKey)
+	}
+	logCtx := managedConn.Context()
+	cm.logger.Warn(logCtx, "Closing local admin WebSocket connection due to session conflict (taken over by another pod)",
+		"adminSessionKey", adminSessionKey,
+		"remoteAddr", managedConn.RemoteAddr(),
+		"conflictingPodID", message.NewPodID,
+	)
+	errResp := domain.NewErrorResponse(domain.ErrSessionConflict, "Session conflict", "Admin session taken over by another connection")
+	if err := managedConn.CloseWithError(errResp, "AdminSessionConflict: Session taken over by another connection"); err != nil {
+		cm.logger.Error(logCtx, "Error closing admin WebSocket connection after session conflict",
+			"adminSessionKey", adminSessionKey,
+			"remoteAddr", managedConn.RemoteAddr(),
+			"error", err.Error(),
+		)
+	}
+	cm.DeregisterConnection(adminSessionKey)
+	return nil
+}
+func (cm *ConnectionManager) StartKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting User KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "UserKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.SessionKillChannelKey("*", "*", "*")
+		cm.logger.Info(ctx, "User KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "User KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "User KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager User KillSwitch listener goroutine finished.")
+	})
+}
+func (cm *ConnectionManager) StartAdminKillSwitchListener(ctx context.Context) {
+	cm.logger.Info(ctx, "Starting Admin KillSwitch listener...")
+	safego.Execute(ctx, cm.logger, "AdminKillSwitchSubscriberLoop", func() {
+		pattern := rediskeys.AdminSessionKillChannelKey("*")
+		cm.logger.Info(ctx, "Admin KillSwitch listener subscribing to pattern", "pattern", pattern)
+		err := cm.killSwitchSubscriber.SubscribeToSessionKillPattern(ctx, pattern, cm.handleAdminKillSwitchMessage)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				cm.logger.Info(ctx, "Admin KillSwitch subscriber stopped due to context cancellation.")
+			} else {
+				cm.logger.Error(ctx, "Admin KillSwitch subscriber failed or terminated", "error", err.Error())
+			}
+		}
+		cm.logger.Info(ctx, "ConnectionManager Admin KillSwitch listener goroutine finished.")
+	})
+}
+func (cm *ConnectionManager) StopKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping all KillSwitch listeners (via shared subscriber Close)... ")
+	if cm.killSwitchSubscriber != nil {
+		return cm.killSwitchSubscriber.Close()
+	}
+	return nil
+}
+func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
+	cm.logger.Info(context.Background(), "Stopping Admin KillSwitch listener called - this is a no-op as StopKillSwitchListener closes the shared subscriber.")
+	return nil
+}
+```
+
 ## File: internal/application/connection_registry.go
 ```go
 package application
@@ -3355,6 +3737,7 @@ func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.StatusCode, reason string) {
 	cm.logger.Info(context.Background(), "Initiating graceful closure of all active WebSocket connections...", "code", closeCode, "reason", reason)
 	closedCount := 0
+	errResp := domain.NewErrorResponse(domain.ErrInternal, "Service shutting down", "The WebSocket service is being gracefully terminated.")
 	cm.activeConnections.Range(func(key, value interface{}) bool {
 		sessionKey, okSessionKey := key.(string)
 		conn, okConn := value.(domain.ManagedConnection)
@@ -3363,8 +3746,22 @@ func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.S
 			return true
 		}
 		cm.logger.Info(conn.Context(), "Sending close frame to WebSocket connection", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
-		if err := conn.Close(closeCode, reason); err != nil {
+		if err := conn.CloseWithError(errResp, reason); err != nil {
 			cm.logger.Warn(conn.Context(), "Error sending close frame during graceful shutdown (will be forcibly closed)", "sessionKey", sessionKey, "error", err.Error())
+		}
+		closedCount++
+		return true
+	})
+	cm.activeAdminConnections.Range(func(key, value interface{}) bool {
+		adminSessionKey, okSessionKey := key.(string)
+		conn, okConn := value.(domain.ManagedConnection)
+		if !okSessionKey || !okConn {
+			cm.logger.Error(context.Background(), "Invalid type in activeAdminConnections map during graceful shutdown", "key_type", fmt.Sprintf("%T", key), "value_type", fmt.Sprintf("%T", value))
+			return true
+		}
+		cm.logger.Info(conn.Context(), "Sending close frame to admin WebSocket connection", "adminSessionKey", adminSessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+		if err := conn.CloseWithError(errResp, reason); err != nil {
+			cm.logger.Warn(conn.Context(), "Error sending close frame to admin connection during graceful shutdown (will be forcibly closed)", "adminSessionKey", adminSessionKey, "error", err.Error())
 		}
 		closedCount++
 		return true
@@ -3668,18 +4065,19 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
-	consumerAdapter, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger, routeRegistry)
+	natsConsumer, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger)
 	if err != nil {
 		cleanup2()
 		cleanup()
 		return nil, nil, err
 	}
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
+	messageForwarder := MessageForwarderProvider(domainLogger, provider)
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, routeRegistry, messageForwarder)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
-	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, consumerAdapter)
-	conn := NatsConnectionProvider(consumerAdapter)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, consumerAdapter, adminAuthMiddleware, adminHandler, conn, client)
+	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
+	conn := NatsConnectionProvider(natsConsumer)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()
@@ -3710,12 +4108,12 @@ import (
 	"time"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 )
 func (a *App) Run(ctx context.Context) error {
 	version := "unknown"
@@ -3921,6 +4319,7 @@ import (
 	"os"
 	"time"
 	"github.com/google/wire"
+	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -3933,7 +4332,6 @@ import (
 	wsadapter "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"github.com/nats-io/nats.go"
 )
 type TokenGenerationMiddleware func(http.Handler) http.Handler
 type AdminAuthMiddleware func(http.Handler) http.Handler
@@ -3966,7 +4364,7 @@ type App struct {
 	tokenGenerationMiddleware TokenGenerationMiddleware
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
-	natsConsumerAdapter       *appnats.ConsumerAdapter
+	natsConsumerAdapter       domain.NatsConsumer
 	adminAuthMiddleware       AdminAuthMiddleware
 	adminWsHandler            *wsadapter.AdminHandler
 	natsConn                  *nats.Conn
@@ -3983,7 +4381,7 @@ func NewApp(
 	tokenGenMiddleware TokenGenerationMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
-	natsAdapter *appnats.ConsumerAdapter,
+	natsAdapter domain.NatsConsumer,
 	adminAuthMid AdminAuthMiddleware,
 	adminHandler *wsadapter.AdminHandler,
 	natsConn *nats.Conn,
@@ -4064,11 +4462,11 @@ func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger d
 func AdminAuthMiddlewareProvider(authService *application.AuthService, logger domain.Logger) AdminAuthMiddleware {
 	return middleware.AdminAuthMiddleware(authService, logger)
 }
-func AdminWebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *wsadapter.AdminHandler {
+func AdminWebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer) *wsadapter.AdminHandler {
 	return wsadapter.NewAdminHandler(logger, cfgProvider, connManager, natsAdapter)
 }
-func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *wsadapter.Handler {
-	return wsadapter.NewHandler(logger, cfgProvider, connManager, natsAdapter)
+func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *wsadapter.Handler {
+	return wsadapter.NewHandler(logger, cfgProvider, connManager, natsAdapter, routeRegistry, messageForwarder)
 }
 func WebsocketRouterProvider(logger domain.Logger, cfgProvider config.Provider, authService *application.AuthService, wsHandler *wsadapter.Handler) *wsadapter.Router {
 	return wsadapter.NewRouter(logger, cfgProvider, authService, wsHandler)
@@ -4117,8 +4515,12 @@ func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) do
 func AdminTokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.AdminTokenCacheStore {
 	return appredis.NewAdminTokenCacheAdapter(redisClient, logger)
 }
-func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger, routeRegistry domain.RouteRegistry) (*appnats.ConsumerAdapter, func(), error) {
-	return appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger, routeRegistry)
+func NatsConsumerAdapterProvider(ctx context.Context, cfgProvider config.Provider, appLogger domain.Logger) (domain.NatsConsumer, func(), error) {
+	adapter, cleanup, err := appnats.NewConsumerAdapter(ctx, cfgProvider, appLogger)
+	if err != nil {
+		return nil, nil, err
+	}
+	return adapter, cleanup, nil
 }
 func RouteRegistryProvider(redisClient *redis.Client, logger domain.Logger) domain.RouteRegistry {
 	return appredis.NewRouteRegistryAdapter(redisClient, logger)
@@ -4129,11 +4531,14 @@ func GRPCMessageHandlerProvider(logger domain.Logger, connManager *application.C
 func GRPCServerProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider, grpcHandler *application.GRPCMessageHandler) (*appgrpc.Server, error) {
 	return appgrpc.NewServer(appCtx, logger, cfgProvider, grpcHandler)
 }
-func NatsConnectionProvider(adapter *appnats.ConsumerAdapter) *nats.Conn {
+func NatsConnectionProvider(adapter domain.NatsConsumer) *nats.Conn {
 	if adapter == nil {
 		return nil
 	}
 	return adapter.NatsConn()
+}
+func MessageForwarderProvider(logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
+	return appgrpc.NewForwarderAdapter(logger, cfgProvider)
 }
 var ProviderSet = wire.NewSet(
 	ConfigProvider,
@@ -4160,6 +4565,7 @@ var ProviderSet = wire.NewSet(
 	AdminWebsocketHandlerProvider,
 	AdminTokenCacheStoreProvider,
 	RouteRegistryProvider,
+	MessageForwarderProvider,
 	NewApp,
 	NatsConsumerAdapterProvider,
 	NatsConnectionProvider,
@@ -4176,7 +4582,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
@@ -4190,29 +4595,24 @@ import (
 	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 	"github.com/google/uuid"
-	dws_message_fwd "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
-	structpb "google.golang.org/protobuf/types/known/structpb"
-	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 )
 type Handler struct {
-	logger         domain.Logger
-	configProvider config.Provider
-	connManager    *application.ConnectionManager
-	natsAdapter    *appnats.ConsumerAdapter
-	grpcClientPool *sync.Map
+	logger           domain.Logger
+	configProvider   config.Provider
+	connManager      *application.ConnectionManager
+	natsAdapter      domain.NatsConsumer
+	routeRegistry    domain.RouteRegistry
+	messageForwarder domain.MessageForwarder
 }
-func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter *appnats.ConsumerAdapter) *Handler {
+func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *Handler {
 	return &Handler{
-		logger:         logger,
-		configProvider: cfgProvider,
-		connManager:    connManager,
-		natsAdapter:    natsAdapter,
-		grpcClientPool: &sync.Map{},
+		logger:           logger,
+		configProvider:   cfgProvider,
+		connManager:      connManager,
+		natsAdapter:      natsAdapter,
+		routeRegistry:    routeRegistry,
+		messageForwarder: messageForwarder,
 	}
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -4366,8 +4766,8 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	}
 	metrics.IncrementMessagesSent(domain.MessageTypeReady)
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
-	var generalNatsSubscription *nats.Subscription
-	var specificNatsSubscription *nats.Subscription
+	var generalNatsSubscription domain.NatsMessageSubscription
+	var specificNatsSubscription domain.NatsMessageSubscription
 	var currentSpecificChatID string
 	generalChatEventsNatsHandler := func(msg *nats.Msg) {
 		metrics.IncrementNatsMessagesReceived(msg.Subject)
@@ -4403,7 +4803,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				metrics.IncrementMessagesSent(domain.MessageTypeError)
 			}
 		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject)
+			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject())
 		}
 	} else {
 		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general chat events.")
@@ -4430,7 +4830,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			_ = msg.Ack()
 			return
 		}
-		ownerPodID, err := h.natsAdapter.RouteRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
+		ownerPodID, err := h.routeRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
 		if err != nil {
 			if errors.Is(err, appredis.ErrNoOwningPod) {
 				h.logger.Warn(connCtx, "No owning pod found for message route in Redis, potential race or cleanup issue. NACKing message.", "subject", msg.Subject, "chat_id_from_subject", msgChatID)
@@ -4450,7 +4850,6 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		} else {
 			isOwner = false
 			if ownerPodID == "" {
-				// This case is defensive and should ideally not be reached if GetOwningPodForMessageRoute behaves as expected (returning error for no owner).
 				h.logger.Error(connCtx, "Internal logic inconsistency: ownerPodID is empty after GetOwningPodForMessageRoute succeeded. Assuming not owner.", "subject", msg.Subject)
 			}
 		}
@@ -4472,101 +4871,22 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 			}
 		} else {
-			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop.",
+			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop via MessageForwarder.",
 				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
 			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
 				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
-				h.logger.Info(msgCtx, "Attempting to forward message via gRPC", "target_address", gprcTargetAddress)
-				var grpcConn *grpc.ClientConn
-				var errClient error
-				var connFromPool bool
-				if connVal, okPool := h.grpcClientPool.Load(gprcTargetAddress); okPool {
-					grpcConn, connFromPool = connVal.(*grpc.ClientConn)
-					if !connFromPool {
-						h.logger.Error(msgCtx, "Invalid type in gRPC client pool, removing entry.", "target_address", gprcTargetAddress, "type", fmt.Sprintf("%T", connVal))
-						h.grpcClientPool.Delete(gprcTargetAddress)
-						grpcConn = nil
+				var domainPayload domain.EnrichedEventPayload
+				if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
+					h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding (MessageForwarder)", "subject", msg.Subject, "error", errUnmarshal.Error())
+				} else {
+					if errFwd := h.messageForwarder.ForwardEvent(msgCtx, gprcTargetAddress, &domainPayload, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
+						h.logger.Error(msgCtx, "Failed to forward event via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID, "error", errFwd.Error())
 					} else {
-						connState := grpcConn.GetState()
-						if connState != connectivity.Ready && connState != connectivity.Idle {
-							h.logger.Warn(msgCtx, "Pooled gRPC connection is not Ready or Idle, discarding.", "target_address", gprcTargetAddress, "state", connState.String())
-							h.grpcClientPool.Delete(gprcTargetAddress)
-							grpcConn.Close()
-							grpcConn = nil
-							connFromPool = false
-						} else {
-							h.logger.Debug(msgCtx, "Reusing gRPC client connection from pool", "target_address", gprcTargetAddress, "state", connState.String())
-						}
-					}
-				}
-				if grpcConn == nil {
-					h.logger.Info(msgCtx, "Creating new gRPC client connection", "target_address", gprcTargetAddress)
-					connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-					newlyCreatedConn, newErrClient := grpc.NewClient(gprcTargetAddress, connOpts...)
-					if newErrClient == nil {
-						grpcConn = newlyCreatedConn
-						h.grpcClientPool.Store(gprcTargetAddress, grpcConn)
-					} else {
-						errClient = newErrClient
-					}
-				}
-				if errClient != nil {
-					h.logger.Error(msgCtx, "Failed to establish gRPC connection to owner pod",
-						"target_pod", ownerPodID, "address", gprcTargetAddress, "error", errClient.Error())
-				} else if grpcConn != nil {
-					client := dws_message_fwd.NewMessageForwardingServiceClient(grpcConn)
-					var domainPayload domain.EnrichedEventPayload
-					if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
-						h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding", "subject", msg.Subject, "error", errUnmarshal.Error())
-					} else {
-						protoData, errProtoStruct := structpb.NewStruct(domainPayload.Data.(map[string]interface{}))
-						if errProtoStruct != nil {
-							h.logger.Error(msgCtx, "Failed to convert domainPayload.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
-						} else {
-							grpcRequest := &dws_message_fwd.PushEventRequest{
-								Payload: &dws_message_fwd.EnrichedEventPayloadMessage{
-									EventId:   domainPayload.EventID,
-									EventType: domainPayload.EventType,
-									Timestamp: timestamppb.New(domainPayload.Timestamp),
-									Source:    domainPayload.Source,
-									Data:      protoData,
-								},
-								TargetCompanyId: msgCompanyID,
-								TargetAgentId:   msgAgentID,
-								TargetChatId:    msgChatID,
-								SourcePodId:     currentPodID,
-							}
-							md := metadata.New(nil)
-							if reqID, okCtxVal := msgCtx.Value(contextkeys.RequestIDKey).(string); okCtxVal && reqID != "" {
-								md.Set(string(contextkeys.RequestIDKey), reqID)
-							}
-							pushCtxWithMetadata := metadata.NewOutgoingContext(msgCtx, md)
-							grpcClientTimeoutSeconds := h.configProvider.Get().App.GRPCCLientForwardTimeoutSeconds
-							grpcClientTimeout := 5 * time.Second
-							if grpcClientTimeoutSeconds > 0 {
-								grpcClientTimeout = time.Duration(grpcClientTimeoutSeconds) * time.Second
-							}
-							pushCtx, pushCancel := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
-							resp, errPush := client.PushEvent(pushCtx, grpcRequest)
-							pushCancel()
-							if errPush != nil {
-								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod failed", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
-								if connFromPool {
-									h.grpcClientPool.Delete(gprcTargetAddress)
-									grpcConn.Close()
-									h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool", "target_address", gprcTargetAddress)
-								}
-							} else if resp != nil && !resp.Success {
-								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
-							} else if resp != nil && resp.Success {
-								h.logger.Info(msgCtx, "Successfully forwarded message via gRPC", "target_pod", ownerPodID, "event_id", domainPayload.EventID, "is_pooled_conn", connFromPool)
-								metrics.IncrementGrpcMessagesSent(ownerPodID)
-							}
-						}
+						h.logger.Info(msgCtx, "Successfully initiated event forwarding via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID)
 					}
 				}
 			} else {
-				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop, message will not be forwarded.", "subject", msg.Subject)
+				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop (MessageForwarder), message will not be forwarded.", "subject", msg.Subject)
 			}
 		}
 		if ackErr := msg.Ack(); ackErr != nil {
@@ -4574,16 +4894,16 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		}
 	}
 	defer func() {
-		if generalNatsSubscription != nil {
-			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject)
+		if generalNatsSubscription != nil && generalNatsSubscription.IsValid() {
+			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject())
 			if unsubErr := generalNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject, "error", unsubErr.Error())
+				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject(), "error", unsubErr.Error())
 			}
 		}
-		if specificNatsSubscription != nil {
-			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject, "chatID", currentSpecificChatID)
+		if specificNatsSubscription != nil && specificNatsSubscription.IsValid() {
+			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject(), "chatID", currentSpecificChatID)
 			if unsubErr := specificNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject, "error", unsubErr.Error())
+				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject(), "error", unsubErr.Error())
 			}
 		}
 	}()
@@ -4605,14 +4925,16 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					if err := conn.Ping(pingWriteCtx); err != nil {
 						h.logger.Error(connCtx, "Failed to send ping", "error", err.Error())
 						pingCancel()
-						conn.Close(websocket.StatusAbnormalClosure, "Ping failure")
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
+						conn.CloseWithError(errResp, "Ping failure")
 						return
 					}
 					pingCancel()
 					h.logger.Debug(connCtx, "Sent ping")
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
 						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "lastPong", conn.LastPongTime())
-						conn.Close(websocket.StatusPolicyViolation, "Pong timeout")
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
+						conn.CloseWithError(errResp, "Pong timeout")
 						return
 					}
 				case <-connCtx.Done():
@@ -4639,7 +4961,8 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		if errRead != nil {
 			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
 				h.logger.Warn(connCtx, "Pong timeout: No message received within pongWaitDuration. Closing connection.", "pong_wait_duration", pongWaitDuration)
-				conn.Close(websocket.StatusPolicyViolation, "Pong timeout")
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within the configured timeout period.")
+				conn.CloseWithError(errResp, "Pong timeout")
 				return
 			}
 			closeStatus := websocket.CloseStatus(errRead)
@@ -4675,7 +4998,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			switch baseMsg.Type {
 			case domain.MessageTypeSelectChat:
 				h.logger.Info(connCtx, "Handling select_chat message type")
-				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, p, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
+				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
 				if err != nil {
 					h.logger.Error(connCtx, "Error handling select_chat message", "error", err.Error())
 					errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to process chat selection", err.Error())
@@ -4701,14 +5024,13 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 func (h *Handler) handleSelectChatMessage(
 	connCtx context.Context,
 	conn *Connection,
-	rawPayload []byte,
 	companyID, agentID, userID string,
 	payloadData interface{},
-	specificChatNatsMsgHandler nats.MsgHandler,
-	currentGeneralSub *nats.Subscription,
-	currentSpecificSub *nats.Subscription,
+	specificChatNatsMsgHandler domain.NatsMessageHandler,
+	currentGeneralSub domain.NatsMessageSubscription,
+	currentSpecificSub domain.NatsMessageSubscription,
 	currentSpecificSubChatID string,
-) (*nats.Subscription, string, error) {
+) (domain.NatsMessageSubscription, string, error) {
 	payloadMap, ok := payloadData.(map[string]interface{})
 	if !ok {
 		h.logger.Error(connCtx, "Invalid payload structure for select_chat after initial unmarshal", "type_received", fmt.Sprintf("%T", payloadData))
@@ -4800,19 +5122,19 @@ func (h *Handler) handleSelectChatMessage(
 		return currentSpecificSub, oldChatID, fmt.Errorf("failed to register new message route: %w", err)
 	}
 	h.logger.Info(connCtx, "Successfully registered new message route", "newChatID", chatID)
-	if currentGeneralSub != nil {
-		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject)
+	if currentGeneralSub != nil && currentGeneralSub.IsValid() {
+		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject())
 		if err := currentGeneralSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject, "error", err.Error())
+			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject(), "error", err.Error())
 		}
 	}
-	if currentSpecificSub != nil && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID {
-		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject)
+	if currentSpecificSub != nil && currentSpecificSub.IsValid() && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID { // Added IsValid check
+		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject())
 		if err := currentSpecificSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject, "error", err.Error())
+			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject(), "error", err.Error())
 		}
 	}
-	var newSpecificSubscription *nats.Subscription
+	var newSpecificSubscription domain.NatsMessageSubscription
 	var newSubErr error
 	if h.natsAdapter != nil {
 		h.logger.Info(connCtx, "Subscribing to NATS for new chat_id", "companyID", companyID, "agentID", agentID, "new_chat_id", chatID)
@@ -4830,7 +5152,7 @@ func (h *Handler) handleSelectChatMessage(
 			conn.SetCurrentChatID(oldChatID)
 			return currentSpecificSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
 		}
-		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject)
+		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject())
 	} else {
 		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to new chat messages.", "new_chat_id", chatID)
 	}

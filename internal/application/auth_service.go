@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -63,13 +64,12 @@ func (s *AuthService) ParseAndValidateDecryptedToken(decryptedPayload []byte, ra
 		return nil, fmt.Errorf("%w: failed to unmarshal token JSON: %v", ErrTokenPayloadInvalid, err)
 	}
 
-	// Basic validation for essential fields (can be expanded)
-	if ctx.CompanyID == "" || ctx.AgentID == "" || ctx.UserID == "" || ctx.ExpiresAt.IsZero() {
-		return nil, fmt.Errorf("%w: missing essential fields (company_id, agent_id, user_id, expires_at)", ErrTokenPayloadInvalid)
-	}
-
-	if time.Now().After(ctx.ExpiresAt) {
-		return nil, fmt.Errorf("%w: token expired at %v", ErrTokenExpired, ctx.ExpiresAt)
+	if err := ctx.Validate(); err != nil {
+		// Wrap the validation error with ErrTokenPayloadInvalid or ErrTokenExpired for consistent error types from the service.
+		if strings.Contains(err.Error(), "expired") {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
 	}
 
 	ctx.Token = rawTokenB64 // Store the raw token for caching purposes
@@ -85,13 +85,15 @@ func (s *AuthService) ParseAndValidateAdminDecryptedToken(decryptedPayload []byt
 	if err != nil {
 		return nil, fmt.Errorf("%w: failed to unmarshal admin token JSON: %v", ErrTokenPayloadInvalid, err)
 	}
-	// Basic validation for essential fields
-	if adminCtx.AdminID == "" || adminCtx.ExpiresAt.IsZero() {
-		return nil, fmt.Errorf("%w: missing essential fields (admin_id, expires_at) in admin token", ErrTokenPayloadInvalid)
+
+	if err := adminCtx.Validate(); err != nil {
+		// Wrap the validation error for consistency
+		if strings.Contains(err.Error(), "expired") {
+			return nil, fmt.Errorf("%w: %v", ErrTokenExpired, err)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenPayloadInvalid, err)
 	}
-	if time.Now().After(adminCtx.ExpiresAt) {
-		return nil, fmt.Errorf("%w: admin token expired at %v", ErrTokenExpired, adminCtx.ExpiresAt)
-	}
+
 	adminCtx.Token = rawTokenB64 // Store the raw token for caching purposes
 	return &adminCtx, nil
 }

@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // AuthenticatedUserContext holds the validated and decrypted data from a company token.
 // This information is added to the request context after successful token authentication.
@@ -10,6 +13,17 @@ type AuthenticatedUserContext struct {
 	UserID    string    `json:"user_id"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Token     string    `json:"-"` // Store the raw token for caching key generation, but don't marshal to JSON
+}
+
+// Validate checks if the AuthenticatedUserContext has all essential fields and is not expired.
+func (auc *AuthenticatedUserContext) Validate() error {
+	if auc.CompanyID == "" || auc.AgentID == "" || auc.UserID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (company_id, agent_id, user_id, expires_at)")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("token expired at %v", auc.ExpiresAt)
+	}
+	return nil
 }
 
 // AdminUserContext holds the validated and decrypted data from an admin token.
@@ -23,4 +37,15 @@ type AdminUserContext struct {
 	SubscribedAgentID   string    `json:"subscribed_agent_id,omitempty"`   // Specific agent to subscribe for, or empty/"*"
 	ExpiresAt           time.Time `json:"expires_at"`
 	Token               string    `json:"-"` // Raw token for caching/logging
+}
+
+// Validate checks if the AdminUserContext has all essential fields and is not expired.
+func (auc *AdminUserContext) Validate() error {
+	if auc.AdminID == "" || auc.ExpiresAt.IsZero() {
+		return fmt.Errorf("missing essential fields (admin_id, expires_at) in admin token")
+	}
+	if time.Now().After(auc.ExpiresAt) {
+		return fmt.Errorf("admin token expired at %v", auc.ExpiresAt)
+	}
+	return nil
 }
