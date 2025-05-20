@@ -310,8 +310,8 @@ func NatsConnectionProvider(adapter domain.NatsConsumer) *nats.Conn {
 	return adapter.NatsConn()
 }
 
-func MessageForwarderProvider(logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
-	return appgrpc.NewForwarderAdapter(logger, cfgProvider)
+func MessageForwarderProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
+	return appgrpc.NewForwarderAdapter(appCtx, logger, cfgProvider)
 }
 
 // ProviderSet is the Wire provider set for the entire application.

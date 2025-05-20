@@ -193,7 +193,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metrics.IncrementConnectionsTotal() // Increment total connections on successful handshake
 
 	// Assign to wrappedConn *after* successful upgrade and *before* manageConnection so callback can use it.
-	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
+	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider, sessionKey)
 
 	h.logger.Info(wrappedConn.Context(), "WebSocket connection established",
 		"remoteAddr", wrappedConn.RemoteAddr(),
@@ -274,12 +274,13 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		var eventPayload domain.EnrichedEventPayload
 		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
 			h.logger.Error(msgCtx, "Failed to unmarshal general chat event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
-			_ = msg.Ack()
-			return
+			return // Return to let NATS redeliver after AckWait
 		}
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
+			// Do NOT ACK if WriteJSON failed
+			return // Return to let NATS redeliver after AckWait
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 		}
@@ -322,15 +323,13 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject)
 		if err != nil {
 			h.logger.Error(msgCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
-			_ = msg.Ack()
-			return
+			return // Return to let NATS redeliver after AckWait
 		}
 
 		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID == "" {
 			h.logger.Error(connCtx, "Current PodID is not configured, cannot determine message ownership.", "subject", msg.Subject)
-			_ = msg.Ack()
-			return
+			return // Return to let NATS redeliver after AckWait
 		}
 
 		ownerPodID, err := h.routeRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
@@ -340,11 +339,10 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				if nakErr := msg.Nak(); nakErr != nil {
 					h.logger.Error(connCtx, "Failed to NACK NATS message for ErrNoOwningPod", "subject", msg.Subject, "error", nakErr.Error())
 				}
-				return
+				return // Return to let NATS redeliver after AckWait
 			} else {
 				h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
-				_ = msg.Ack()
-				return
+				return // Return to let NATS redeliver after AckWait
 			}
 		}
 
@@ -364,14 +362,15 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
 				h.logger.Error(msgCtx, "Failed to unmarshal NATS message into EnrichedEventPayload (owner)",
 					"subject", msg.Subject, "error", errUnmarshal.Error(), "raw_data", string(msg.Data))
-				_ = msg.Ack()
-				return
+				return // Return to let NATS redeliver after AckWait
 			}
 			wsMessage := domain.NewEventMessage(eventPayload)
 			if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 				h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
 					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
 				)
+				// Do NOT ACK if WriteJSON failed
+				return // Return to let NATS redeliver after AckWait
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 			}
@@ -383,15 +382,24 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				var domainPayload domain.EnrichedEventPayload
 				if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
 					h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding (MessageForwarder)", "subject", msg.Subject, "error", errUnmarshal.Error())
+					// Do NOT ACK if unmarshal failed for forwarding logic consistency, let NATS redeliver.
+					// Or, if this is a permanent error, consider a dead-letter queue strategy (outside current scope).
+					return
 				} else {
 					if errFwd := h.messageForwarder.ForwardEvent(msgCtx, gprcTargetAddress, &domainPayload, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
 						h.logger.Error(msgCtx, "Failed to forward event via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID, "error", errFwd.Error())
+						// Do NOT ACK if forwarding failed
+						return // Return to let NATS redeliver
 					} else {
 						h.logger.Info(msgCtx, "Successfully initiated event forwarding via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID)
 					}
 				}
 			} else {
 				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop (MessageForwarder), message will not be forwarded.", "subject", msg.Subject)
+				// If not forwarded, and not owned locally, this message is effectively dropped by this pod.
+				// We should still ACK it to prevent NATS redelivery if this is the terminal state for this pod.
+				// However, if ErrNoOwningPod was hit earlier and NACKed, this path won't be reached for that message.
+				// Assuming if ownerPodID is empty here, it's a scenario where the message shouldn't be processed by this pod.
 			}
 		}
 

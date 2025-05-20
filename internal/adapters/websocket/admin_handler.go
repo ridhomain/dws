@@ -111,7 +111,7 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	metrics.IncrementConnectionsTotal() // Increment for admin connections too
 
-	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
+	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider, adminSessionKey)
 	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
 		"remoteAddr", wrappedConn.RemoteAddr(),
 		"subprotocol", c.Subprotocol(),

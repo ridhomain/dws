@@ -60,5 +60,15 @@ app:
   websocket_compression_mode: "disabled"  # Options: disabled, context_takeover, no_context_takeover
   websocket_compression_threshold: 1024   # Bytes, applies if mode is not disabled. 0 means no threshold.
   websocket_development_insecure_skip_verify: false # Set to true for local dev with self-signed certs ONLY
+  # New gRPC Client Pool and Circuit Breaker settings
+  grpc_pool_idle_timeout_seconds: 300             # 5 minutes
+  grpc_pool_health_check_interval_seconds: 60   # 1 minute (for proactive checks, if implemented)
+  grpc_circuitbreaker_fail_threshold: 5           # After 5 consecutive failures
+  grpc_circuitbreaker_open_duration_seconds: 30 # Circuit stays open for 30 seconds
+  # New WebSocket Backpressure settings
+  websocket_message_buffer_size: 100 # Number of messages
+  websocket_backpressure_drop_policy: "drop_oldest" # "drop_oldest" or "block"
+  websocket_slow_client_latency_ms: 5000 # Threshold for considering a client slow (not directly used yet)
+  websocket_slow_client_disconnect_threshold_ms: 30000 # Threshold for disconnecting a slow client (not directly used yet)
 
 # Config holds all configuration for the application. 

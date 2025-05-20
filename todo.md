@@ -39,3 +39,13 @@
 - **`internal/bootstrap/app.go`**: Add other checks like gRPC server health if applicable in the future
 - **`internal/adapters/nats/consumer.go`**: Add more robust connection options from config (e.g., timeouts, reconnectWait, maxReconnect)
 - **`internal/adapters/websocket/handler.go`**: Add a basic health check here if possible. For now, assume good or will error out on use.
+
+## New Todos - 2025-05-20
+
+- TODO: (Task 14.3 Follow-up) Conduct thorough testing of the advanced gRPC connection pooling features (idle timeout, health checks, circuit breaker) under various conditions (normal, failure, high load). -- Later in testing phase.
+- TODO: (Task 14.4 Follow-up) Conduct thorough testing of WebSocket message buffering and backpressure handling, especially the "drop_oldest" and "block" policies. -- Later in testing phase.
+- TODO: (Task 14.4 Follow-up) Refine or implement robust slow client detection logic for WebSocket connections. The current config fields `WebsocketSlowClientLatencyMs` and `WebsocketSlowClientDisconnectThresholdMs` are placeholders. -- SKIP, no need
+- TODO: (Task 14.4 Follow-up) Review and verify NATS ACK/NACK interaction with the WebSocket buffering. Specifically:
+    - If a message is dropped from the buffer due to `drop_oldest` policy, the NATS message should be ACKed.
+    - If `WriteJSON` uses the `block` policy and the parent context (e.g., NATS message processing context) times out or is cancelled while `WriteJSON` is blocked trying to send to the buffer, determine if the NATS message should be NACKed or allowed to time out for redelivery.
+    - Ensure that messages successfully written from the buffer to the WebSocket by the writer goroutine result in the original NATS message being ACKed (this is handled by the caller of `WriteJSON` currently, but needs to be robust if `WriteJSON` itself can block for extended periods).

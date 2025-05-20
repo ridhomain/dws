@@ -169,6 +169,7 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -178,66 +179,158 @@ import (
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 )
-type ForwarderAdapter struct {
-	logger         domain.Logger
-	configProvider config.Provider
-	grpcClientPool *sync.Map
+const (
+	defaultGRPCPoolIdleTimeout             = 300 * time.Second
+	defaultGRPCPoolHealthCheckInterval     = 60 * time.Second
+	defaultGRPCCircuitBreakerFailThreshold = 5
+	defaultGRPCCircuitBreakerOpenDuration  = 30 * time.Second
+)
+type pooledConnection struct {
+	conn         *grpc.ClientConn
+	lastUsedTime time.Time
+	mu           sync.Mutex
 }
-func NewForwarderAdapter(logger domain.Logger, configProvider config.Provider) *ForwarderAdapter {
-	return &ForwarderAdapter{
-		logger:         logger,
-		configProvider: configProvider,
-		grpcClientPool: &sync.Map{},
+type circuitBreakerState struct {
+	failures    int
+	lastFailure time.Time
+	openUntil   time.Time
+	targetPodID string
+}
+type ForwarderAdapter struct {
+	logger              domain.Logger
+	configProvider      config.Provider
+	grpcClientPool      *sync.Map
+	circuitBreakers     *sync.Map
+	appCtx              context.Context
+	appCancel           context.CancelFunc
+	idleTimeout         time.Duration
+	healthCheckInterval time.Duration
+	failThreshold       int
+	openDuration        time.Duration
+}
+func NewForwarderAdapter(appCtx context.Context, logger domain.Logger, configProvider config.Provider) *ForwarderAdapter {
+	appCfg := configProvider.Get().App
+	idleTimeout := defaultGRPCPoolIdleTimeout
+	if appCfg.GrpcPoolIdleTimeoutSeconds > 0 {
+		idleTimeout = time.Duration(appCfg.GrpcPoolIdleTimeoutSeconds) * time.Second
 	}
+	healthCheckInterval := defaultGRPCPoolHealthCheckInterval
+	if appCfg.GrpcPoolHealthCheckIntervalSeconds > 0 {
+		healthCheckInterval = time.Duration(appCfg.GrpcPoolHealthCheckIntervalSeconds) * time.Second
+	}
+	failThreshold := defaultGRPCCircuitBreakerFailThreshold
+	if appCfg.GrpcCircuitBreakerFailThreshold > 0 {
+		failThreshold = appCfg.GrpcCircuitBreakerFailThreshold
+	}
+	openDuration := defaultGRPCCircuitBreakerOpenDuration
+	if appCfg.GrpcCircuitBreakerOpenDurationSeconds > 0 {
+		openDuration = time.Duration(appCfg.GrpcCircuitBreakerOpenDurationSeconds) * time.Second
+	}
+	adapterCtx, adapterCancel := context.WithCancel(appCtx)
+	fa := &ForwarderAdapter{
+		logger:              logger,
+		configProvider:      configProvider,
+		grpcClientPool:      &sync.Map{},
+		circuitBreakers:     &sync.Map{},
+		appCtx:              adapterCtx,
+		appCancel:           adapterCancel,
+		idleTimeout:         idleTimeout,
+		healthCheckInterval: healthCheckInterval,
+		failThreshold:       failThreshold,
+		openDuration:        openDuration,
+	}
+	fa.startCleanupRoutine()
+	return fa
+}
+func (fa *ForwarderAdapter) getCircuitBreaker(targetPodID string) *circuitBreakerState {
+	cbVal, _ := fa.circuitBreakers.LoadOrStore(targetPodID, &circuitBreakerState{targetPodID: targetPodID})
+	return cbVal.(*circuitBreakerState)
+}
+func (fa *ForwarderAdapter) isCircuitOpen(targetPodID string) bool {
+	cb := fa.getCircuitBreaker(targetPodID)
+	if cb.openUntil.IsZero() || time.Now().After(cb.openUntil) {
+		return false
+	}
+	return true
+}
+func (fa *ForwarderAdapter) recordFailure(targetPodID string) {
+	cb := fa.getCircuitBreaker(targetPodID)
+	cb.failures++
+	cb.lastFailure = time.Now()
+	if cb.failures >= fa.failThreshold {
+		cb.openUntil = time.Now().Add(fa.openDuration)
+		fa.logger.Warn(fa.appCtx, "Circuit breaker tripped for target pod", "target_pod_id", targetPodID, "open_until", cb.openUntil)
+		metrics.IncrementGrpcCircuitBreakerTripped(targetPodID)
+		if connVal, okPool := fa.grpcClientPool.Load(targetPodID); okPool {
+			pc := connVal.(*pooledConnection)
+			pc.mu.Lock()
+			if pc.conn != nil {
+				pc.conn.Close()
+				pc.conn = nil
+				metrics.IncrementGrpcPoolConnectionsClosed("circuit_trip")
+				fa.logger.Info(fa.appCtx, "Closed gRPC connection due to circuit breaker trip", "target_pod_id", targetPodID)
+			}
+			pc.mu.Unlock()
+			fa.grpcClientPool.Delete(targetPodID)
+		}
+	}
+}
+func (fa *ForwarderAdapter) recordSuccess(targetPodID string) {
+	cb := fa.getCircuitBreaker(targetPodID)
+	cb.failures = 0
+	cb.openUntil = time.Time{}
+}
+func (fa *ForwarderAdapter) getConnection(ctx context.Context, targetPodAddress string) (*grpc.ClientConn, error) {
+	if fa.isCircuitOpen(targetPodAddress) {
+		fa.logger.Warn(ctx, "Circuit breaker is open for target, refusing connection attempt", "target_pod_address", targetPodAddress)
+		return nil, fmt.Errorf("circuit breaker open for %s", targetPodAddress)
+	}
+	connVal, okPool := fa.grpcClientPool.Load(targetPodAddress)
+	if okPool {
+		pc := connVal.(*pooledConnection)
+		pc.mu.Lock()
+		defer pc.mu.Unlock()
+		if pc.conn != nil {
+			state := pc.conn.GetState()
+			if state == connectivity.Ready || state == connectivity.Idle {
+				pc.lastUsedTime = time.Now()
+				fa.logger.Debug(ctx, "Reusing healthy gRPC connection from pool", "target_address", targetPodAddress, "state", state.String())
+				return pc.conn, nil
+			}
+			fa.logger.Warn(ctx, "Pooled gRPC connection is not healthy, closing and removing", "target_address", targetPodAddress, "state", state.String())
+			pc.conn.Close()
+			pc.conn = nil
+			metrics.IncrementGrpcPoolConnectionsClosed("health_fail")
+		}
+	}
+	fa.logger.Info(ctx, "Creating new gRPC client connection", "target_address", targetPodAddress)
+	connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	newlyCreatedConn, errClient := grpc.NewClient(targetPodAddress, connOpts...)
+	if errClient != nil {
+		fa.logger.Error(ctx, "Failed to establish new gRPC connection", "target_pod_address", targetPodAddress, "error", errClient.Error())
+		metrics.IncrementGrpcPoolConnectionErrors(targetPodAddress)
+		fa.recordFailure(targetPodAddress)
+		return nil, errClient
+	}
+	pc := &pooledConnection{
+		conn:         newlyCreatedConn,
+		lastUsedTime: time.Now(),
+	}
+	fa.grpcClientPool.Store(targetPodAddress, pc)
+	metrics.IncrementGrpcPoolConnectionsCreated()
+	metrics.SetGrpcPoolSize(float64(getSyncMapLength(fa.grpcClientPool)))
+	return newlyCreatedConn, nil
 }
 func (fa *ForwarderAdapter) ForwardEvent(ctx context.Context, targetPodAddress string, event *domain.EnrichedEventPayload, targetCompanyID, targetAgentID, targetChatID, sourcePodID string) error {
-	fa.logger.Info(ctx, "Attempting to forward message via gRPC using ForwarderAdapter", "target_address", targetPodAddress, "event_id", event.EventID)
-	var grpcConn *grpc.ClientConn
-	var errClient error
-	var connFromPool bool
-	if connVal, okPool := fa.grpcClientPool.Load(targetPodAddress); okPool {
-		grpcConn, connFromPool = connVal.(*grpc.ClientConn)
-		if !connFromPool {
-			fa.logger.Error(ctx, "Invalid type in gRPC client pool, removing entry.", "target_address", targetPodAddress, "type", fmt.Sprintf("%T", connVal))
-			fa.grpcClientPool.Delete(targetPodAddress)
-			grpcConn = nil
-		} else {
-			connState := grpcConn.GetState()
-			if connState != connectivity.Ready && connState != connectivity.Idle {
-				fa.logger.Warn(ctx, "Pooled gRPC connection is not Ready or Idle, discarding.", "target_address", targetPodAddress, "state", connState.String())
-				fa.grpcClientPool.Delete(targetPodAddress)
-				grpcConn.Close()
-				grpcConn = nil
-				connFromPool = false
-			} else {
-				fa.logger.Debug(ctx, "Reusing gRPC client connection from pool", "target_address", targetPodAddress, "state", connState.String())
-			}
-		}
-	}
-	if grpcConn == nil {
-		fa.logger.Info(ctx, "Creating new gRPC client connection via ForwarderAdapter", "target_address", targetPodAddress)
-		connOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
-		newlyCreatedConn, newErrClient := grpc.NewClient(targetPodAddress, connOpts...)
-		if newErrClient == nil {
-			grpcConn = newlyCreatedConn
-			fa.grpcClientPool.Store(targetPodAddress, grpcConn)
-		} else {
-			errClient = newErrClient
-		}
-	}
+	fa.logger.Info(ctx, "Attempting to forward message via gRPC", "target_address", targetPodAddress, "event_id", event.EventID)
+	grpcConn, errClient := fa.getConnection(ctx, targetPodAddress)
 	if errClient != nil {
-		fa.logger.Error(ctx, "Failed to establish gRPC connection to owner pod via ForwarderAdapter",
-			"target_pod_address", targetPodAddress, "error", errClient.Error())
-		return errClient
-	}
-	if grpcConn == nil {
-		fa.logger.Error(ctx, "gRPC connection is nil after creation attempt without error ForwarderAdapter", "target_pod_address", targetPodAddress)
-		return fmt.Errorf("gRPC connection is nil for %s", targetPodAddress)
+		return fmt.Errorf("failed to get gRPC connection for %s: %w", targetPodAddress, errClient)
 	}
 	client := pb.NewMessageForwardingServiceClient(grpcConn)
 	protoData, errProtoStruct := structpb.NewStruct(event.Data.(map[string]interface{}))
 	if errProtoStruct != nil {
-		fa.logger.Error(ctx, "Failed to convert event.Data to proto.Struct for gRPC via ForwarderAdapter", "error", errProtoStruct.Error())
+		fa.logger.Error(ctx, "Failed to convert event.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
 		return errProtoStruct
 	}
 	grpcRequest := &pb.PushEventRequest{
@@ -270,41 +363,118 @@ func (fa *ForwarderAdapter) ForwardEvent(ctx context.Context, targetPodAddress s
 		pushCancel()
 		if errPush == nil {
 			if resp != nil && resp.Success {
-				fa.logger.Info(ctx, "Successfully forwarded message via gRPC using ForwarderAdapter", "target_pod_address", targetPodAddress, "event_id", event.EventID, "attempt", i)
+				fa.logger.Info(ctx, "Successfully forwarded message via gRPC", "target_pod_address", targetPodAddress, "event_id", event.EventID, "attempt", i)
 				metrics.IncrementGrpcMessagesSent(targetPodAddress)
+				fa.recordSuccess(targetPodAddress)
 				if i > 0 {
 					metrics.IncrementGrpcForwardRetrySuccess(targetPodAddress)
 				}
+				if connVal, okPool := fa.grpcClientPool.Load(targetPodAddress); okPool {
+					connVal.(*pooledConnection).lastUsedTime = time.Now()
+				}
 				return nil
 			}
-			finalErr = fmt.Errorf("gRPC PushEvent to %s was not successful via ForwarderAdapter: %s (attempt %d)", targetPodAddress, resp.Message, i)
+			finalErr = fmt.Errorf("gRPC PushEvent to %s was not successful: %s (attempt %d)", targetPodAddress, resp.Message, i)
 			fa.logger.Warn(ctx, finalErr.Error())
 			break
 		}
 		finalErr = errPush
+		metrics.IncrementGrpcPoolConnectionErrors(targetPodAddress)
+		fa.recordFailure(targetPodAddress)
 		st, ok := status.FromError(errPush)
 		if ok && (st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded) {
-			fa.logger.Warn(ctx, "gRPC PushEvent to owner pod failed with retryable error via ForwarderAdapter", "target_pod_address", targetPodAddress, "error", errPush.Error(), "grpc_code", st.Code().String(), "is_pooled_conn", connFromPool, "attempt", i)
+			fa.logger.Warn(ctx, "gRPC PushEvent to owner pod failed with retryable error", "target_pod_address", targetPodAddress, "error", errPush.Error(), "grpc_code", st.Code().String(), "attempt", i)
 			if i == 0 {
 				metrics.IncrementGrpcForwardRetryAttempts(targetPodAddress)
 				time.Sleep(200 * time.Millisecond)
+				grpcConn, errClient = fa.getConnection(ctx, targetPodAddress)
+				if errClient != nil {
+					return fmt.Errorf("failed to get gRPC connection for retry to %s: %w", targetPodAddress, errClient)
+				}
+				client = pb.NewMessageForwardingServiceClient(grpcConn)
 				continue
 			}
 		} else {
-			fa.logger.Error(ctx, "gRPC PushEvent to owner pod failed with non-retryable error via ForwarderAdapter", "target_pod_address", targetPodAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool, "attempt", i)
+			fa.logger.Error(ctx, "gRPC PushEvent to owner pod failed with non-retryable error", "target_pod_address", targetPodAddress, "error", errPush.Error(), "attempt", i)
 			break
 		}
 	}
 	if finalErr != nil {
 		metrics.IncrementGrpcForwardRetryFailure(targetPodAddress)
-		if connFromPool && grpcConn != nil {
-			fa.grpcClientPool.Delete(targetPodAddress)
-			grpcConn.Close()
-			fa.logger.Info(ctx, "Removed and closed failed gRPC connection from pool in ForwarderAdapter", "target_pod_address", targetPodAddress)
-		}
 		return finalErr
 	}
 	return nil
+}
+func (fa *ForwarderAdapter) startCleanupRoutine() {
+	ticker := time.NewTicker(fa.healthCheckInterval)
+	safego.Execute(fa.appCtx, fa.logger, "GRPCPoolCleanupRoutine", func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fa.cleanupIdleConnections()
+			case <-fa.appCtx.Done():
+				fa.logger.Info(fa.appCtx, "gRPC pool cleanup routine stopping.")
+				fa.closeAllConnections()
+				return
+			}
+		}
+	})
+}
+func (fa *ForwarderAdapter) cleanupIdleConnections() {
+	now := time.Now()
+	cleanedCount := 0
+	fa.grpcClientPool.Range(func(key, value interface{}) bool {
+		targetPodAddress := key.(string)
+		pc := value.(*pooledConnection)
+		pc.mu.Lock()
+		if pc.conn != nil && now.Sub(pc.lastUsedTime) > fa.idleTimeout {
+			fa.logger.Info(fa.appCtx, "Closing idle gRPC connection", "target_address", targetPodAddress, "idle_duration_seconds", now.Sub(pc.lastUsedTime).Seconds())
+			pc.conn.Close()
+			pc.conn = nil
+			metrics.IncrementGrpcPoolConnectionsClosed("idle")
+			cleanedCount++
+			fa.grpcClientPool.Delete(targetPodAddress)
+		}
+		pc.mu.Unlock()
+		return true
+	})
+	if cleanedCount > 0 {
+		fa.logger.Info(fa.appCtx, "Cleaned up idle gRPC connections", "count", cleanedCount)
+	}
+	metrics.SetGrpcPoolSize(float64(getSyncMapLength(fa.grpcClientPool)))
+}
+func (fa *ForwarderAdapter) closeAllConnections() {
+	fa.logger.Info(fa.appCtx, "Closing all gRPC client connections in pool...")
+	closedCount := 0
+	fa.grpcClientPool.Range(func(key, value interface{}) bool {
+		targetPodAddress := key.(string)
+		pc := value.(*pooledConnection)
+		pc.mu.Lock()
+		if pc.conn != nil {
+			pc.conn.Close()
+			pc.conn = nil
+			metrics.IncrementGrpcPoolConnectionsClosed("shutdown")
+			closedCount++
+		}
+		pc.mu.Unlock()
+		fa.grpcClientPool.Delete(targetPodAddress)
+		return true
+	})
+	fa.logger.Info(fa.appCtx, "All gRPC client connections closed.", "count", closedCount)
+	metrics.SetGrpcPoolSize(0)
+}
+func getSyncMapLength(m *sync.Map) int {
+	length := 0
+	m.Range(func(_, _ interface{}) bool {
+		length++
+		return true
+	})
+	return length
+}
+func (fa *ForwarderAdapter) Stop() {
+	fa.logger.Info(fa.appCtx, "Stopping ForwarderAdapter...")
+	fa.appCancel()
 }
 ```
 
@@ -1784,6 +1954,66 @@ var (
 		},
 		[]string{"user_type", "reason"},
 	)
+	GrpcPoolSizeGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dws_grpc_pool_size",
+			Help: "Total number of connections in the gRPC client pool.",
+		},
+	)
+	GrpcPoolConnectionsCreatedTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connections_created_total",
+			Help: "Total new gRPC client connections established by the pool.",
+		},
+	)
+	GrpcPoolConnectionsClosedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connections_closed_total",
+			Help: "Total gRPC client connections closed by the pool, partitioned by reason.",
+		},
+		[]string{"reason"},
+	)
+	GrpcPoolConnectionErrorsTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connection_errors_total",
+			Help: "Total errors encountered with pooled gRPC client connections, partitioned by target pod.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcCircuitBreakerTrippedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_circuitbreaker_tripped_total",
+			Help: "Total times the circuit breaker has tripped for a target pod.",
+		},
+		[]string{"target_pod_id"},
+	)
+	WebsocketBufferUsedGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dws_websocket_buffer_used_count",
+			Help: "Current number of messages in the WebSocket send buffer.",
+		},
+		[]string{"session_key"},
+	)
+	WebsocketBufferCapacityGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dws_websocket_buffer_capacity_count",
+			Help: "Capacity of the WebSocket send buffer.",
+		},
+		[]string{"session_key"},
+	)
+	WebsocketMessagesDroppedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_websocket_messages_dropped_total",
+			Help: "Total messages dropped due to WebSocket backpressure.",
+		},
+		[]string{"session_key", "reason"},
+	)
+	WebsocketSlowClientsDisconnectedTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_websocket_slow_clients_disconnected_total",
+			Help: "Total slow WebSocket clients disconnected.",
+		},
+	)
 )
 func IncrementActiveConnections() {
 	ActiveConnectionsGauge.Inc()
@@ -1838,6 +2068,33 @@ func IncrementSessionLockSuccess(userType, lockType string) {
 }
 func IncrementSessionLockFailure(userType, reason string) {
 	SessionLockFailureCounter.WithLabelValues(userType, reason).Inc()
+}
+func SetGrpcPoolSize(size float64) {
+	GrpcPoolSizeGauge.Set(size)
+}
+func IncrementGrpcPoolConnectionsCreated() {
+	GrpcPoolConnectionsCreatedTotalCounter.Inc()
+}
+func IncrementGrpcPoolConnectionsClosed(reason string) {
+	GrpcPoolConnectionsClosedTotalCounter.WithLabelValues(reason).Inc()
+}
+func IncrementGrpcPoolConnectionErrors(targetPodID string) {
+	GrpcPoolConnectionErrorsTotalCounter.WithLabelValues(targetPodID).Inc()
+}
+func IncrementGrpcCircuitBreakerTripped(targetPodID string) {
+	GrpcCircuitBreakerTrippedTotalCounter.WithLabelValues(targetPodID).Inc()
+}
+func SetWebsocketBufferUsed(sessionKey string, count float64) {
+	WebsocketBufferUsedGauge.WithLabelValues(sessionKey).Set(count)
+}
+func SetWebsocketBufferCapacity(sessionKey string, capacity float64) {
+	WebsocketBufferCapacityGauge.WithLabelValues(sessionKey).Set(capacity)
+}
+func IncrementWebsocketMessagesDropped(sessionKey, reason string) {
+	WebsocketMessagesDroppedTotalCounter.WithLabelValues(sessionKey, reason).Inc()
+}
+func IncrementWebsocketSlowClientsDisconnected() {
+	WebsocketSlowClientsDisconnectedTotalCounter.Inc()
 }
 ```
 
@@ -2072,13 +2329,20 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+const (
+	backpressurePolicyDropOldest = "drop_oldest"
+	backpressurePolicyBlock      = "block"
 )
 type Connection struct {
 	wsConn              *websocket.Conn
@@ -2094,6 +2358,13 @@ type Connection struct {
 	remoteAddrStr       string
 	currentChatID       string
 	currentChatIDMu     sync.Mutex
+	sessionKey      string
+	messageBuffer   chan []byte
+	bufferCapacity  int
+	dropPolicy      string
+	writerWg        sync.WaitGroup
+	isWriterRunning bool
+	writerMu        sync.Mutex
 }
 func NewConnection(
 	connCtx context.Context,
@@ -2102,9 +2373,20 @@ func NewConnection(
 	remoteAddr string,
 	logger domain.Logger,
 	cfgProvider config.Provider,
+	sessionKey string,
 ) *Connection {
 	appCfg := cfgProvider.Get().App
-	return &Connection{
+	bufferCap := appCfg.WebsocketMessageBufferSize
+	if bufferCap <= 0 {
+		bufferCap = 100
+		logger.Warn(connCtx, "WebsocketMessageBufferSize not configured or invalid, using default", "default_size", bufferCap)
+	}
+	dropPol := strings.ToLower(appCfg.WebsocketBackpressureDropPolicy)
+	if dropPol != backpressurePolicyDropOldest && dropPol != backpressurePolicyBlock {
+		logger.Warn(connCtx, "Invalid WebsocketBackpressureDropPolicy, defaulting to drop_oldest", "configured_policy", appCfg.WebsocketBackpressureDropPolicy, "default_policy", backpressurePolicyDropOldest)
+		dropPol = backpressurePolicyDropOldest
+	}
+	c := &Connection{
 		wsConn:              wsConn,
 		logger:              logger,
 		config:              &appCfg,
@@ -2115,53 +2397,214 @@ func NewConnection(
 		pingIntervalSeconds: appCfg.PingIntervalSeconds,
 		pongWaitSeconds:     appCfg.PongWaitSeconds,
 		remoteAddrStr:       remoteAddr,
-		currentChatID:       "",         // currentChatID is initialized as empty string
+		currentChatID:       "",
+		sessionKey:          sessionKey,
+		messageBuffer:       make(chan []byte, bufferCap),
+		bufferCapacity:      bufferCap,
+		dropPolicy:          dropPol,
+		isWriterRunning:     false,
 	}
+	metrics.SetWebsocketBufferCapacity(c.sessionKey, float64(c.bufferCapacity))
+	c.startWriter()
+	return c
 }
-// Context returns the context associated with this connection.
+func (c *Connection) startWriter() {
+	c.writerMu.Lock()
+	if c.isWriterRunning {
+		c.writerMu.Unlock()
+		return
+	}
+	c.isWriterRunning = true
+	c.writerMu.Unlock()
+	c.writerWg.Add(1)
+	safego.Execute(c.connCtx, c.logger, fmt.Sprintf("WebSocketWriter-%s", c.sessionKey), func() {
+		defer c.writerWg.Done()
+		c.logger.Info(c.connCtx, "WebSocket writer goroutine started", "sessionKey", c.sessionKey)
+		for {
+			select {
+			case <-c.connCtx.Done():
+				c.logger.Info(c.connCtx, "Connection context done, stopping WebSocket writer.", "sessionKey", c.sessionKey)
+				return
+			case msgBytes, ok := <-c.messageBuffer:
+				if !ok {
+					c.logger.Info(c.connCtx, "Message buffer closed, stopping WebSocket writer.", "sessionKey", c.sessionKey)
+					return
+				}
+				metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+				ctxToWrite := c.connCtx
+				var cancel context.CancelFunc
+				writeTimeout := time.Duration(c.writeTimeoutSeconds) * time.Second
+				if writeTimeout <= 0 {
+					writeTimeout = 10 * time.Second
+				}
+				ctxToWrite, cancel = context.WithTimeout(c.connCtx, writeTimeout)
+				c.mu.Lock()
+				err := c.wsConn.Write(ctxToWrite, websocket.MessageText, msgBytes)
+				c.mu.Unlock()
+				cancel()
+				if err != nil {
+					c.logger.Error(c.connCtx, "Failed to write message from buffer to WebSocket", "error", err.Error(), "sessionKey", c.sessionKey)
+					c.cancelConnCtxFunc()
+					return
+				}
+			}
+		}
+	})
+}
 func (c *Connection) Context() context.Context {
 	return c.connCtx
 }
-// Close attempts to close the WebSocket connection with a specified status code and reason.
 func (c *Connection) Close(statusCode websocket.StatusCode, reason string) error {
+	c.logger.Info(c.connCtx, "Connection.Close called", "statusCode", statusCode, "reason", reason, "sessionKey", c.sessionKey)
+	c.writerMu.Lock()
+	if c.isWriterRunning {
+		if c.messageBuffer != nil {
+			close(c.messageBuffer)
+		}
+		c.isWriterRunning = false
+	}
+	c.writerMu.Unlock()
+	c.writerWg.Wait()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cancelConnCtxFunc != nil {
-		c.cancelConnCtxFunc()
+		currentCancelFunc := c.cancelConnCtxFunc
+		c.cancelConnCtxFunc = nil
+		currentCancelFunc()
 	}
-	return c.wsConn.Close(statusCode, reason)
+	if c.wsConn == nil {
+		return errors.New("WebSocket connection is already nil")
+	}
+	err := c.wsConn.Close(statusCode, reason)
+	c.wsConn = nil
+	return err
 }
-// CloseWithError sends an error message to the client and then closes the WebSocket connection
-// with the appropriate close code derived from the error response.
 func (c *Connection) CloseWithError(errResp domain.ErrorResponse, reason string) error {
-	// First send the error message to the client
-	errorMsg := domain.NewErrorMessage(errResp)
-	if err := c.WriteJSON(errorMsg); err != nil {
-		c.logger.Error(c.connCtx, "Failed to send error message before closing connection",
+	c.logger.Warn(c.connCtx, "Closing connection with error", "code", errResp.Code, "message", errResp.Message, "details", errResp.Details, "reason", reason, "sessionKey", c.sessionKey)
+	errorMsgPayload := domain.NewErrorMessage(errResp)
+	if err := c.WriteJSON(errorMsgPayload); err != nil {
+		c.logger.Error(c.connCtx, "Failed to queue error message before closing connection",
 			"error", err.Error(),
 			"error_code", string(errResp.Code),
-			"message", errResp.Message)
+			"message", errResp.Message,
+			"sessionKey", c.sessionKey)
 	} else {
-		metrics.IncrementMessagesSent(domain.MessageTypeError)
 	}
 	closeCode := errResp.ToWebSocketCloseCode()
 	return c.Close(closeCode, reason)
 }
 func (c *Connection) WriteJSON(v interface{}) error {
-	payload, err := json.Marshal(v)
+	msgBytes, err := json.Marshal(v)
 	if err != nil {
-		c.logger.Error(c.connCtx, "Failed to marshal JSON for WriteJSON", "error", err.Error())
+		c.logger.Error(c.connCtx, "Failed to marshal JSON for WriteJSON", "error", err.Error(), "sessionKey", c.sessionKey)
 		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ctxToWrite := c.connCtx
-	var cancel context.CancelFunc
-	if c.writeTimeoutSeconds > 0 {
-		ctxToWrite, cancel = context.WithTimeout(c.connCtx, time.Duration(c.writeTimeoutSeconds)*time.Second)
-		defer cancel()
+	var messageTypeForMetric string = "unknown"
+	if bm, ok := v.(domain.BaseMessage); ok {
+		messageTypeForMetric = bm.Type
 	}
-	return c.wsConn.Write(ctxToWrite, websocket.MessageText, payload)
+	select {
+	case <-c.connCtx.Done():
+		c.logger.Warn(c.connCtx, "Connection context done, cannot write message to buffer", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+		return c.connCtx.Err()
+	default:
+	}
+	c.writerMu.Lock()
+	if !c.isWriterRunning {
+		c.writerMu.Unlock()
+		c.logger.Warn(c.connCtx, "Writer not running, cannot write message to buffer", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+		return fmt.Errorf("writer goroutine not running for session %s", c.sessionKey)
+	}
+	c.writerMu.Unlock()
+	if len(c.messageBuffer) >= c.bufferCapacity {
+		metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+		c.logger.Warn(c.connCtx, "WebSocket send buffer is full", "sessionKey", c.sessionKey, "capacity", c.bufferCapacity, "policy", c.dropPolicy, "messageType", messageTypeForMetric)
+		if c.dropPolicy == backpressurePolicyDropOldest {
+			select {
+			case oldestMsg := <-c.messageBuffer:
+				metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_full_dropped_oldest")
+				c.logger.Info(c.connCtx, "Dropped oldest message from buffer due to backpressure", "sessionKey", c.sessionKey, "dropped_msg_len", len(oldestMsg), "messageType", messageTypeForMetric)
+			default:
+				c.logger.Error(c.connCtx, "Buffer full but could not dequeue oldest message (unexpected state)", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+			}
+			select {
+			case c.messageBuffer <- msgBytes:
+				metrics.IncrementMessagesSent(messageTypeForMetric)
+				metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+				return nil
+			default:
+				c.logger.Error(c.connCtx, "Failed to send message to buffer even after dropping oldest (buffer likely still full)", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+				metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_full_post_drop_fail")
+				return fmt.Errorf("failed to send to buffer for session %s after dropping oldest", c.sessionKey)
+			}
+		} else if c.dropPolicy == backpressurePolicyBlock {
+			c.logger.Info(c.connCtx, "Blocking on WebSocket send buffer (policy: block)", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+			select {
+			case c.messageBuffer <- msgBytes:
+				metrics.IncrementMessagesSent(messageTypeForMetric)
+				metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+				return nil
+			case <-c.connCtx.Done():
+				c.logger.Warn(c.connCtx, "Connection context done while blocked on send buffer", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+				metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_full_block_ctx_done")
+				return c.connCtx.Err()
+			}
+		} else {
+			c.logger.Error(c.connCtx, "Unknown backpressure drop policy", "policy", c.dropPolicy, "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+			metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "unknown_policy")
+			return fmt.Errorf("unknown backpressure policy: %s for session %s", c.dropPolicy, c.sessionKey)
+		}
+	}
+	select {
+	case c.messageBuffer <- msgBytes:
+		metrics.IncrementMessagesSent(messageTypeForMetric)
+		metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+		return nil
+	default:
+		c.logger.Warn(c.connCtx, "Buffer filled during non-blocking send attempt, retrying with policy", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+		if len(c.messageBuffer) >= c.bufferCapacity {
+			if c.dropPolicy == backpressurePolicyDropOldest {
+				select {
+				case <-c.messageBuffer:
+					metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_full_race_dropped_oldest")
+				default:
+				}
+				select {
+				case c.messageBuffer <- msgBytes:
+					metrics.IncrementMessagesSent(messageTypeForMetric)
+					metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+					return nil
+				default:
+					metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_full_race_drop_fail")
+					return fmt.Errorf("failed to send to buffer (race) for session %s after dropping", c.sessionKey)
+				}
+			} else if c.dropPolicy == backpressurePolicyBlock {
+				select {
+				case c.messageBuffer <- msgBytes:
+					metrics.IncrementMessagesSent(messageTypeForMetric)
+					metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+					return nil
+				case <-c.connCtx.Done():
+					metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_full_race_block_ctx_done")
+					return c.connCtx.Err()
+				}
+			}
+		}
+		select {
+		case c.messageBuffer <- msgBytes:
+			metrics.IncrementMessagesSent(messageTypeForMetric)
+			metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
+			return nil
+		case <-time.After(100 * time.Millisecond):
+			c.logger.Error(c.connCtx, "Failed to send message to buffer after non-blocking attempt and re-check (unexpected)", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+			metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_send_timeout_unexpected")
+			return fmt.Errorf("timed out sending to buffer for session %s (unexpected state)", c.sessionKey)
+		case <-c.connCtx.Done():
+			c.logger.Warn(c.connCtx, "Connection context done while trying to send to buffer (unexpected state)", "sessionKey", c.sessionKey, "messageType", messageTypeForMetric)
+			metrics.IncrementWebsocketMessagesDropped(c.sessionKey, "buffer_send_ctx_done_unexpected")
+			return c.connCtx.Err()
+		}
+	}
 }
 func (c *Connection) ReadMessage(ctx context.Context) (websocket.MessageType, []byte, error) {
 	return c.wsConn.Read(ctx)
@@ -2185,12 +2628,17 @@ func (c *Connection) UpdateLastPongTime() {
 func (c *Connection) Ping(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.wsConn == nil {
+		return errors.New("cannot ping: WebSocket connection is nil (likely closed)")
+	}
 	ctxToWrite := c.connCtx
 	var cancel context.CancelFunc
-	if c.writeTimeoutSeconds > 0 {
-		ctxToWrite, cancel = context.WithTimeout(c.connCtx, time.Duration(c.writeTimeoutSeconds)*time.Second)
-		defer cancel()
+	writeTimeout := time.Duration(c.writeTimeoutSeconds) * time.Second
+	if writeTimeout <= 0 {
+		writeTimeout = 10 * time.Second
 	}
+	ctxToWrite, cancel = context.WithTimeout(ctxToWrite, writeTimeout)
+	defer cancel()
 	return c.wsConn.Ping(ctxToWrite)
 }
 func (c *Connection) GetCurrentChatID() string {
@@ -2202,6 +2650,9 @@ func (c *Connection) SetCurrentChatID(chatID string) {
 	c.currentChatIDMu.Lock()
 	defer c.currentChatIDMu.Unlock()
 	c.currentChatID = chatID
+}
+func (c *Connection) GetSessionKey() string {
+	return c.sessionKey
 }
 ```
 
@@ -3478,7 +3929,7 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.IncrementConnectionsTotal()
-	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
+	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider, adminSessionKey)
 	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
 		"remoteAddr", wrappedConn.RemoteAddr(),
 		"subprotocol", c.Subprotocol(),
@@ -3822,6 +4273,14 @@ app:
   websocket_compression_mode: "disabled"
   websocket_compression_threshold: 1024
   websocket_development_insecure_skip_verify: false
+  grpc_pool_idle_timeout_seconds: 300
+  grpc_pool_health_check_interval_seconds: 60
+  grpc_circuitbreaker_fail_threshold: 5
+  grpc_circuitbreaker_open_duration_seconds: 30
+  websocket_message_buffer_size: 100
+  websocket_backpressure_drop_policy: "drop_oldest"
+  websocket_slow_client_latency_ms: 5000
+  websocket_slow_client_disconnect_threshold_ms: 30000
 ```
 
 ## File: internal/adapters/config/config.go
@@ -3858,9 +4317,12 @@ type NATSConfig struct {
 	RetryOnFailedConnect  bool   `mapstructure:"retry_on_failed_connect"`
 }
 type RedisConfig struct {
-	Address  string `mapstructure:"address"`
-	Password string `mapstructure:"password"`
-	DB       int    `mapstructure:"db"`
+	Address                                string `mapstructure:"address"`
+	Password                               string `mapstructure:"password"`
+	DB                                     int    `mapstructure:"db"`
+	WebsocketCompressionMode               string `mapstructure:"websocket_compression_mode"`
+	WebsocketCompressionThreshold          int    `mapstructure:"websocket_compression_threshold"`
+	WebsocketDevelopmentInsecureSkipVerify bool   `mapstructure:"websocket_development_insecure_skip_verify"`
 }
 type LogConfig struct {
 	Level string `mapstructure:"level"`
@@ -3874,25 +4336,33 @@ type AuthConfig struct {
 	AdminTokenCacheTTLSeconds int    `mapstructure:"admin_token_cache_ttl_seconds"`
 }
 type AppConfig struct {
-	ServiceName                            string `mapstructure:"service_name"`
-	Version                                string `mapstructure:"version"`
-	PingIntervalSeconds                    int    `mapstructure:"ping_interval_seconds"`
-	ShutdownTimeoutSeconds                 int    `mapstructure:"shutdown_timeout_seconds"`
-	PongWaitSeconds                        int    `mapstructure:"pong_wait_seconds"`
-	WriteTimeoutSeconds                    int    `mapstructure:"write_timeout_seconds"`
-	MaxMissedPongs                         int    `mapstructure:"max_missed_pongs"`
-	SessionTTLSeconds                      int    `mapstructure:"session_ttl_seconds"`
-	RouteTTLSeconds                        int    `mapstructure:"route_ttl_seconds"`
-	TTLRefreshIntervalSeconds              int    `mapstructure:"ttl_refresh_interval_seconds"`
-	NATSMaxAckPending                      int    `mapstructure:"nats_max_ack_pending"`
-	SessionLockRetryDelayMs                int    `mapstructure:"session_lock_retry_delay_ms"`
-	NatsAckWaitSeconds                     int    `mapstructure:"nats_ack_wait_seconds"`
-	GRPCCLientForwardTimeoutSeconds        int    `mapstructure:"grpc_client_forward_timeout_seconds"`
-	ReadTimeoutSeconds                     int    `mapstructure:"read_timeout_seconds"`
-	IdleTimeoutSeconds                     int    `mapstructure:"idle_timeout_seconds"`
-	WebsocketCompressionMode               string `mapstructure:"websocket_compression_mode"`
-	WebsocketCompressionThreshold          int    `mapstructure:"websocket_compression_threshold"`
-	WebsocketDevelopmentInsecureSkipVerify bool   `mapstructure:"websocket_development_insecure_skip_verify"`
+	ServiceName                              string `mapstructure:"service_name"`
+	Version                                  string `mapstructure:"version"`
+	PingIntervalSeconds                      int    `mapstructure:"ping_interval_seconds"`
+	ShutdownTimeoutSeconds                   int    `mapstructure:"shutdown_timeout_seconds"`
+	PongWaitSeconds                          int    `mapstructure:"pong_wait_seconds"`
+	WriteTimeoutSeconds                      int    `mapstructure:"write_timeout_seconds"`
+	MaxMissedPongs                           int    `mapstructure:"max_missed_pongs"`
+	SessionTTLSeconds                        int    `mapstructure:"session_ttl_seconds"`
+	RouteTTLSeconds                          int    `mapstructure:"route_ttl_seconds"`
+	TTLRefreshIntervalSeconds                int    `mapstructure:"ttl_refresh_interval_seconds"`
+	NATSMaxAckPending                        int    `mapstructure:"nats_max_ack_pending"`
+	SessionLockRetryDelayMs                  int    `mapstructure:"session_lock_retry_delay_ms"`
+	NatsAckWaitSeconds                       int    `mapstructure:"nats_ack_wait_seconds"`
+	GRPCCLientForwardTimeoutSeconds          int    `mapstructure:"grpc_client_forward_timeout_seconds"`
+	ReadTimeoutSeconds                       int    `mapstructure:"read_timeout_seconds"`
+	IdleTimeoutSeconds                       int    `mapstructure:"idle_timeout_seconds"`
+	WebsocketCompressionMode                 string `mapstructure:"websocket_compression_mode"`
+	WebsocketCompressionThreshold            int    `mapstructure:"websocket_compression_threshold"`
+	WebsocketDevelopmentInsecureSkipVerify   bool   `mapstructure:"websocket_development_insecure_skip_verify"`
+	GrpcPoolIdleTimeoutSeconds               int    `mapstructure:"grpc_pool_idle_timeout_seconds"`
+	GrpcPoolHealthCheckIntervalSeconds       int    `mapstructure:"grpc_pool_health_check_interval_seconds"`
+	GrpcCircuitBreakerFailThreshold          int    `mapstructure:"grpc_circuitbreaker_fail_threshold"`
+	GrpcCircuitBreakerOpenDurationSeconds    int    `mapstructure:"grpc_circuitbreaker_open_duration_seconds"`
+	WebsocketMessageBufferSize               int    `mapstructure:"websocket_message_buffer_size"`
+	WebsocketBackpressureDropPolicy          string `mapstructure:"websocket_backpressure_drop_policy"`
+	WebsocketSlowClientLatencyMs             int    `mapstructure:"websocket_slow_client_latency_ms"`
+	WebsocketSlowClientDisconnectThresholdMs int    `mapstructure:"websocket_slow_client_disconnect_threshold_ms"`
 }
 type Config struct {
 	Server ServerConfig `mapstructure:"server"`
@@ -4055,7 +4525,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 		cleanup()
 		return nil, nil, err
 	}
-	messageForwarder := MessageForwarderProvider(domainLogger, provider)
+	messageForwarder := MessageForwarderProvider(ctx, domainLogger, provider)
 	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, routeRegistry, messageForwarder)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
@@ -4521,8 +4991,8 @@ func NatsConnectionProvider(adapter domain.NatsConsumer) *nats.Conn {
 	}
 	return adapter.NatsConn()
 }
-func MessageForwarderProvider(logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
-	return appgrpc.NewForwarderAdapter(logger, cfgProvider)
+func MessageForwarderProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
+	return appgrpc.NewForwarderAdapter(appCtx, logger, cfgProvider)
 }
 var ProviderSet = wire.NewSet(
 	ConfigProvider,
@@ -4704,7 +5174,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.IncrementConnectionsTotal()
-	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider)
+	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider, sessionKey)
 	h.logger.Info(wrappedConn.Context(), "WebSocket connection established",
 		"remoteAddr", wrappedConn.RemoteAddr(),
 		"subprotocol", c.Subprotocol(),
@@ -4764,12 +5234,12 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		var eventPayload domain.EnrichedEventPayload
 		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
 			h.logger.Error(msgCtx, "Failed to unmarshal general chat event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
-			_ = msg.Ack()
 			return
 		}
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
+			return
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 		}
@@ -4805,13 +5275,11 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject)
 		if err != nil {
 			h.logger.Error(msgCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
-			_ = msg.Ack()
 			return
 		}
 		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID == "" {
 			h.logger.Error(connCtx, "Current PodID is not configured, cannot determine message ownership.", "subject", msg.Subject)
-			_ = msg.Ack()
 			return
 		}
 		ownerPodID, err := h.routeRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
@@ -4824,7 +5292,6 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				return
 			} else {
 				h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
-				_ = msg.Ack()
 				return
 			}
 		}
@@ -4843,7 +5310,6 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
 				h.logger.Error(msgCtx, "Failed to unmarshal NATS message into EnrichedEventPayload (owner)",
 					"subject", msg.Subject, "error", errUnmarshal.Error(), "raw_data", string(msg.Data))
-				_ = msg.Ack()
 				return
 			}
 			wsMessage := domain.NewEventMessage(eventPayload)
@@ -4851,6 +5317,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
 					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
 				)
+				return
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 			}
@@ -4862,9 +5329,11 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				var domainPayload domain.EnrichedEventPayload
 				if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
 					h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding (MessageForwarder)", "subject", msg.Subject, "error", errUnmarshal.Error())
+					return
 				} else {
 					if errFwd := h.messageForwarder.ForwardEvent(msgCtx, gprcTargetAddress, &domainPayload, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
 						h.logger.Error(msgCtx, "Failed to forward event via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID, "error", errFwd.Error())
+						return
 					} else {
 						h.logger.Info(msgCtx, "Successfully initiated event forwarding via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID)
 					}

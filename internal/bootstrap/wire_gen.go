@@ -60,7 +60,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 		cleanup()
 		return nil, nil, err
 	}
-	messageForwarder := MessageForwarderProvider(domainLogger, provider)
+	messageForwarder := MessageForwarderProvider(ctx, domainLogger, provider)
 	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, routeRegistry, messageForwarder)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)

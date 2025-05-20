@@ -586,48 +586,6 @@ All subtasks for Task 7 are complete. The service now dynamically manages route 
 - This existing implementation covers all subtasks of Task 9.
 - Marked Task 9 as 'done' in Task Master.
 
-## Task 8: Per-Thread Message Fan-Out & gRPC Hop - COMPLETED - 2025-05-19 22:31:15 (GMT+7)
-
-- **Subtask 8.1: Update NATS Consumer to Route Messages by Ownership - COMPLETED**
-    - `internal/adapters/nats/consumer.go`:
-        - Added `RouteRegistry` and `config.Provider` dependencies to `ConsumerAdapter` and exported them.
-        - Implemented `SubscribeToChatMessages` for specific message threads (`wa.<C>.<A>.messages.<chatID>`).
-        - Exported `ParseNATSMessageSubject` helper.
-    - `internal/bootstrap/providers.go`: Updated `NatsConsumerAdapterProvider`.
-    - `internal/adapters/websocket/handler.go` (`manageConnection`, `handleSelectChatMessage`):
-        - Integrated logic to switch NATS subscriptions to specific chat message threads.
-        - `natsMessageHandler` now uses `appnats.ParseNATSMessageSubject` and `h.natsAdapter.RouteRegistry.GetOwningPodForMessageRoute` for ownership checks.
-    - Moved WebSocket protocol definitions from `adapters/websocket/protocol.go` to `domain/websocket_protocol.go` to resolve import cycles. Updated all references.
-    - Ensured `go generate ./...` runs successfully after DI changes.
-
-- **Subtask 8.2: Implement Local Message Delivery for Owner Pod - COMPLETED**
-    - In `internal/adapters/websocket/handler.go` (`natsMessageHandler`):
-        - If the current pod is the owner, the NATS message (`EnrichedEventPayload`) is unmarshalled and forwarded to the local WebSocket client.
-        - Refined ownership check logic, particularly for `ErrNoOwningPod` scenarios (with a TODO FR-8A for further review).
-
-- **Subtask 8.3: Forward Messages via gRPC to Owner Pod(s) When Not Owner - COMPLETED**
-    - `internal/adapters/grpc/proto/dws_message_fwd.proto`: Defined `MessageForwardingService` with `PushEvent` RPC and associated messages.
-    - Generated Go code from the `.proto` file (user confirmed `protoc` setup).
-    - `internal/adapters/websocket/handler.go` (`natsMessageHandler`):
-        - Added gRPC client logic to forward `EnrichedEventPayload` to the owner pod via `PushEvent` RPC if the current pod is not the owner.
-        - Includes translation from `domain.EnrichedEventPayload` to `proto.EnrichedEventPayloadMessage`.
-        - Added TODOs for pod address resolution (FR-8B), gRPC client pooling/reuse, and mTLS (FR-8C).
-
-- **Subtask 8.4: Develop gRPC Server for Receiving Forwarded Messages - COMPLETED**
-    - `internal/application/grpc_handler.go`: Implemented `GRPCMessageHandler` with `PushEvent` method to receive forwarded messages. This handler finds the local WebSocket connection based on target identifiers and forwards the message.
-    - `internal/adapters/grpc/server.go`: Created gRPC server setup, which registers `GRPCMessageHandler` and starts listening on the configured gRPC port. Includes basic graceful shutdown logic tied to context cancellation.
-    - `internal/bootstrap/providers.go`: Added DI providers for `GRPCMessageHandler` and `appgrpc.Server`.
-    - `internal/bootstrap/app.go`: Integrated gRPC server startup into `App.Run()`.
-    - Ensured `go generate ./...` runs successfully after DI changes.
-    - Added TODOs for mTLS (FR-8D) and gRPC reflection in `server.go`.
-
-- **Subtask 8.5: Implement Retry and Logging for gRPC Forwarding Failures - COMPLETED**
-    - `internal/adapters/websocket/handler.go` (`natsMessageHandler`):
-        - Added logic to retry gRPC `PushEvent` once after a short delay if the initial attempt fails.
-        - Ensured relevant logging for gRPC forwarding attempts, successes, and failures (leveraging existing logger context propagation).
-
-**Overall Task 8 Status:** All subtasks are addressed. The core fan-out logic (local delivery or gRPC hop based on Redis ownership) is in place. Key areas for future enhancement are marked with TODOs (mTLS, pod discovery, gRPC client pooling, robust error handling for orphaned NATS messages).
-
 ## Task 12: Admin WebSocket & Agent Event Streaming - COMPLETED - 2025-05-19 20:24:26 (GMT+7)
 
 **Task 12: Implement Admin WebSocket for Agent Table Events - COMPLETED**
@@ -725,26 +683,21 @@ All subtasks for Task 12 are complete. The service now supports an admin WebSock
 - **`internal/adapters/nats/consumer.go`**: Removed an outdated TODO comment about Subtask 6.3, as its functionality was implemented in `websocket/handler.go`.
 - **`internal/bootstrap/app.go`**: Ensured the `/admin/generate-token` endpoint is correctly registered.
 
-## Task 13.3: Error Response Format Consistency - 2025-05-20 16:38:12 (GMT+7)
+## NATS ACK/NACK Logic for WebSocket Buffering Review - 2025-05-20 16:28:03 (GMT+7)
 
-Improved error response format consistency by implementing centralized error handling mechanisms:
+**Context:** Addressed TODO item: "(Task 14.4 Follow-up) Review and verify NATS ACK/NACK interaction with the WebSocket buffering."
 
-1. **Enhanced WebSocket Error Closing Method**:
-   - Added `ToWebSocketCloseCode()` method to `ErrorResponse` struct in `internal/domain/errors.go` to standardize mapping from domain error codes to WebSocket close codes.
-   - Added `ToHTTPStatus()` method to `ErrorResponse` to provide a similar mapping from domain error codes to HTTP status codes.
-   - Updated `WriteJSON()` method to use `ToHTTPStatus()` when no explicit HTTP status code is provided.
+**Key Changes & Verifications:**
 
-2. **Standardized WebSocket Connection Closure**:
-   - Created a unified `CloseWithError()` method in `Connection` struct that sends a properly formatted error message to the client before closing with the appropriate code.
-   - Updated all error-related connection closures to use this method in both regular and admin WebSocket handlers.
-   - Added clear comments to distinguish normal/graceful closures (which don't need to send error messages) from error conditions.
+1.  **Modified NATS Message Handlers (`internal/adapters/websocket/handler.go`):**
+    *   In both `generalChatEventsNatsHandler` and `specificChatNatsMessageHandler`:
+        *   If `json.Unmarshal` of the NATS payload fails, the handler now logs the error and returns immediately *without* ACKing the NATS message. This allows NATS to redeliver the message, which is appropriate for transient unmarshalling issues or malformed payloads that might be fixed upon redelivery (or eventually go to a dead-letter queue if NATS is configured for it).
+        *   If `conn.WriteJSON()` (for local delivery to WebSocket) or `h.messageForwarder.ForwardEvent()` (for gRPC hop) returns an error, the handler logs the error and returns *without* ACKing. This handles scenarios where the WebSocket buffer is full and the policy is `block` and the context cancels, or other WebSocket write/forwarding failures.
+        *   `msg.Ack()` is now only called if all processing steps (unmarshal, and then either local WebSocket write or gRPC forward) are successful.
 
-3. **Implemented Consistent Error Response Format**:
-   - All error responses now follow the established format defined in the architecture document:
-     - For HTTP errors: JSON with `code`, `message`, and optional `details` fields.
-     - For WebSocket errors: JSON with `{"type":"error", "payload": {<ErrorResponseObject>}}` followed by an appropriate close code.
+2.  **Interaction with WebSocket Buffering (`internal/adapters/websocket/conn.go`):**
+    *   **Message Dropped by Policy (`drop_oldest`):** When `conn.WriteJSON()` successfully buffers a new message by dropping an older one (due to `drop_oldest` policy), it returns `nil`. The NATS handler correctly ACKs the NATS message. This is considered a successful handling of the NATS message from the service's perspective, even though an older buffered message was discarded to make space for the new NATS-originated message.
+    *   **`WriteJSON` Blocks & Context Cancels:** If `conn.WriteJSON()` is using the `block` policy and the connection's context (`connCtx`) is cancelled (e.g., due to connection closure) while it's blocked trying to send to the internal `messageBuffer`, `conn.WriteJSON()` returns an error (`c.connCtx.Err()`). The NATS handlers will now correctly *not* ACK the NATS message, allowing NATS to redeliver.
+    *   **Successful Buffering, Later Writer Failure:** If `conn.WriteJSON()` successfully buffers a message (NATS ACKed), but the dedicated writer goroutine in `Connection` later fails to write this specific message to the actual WebSocket, that message is lost for that client. The writer goroutine attempts to signal a connection closure by cancelling `connCtx`, but the NATS message was already ACKed. This is a known trade-off for asynchronous buffered writes; ensuring NATS ACK only after *actual* WebSocket write confirmation would significantly increase complexity and reduce throughput.
 
-4. **Enhanced Graceful Shutdown**:
-   - Updated `GracefullyCloseAllConnections` to close both regular and admin connections with a standard shutdown error message.
-
-These changes ensure that all error responses throughout the codebase maintain a consistent format, improving client-side error handling predictability and making the API more robust.
+**Outcome:** The NATS ACK/NACK logic is now more robust in conjunction with the WebSocket buffering and backpressure mechanisms. Messages are less likely to be prematurely ACKed if they cannot be successfully buffered or if critical processing/forwarding steps fail, improving overall message reliability under various conditions.

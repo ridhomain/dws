@@ -135,6 +135,70 @@ var (
 		},
 		[]string{"user_type", "reason"}, // reason: conflict, redis_error, timeout
 	)
+
+	// gRPC Client Pool Metrics
+	GrpcPoolSizeGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "dws_grpc_pool_size",
+			Help: "Total number of connections in the gRPC client pool.",
+		},
+	)
+	GrpcPoolConnectionsCreatedTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connections_created_total",
+			Help: "Total new gRPC client connections established by the pool.",
+		},
+	)
+	GrpcPoolConnectionsClosedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connections_closed_total",
+			Help: "Total gRPC client connections closed by the pool, partitioned by reason.",
+		},
+		[]string{"reason"}, // e.g., "idle", "error", "health_fail"
+	)
+	GrpcPoolConnectionErrorsTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_pool_connection_errors_total",
+			Help: "Total errors encountered with pooled gRPC client connections, partitioned by target pod.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcCircuitBreakerTrippedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_circuitbreaker_tripped_total",
+			Help: "Total times the circuit breaker has tripped for a target pod.",
+		},
+		[]string{"target_pod_id"},
+	)
+
+	// WebSocket Buffer Metrics
+	WebsocketBufferUsedGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dws_websocket_buffer_used_count",
+			Help: "Current number of messages in the WebSocket send buffer.",
+		},
+		[]string{"session_key"}, // Or another relevant label like user_id
+	)
+	WebsocketBufferCapacityGauge = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "dws_websocket_buffer_capacity_count",
+			Help: "Capacity of the WebSocket send buffer.",
+		},
+		[]string{"session_key"},
+	)
+	WebsocketMessagesDroppedTotalCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_websocket_messages_dropped_total",
+			Help: "Total messages dropped due to WebSocket backpressure.",
+		},
+		[]string{"session_key", "reason"}, // e.g., reason: "buffer_full"
+	)
+	WebsocketSlowClientsDisconnectedTotalCounter = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dws_websocket_slow_clients_disconnected_total",
+			Help: "Total slow WebSocket clients disconnected.",
+		},
+	)
 )
 
 // IncrementActiveConnections increments the active connections gauge.
@@ -219,4 +283,42 @@ func IncrementSessionLockSuccess(userType, lockType string) {
 
 func IncrementSessionLockFailure(userType, reason string) {
 	SessionLockFailureCounter.WithLabelValues(userType, reason).Inc()
+}
+
+// Helper functions for gRPC Client Pool Metrics
+func SetGrpcPoolSize(size float64) {
+	GrpcPoolSizeGauge.Set(size)
+}
+
+func IncrementGrpcPoolConnectionsCreated() {
+	GrpcPoolConnectionsCreatedTotalCounter.Inc()
+}
+
+func IncrementGrpcPoolConnectionsClosed(reason string) {
+	GrpcPoolConnectionsClosedTotalCounter.WithLabelValues(reason).Inc()
+}
+
+func IncrementGrpcPoolConnectionErrors(targetPodID string) {
+	GrpcPoolConnectionErrorsTotalCounter.WithLabelValues(targetPodID).Inc()
+}
+
+func IncrementGrpcCircuitBreakerTripped(targetPodID string) {
+	GrpcCircuitBreakerTrippedTotalCounter.WithLabelValues(targetPodID).Inc()
+}
+
+// Helper functions for WebSocket Buffer Metrics
+func SetWebsocketBufferUsed(sessionKey string, count float64) {
+	WebsocketBufferUsedGauge.WithLabelValues(sessionKey).Set(count)
+}
+
+func SetWebsocketBufferCapacity(sessionKey string, capacity float64) {
+	WebsocketBufferCapacityGauge.WithLabelValues(sessionKey).Set(capacity)
+}
+
+func IncrementWebsocketMessagesDropped(sessionKey, reason string) {
+	WebsocketMessagesDroppedTotalCounter.WithLabelValues(sessionKey, reason).Inc()
+}
+
+func IncrementWebsocketSlowClientsDisconnected() {
+	WebsocketSlowClientsDisconnectedTotalCounter.Inc()
 }

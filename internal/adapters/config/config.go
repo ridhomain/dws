@@ -40,9 +40,12 @@ type NATSConfig struct {
 
 // RedisConfig holds Redis-related configurations.
 type RedisConfig struct {
-	Address  string `mapstructure:"address"`
-	Password string `mapstructure:"password"` // Optional
-	DB       int    `mapstructure:"db"`       // Optional
+	Address                                string `mapstructure:"address"`
+	Password                               string `mapstructure:"password"` // Optional
+	DB                                     int    `mapstructure:"db"`       // Optional
+	WebsocketCompressionMode               string `mapstructure:"websocket_compression_mode"`
+	WebsocketCompressionThreshold          int    `mapstructure:"websocket_compression_threshold"`
+	WebsocketDevelopmentInsecureSkipVerify bool   `mapstructure:"websocket_development_insecure_skip_verify"`
 }
 
 // LogConfig holds logging-related configurations.
@@ -62,25 +65,33 @@ type AuthConfig struct {
 
 // AppConfig holds application-specific configurations.
 type AppConfig struct {
-	ServiceName                            string `mapstructure:"service_name"`
-	Version                                string `mapstructure:"version"`
-	PingIntervalSeconds                    int    `mapstructure:"ping_interval_seconds"`
-	ShutdownTimeoutSeconds                 int    `mapstructure:"shutdown_timeout_seconds"`
-	PongWaitSeconds                        int    `mapstructure:"pong_wait_seconds"`
-	WriteTimeoutSeconds                    int    `mapstructure:"write_timeout_seconds"`
-	MaxMissedPongs                         int    `mapstructure:"max_missed_pongs"`
-	SessionTTLSeconds                      int    `mapstructure:"session_ttl_seconds"`
-	RouteTTLSeconds                        int    `mapstructure:"route_ttl_seconds"`
-	TTLRefreshIntervalSeconds              int    `mapstructure:"ttl_refresh_interval_seconds"`
-	NATSMaxAckPending                      int    `mapstructure:"nats_max_ack_pending"`
-	SessionLockRetryDelayMs                int    `mapstructure:"session_lock_retry_delay_ms"`
-	NatsAckWaitSeconds                     int    `mapstructure:"nats_ack_wait_seconds"`
-	GRPCCLientForwardTimeoutSeconds        int    `mapstructure:"grpc_client_forward_timeout_seconds"`
-	ReadTimeoutSeconds                     int    `mapstructure:"read_timeout_seconds"`
-	IdleTimeoutSeconds                     int    `mapstructure:"idle_timeout_seconds"`
-	WebsocketCompressionMode               string `mapstructure:"websocket_compression_mode"`                 // Added for WebSocket compression
-	WebsocketCompressionThreshold          int    `mapstructure:"websocket_compression_threshold"`            // Added for WebSocket compression (bytes)
-	WebsocketDevelopmentInsecureSkipVerify bool   `mapstructure:"websocket_development_insecure_skip_verify"` // Added for local dev with self-signed certs
+	ServiceName                              string `mapstructure:"service_name"`
+	Version                                  string `mapstructure:"version"`
+	PingIntervalSeconds                      int    `mapstructure:"ping_interval_seconds"`
+	ShutdownTimeoutSeconds                   int    `mapstructure:"shutdown_timeout_seconds"`
+	PongWaitSeconds                          int    `mapstructure:"pong_wait_seconds"`
+	WriteTimeoutSeconds                      int    `mapstructure:"write_timeout_seconds"`
+	MaxMissedPongs                           int    `mapstructure:"max_missed_pongs"`
+	SessionTTLSeconds                        int    `mapstructure:"session_ttl_seconds"`
+	RouteTTLSeconds                          int    `mapstructure:"route_ttl_seconds"`
+	TTLRefreshIntervalSeconds                int    `mapstructure:"ttl_refresh_interval_seconds"`
+	NATSMaxAckPending                        int    `mapstructure:"nats_max_ack_pending"`
+	SessionLockRetryDelayMs                  int    `mapstructure:"session_lock_retry_delay_ms"`
+	NatsAckWaitSeconds                       int    `mapstructure:"nats_ack_wait_seconds"`
+	GRPCCLientForwardTimeoutSeconds          int    `mapstructure:"grpc_client_forward_timeout_seconds"`
+	ReadTimeoutSeconds                       int    `mapstructure:"read_timeout_seconds"`
+	IdleTimeoutSeconds                       int    `mapstructure:"idle_timeout_seconds"`
+	WebsocketCompressionMode                 string `mapstructure:"websocket_compression_mode"`
+	WebsocketCompressionThreshold            int    `mapstructure:"websocket_compression_threshold"`
+	WebsocketDevelopmentInsecureSkipVerify   bool   `mapstructure:"websocket_development_insecure_skip_verify"`
+	GrpcPoolIdleTimeoutSeconds               int    `mapstructure:"grpc_pool_idle_timeout_seconds"`
+	GrpcPoolHealthCheckIntervalSeconds       int    `mapstructure:"grpc_pool_health_check_interval_seconds"`
+	GrpcCircuitBreakerFailThreshold          int    `mapstructure:"grpc_circuitbreaker_fail_threshold"`
+	GrpcCircuitBreakerOpenDurationSeconds    int    `mapstructure:"grpc_circuitbreaker_open_duration_seconds"`
+	WebsocketMessageBufferSize               int    `mapstructure:"websocket_message_buffer_size"`
+	WebsocketBackpressureDropPolicy          string `mapstructure:"websocket_backpressure_drop_policy"` // e.g., "drop_oldest", "block"
+	WebsocketSlowClientLatencyMs             int    `mapstructure:"websocket_slow_client_latency_ms"`
+	WebsocketSlowClientDisconnectThresholdMs int    `mapstructure:"websocket_slow_client_disconnect_threshold_ms"`
 }
 
 // Config holds all configuration for the application.
