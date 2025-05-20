@@ -30,9 +30,11 @@ import (
 	dws_message_fwd "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto" // Alias for your generated proto package
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"                 // For XRequestIDHeader
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"                // Added for gRPC status codes
 	"google.golang.org/grpc/connectivity"         // Added for health check
 	"google.golang.org/grpc/credentials/insecure" // For now, will add mTLS later
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status" // Added for gRPC error codes
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -490,14 +492,43 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 							pushCancel()
 
 							if errPush != nil {
-								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod failed", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
-								// If a pooled connection fails, remove it from the pool so a new one is tried next time.
-								if connFromPool {
-									h.grpcClientPool.Delete(gprcTargetAddress)
-									grpcConn.Close() // Close the problematic connection
-									h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool", "target_address", gprcTargetAddress)
+								st, ok := status.FromError(errPush)
+								if ok && (st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded) {
+									h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod failed with retryable error, attempting retry", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "grpc_code", st.Code().String(), "is_pooled_conn", connFromPool, "retry_attempt", 1)
+									metrics.IncrementGrpcForwardRetryAttempts(ownerPodID)
+
+									// Short delay before retry
+									time.Sleep(200 * time.Millisecond) // Configurable delay can be added later
+
+									pushCtxRetry, pushCancelRetry := context.WithTimeout(pushCtxWithMetadata, grpcClientTimeout)
+									resp, errPush = client.PushEvent(pushCtxRetry, grpcRequest) // Retry the call
+									pushCancelRetry()
+
+									if errPush != nil {
+										h.logger.Error(msgCtx, "gRPC PushEvent to owner pod failed after retry", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
+										metrics.IncrementGrpcForwardRetryFailure(ownerPodID)
+										if connFromPool {
+											h.grpcClientPool.Delete(gprcTargetAddress)
+											grpcConn.Close()
+											h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool after retry", "target_address", gprcTargetAddress)
+										}
+									} else if resp != nil && !resp.Success {
+										h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful after retry", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
+										metrics.IncrementGrpcForwardRetryFailure(ownerPodID) // Technically a failure of the retry if GRPC itself succeeded but operation was not successful
+									} else if resp != nil && resp.Success {
+										h.logger.Info(msgCtx, "Successfully forwarded message via gRPC after retry", "target_pod", ownerPodID, "event_id", domainPayload.EventID, "is_pooled_conn", connFromPool)
+										metrics.IncrementGrpcMessagesSent(ownerPodID)        // This still counts as one message sent from the service's perspective
+										metrics.IncrementGrpcForwardRetrySuccess(ownerPodID) // Specifically count successful retries
+									}
+								} else {
+									// Non-retryable error or parsing gRPC status failed
+									h.logger.Error(msgCtx, "gRPC PushEvent to owner pod failed with non-retryable error", "target_pod", ownerPodID, "address", gprcTargetAddress, "error", errPush.Error(), "is_pooled_conn", connFromPool)
+									if connFromPool {
+										h.grpcClientPool.Delete(gprcTargetAddress)
+										grpcConn.Close()
+										h.logger.Info(msgCtx, "Removed and closed failed gRPC connection from pool due to non-retryable error", "target_address", gprcTargetAddress)
+									}
 								}
-								// Retry logic is removed for now to simplify. Can be added back if needed.
 							} else if resp != nil && !resp.Success {
 								h.logger.Warn(msgCtx, "gRPC PushEvent to owner pod was not successful", "target_pod", ownerPodID, "response_message", resp.Message, "is_pooled_conn", connFromPool)
 							} else if resp != nil && resp.Success {
@@ -676,9 +707,9 @@ func (h *Handler) handleSelectChatMessage(
 	companyID, agentID, userID string,
 	payloadData interface{},
 	specificChatNatsMsgHandler nats.MsgHandler, // Renamed for clarity
-	currentGeneralSub *nats.Subscription,       // Pass general subscription
-	currentSpecificSub *nats.Subscription,      // Pass current specific subscription
-	currentSpecificSubChatID string,            // Pass current specific chat ID
+	currentGeneralSub *nats.Subscription, // Pass general subscription
+	currentSpecificSub *nats.Subscription, // Pass current specific subscription
+	currentSpecificSubChatID string, // Pass current specific chat ID
 ) (*nats.Subscription, string, error) { // Returns new specific subscription, new chatID, and error
 
 	payloadMap, ok := payloadData.(map[string]interface{})

@@ -724,3 +724,27 @@ All subtasks for Task 12 are complete. The service now supports an admin WebSock
   - Before reusing a gRPC connection from the pool in `specificChatNatsMessageHandler`, check `grpcConn.GetState()`. If not `Ready` or `Idle`, discard the connection and create a new one.
 - **`internal/adapters/nats/consumer.go`**: Removed an outdated TODO comment about Subtask 6.3, as its functionality was implemented in `websocket/handler.go`.
 - **`internal/bootstrap/app.go`**: Ensured the `/admin/generate-token` endpoint is correctly registered.
+
+## Task 13.3: Error Response Format Consistency - 2025-05-20 16:38:12 (GMT+7)
+
+Improved error response format consistency by implementing centralized error handling mechanisms:
+
+1. **Enhanced WebSocket Error Closing Method**:
+   - Added `ToWebSocketCloseCode()` method to `ErrorResponse` struct in `internal/domain/errors.go` to standardize mapping from domain error codes to WebSocket close codes.
+   - Added `ToHTTPStatus()` method to `ErrorResponse` to provide a similar mapping from domain error codes to HTTP status codes.
+   - Updated `WriteJSON()` method to use `ToHTTPStatus()` when no explicit HTTP status code is provided.
+
+2. **Standardized WebSocket Connection Closure**:
+   - Created a unified `CloseWithError()` method in `Connection` struct that sends a properly formatted error message to the client before closing with the appropriate code.
+   - Updated all error-related connection closures to use this method in both regular and admin WebSocket handlers.
+   - Added clear comments to distinguish normal/graceful closures (which don't need to send error messages) from error conditions.
+
+3. **Implemented Consistent Error Response Format**:
+   - All error responses now follow the established format defined in the architecture document:
+     - For HTTP errors: JSON with `code`, `message`, and optional `details` fields.
+     - For WebSocket errors: JSON with `{"type":"error", "payload": {<ErrorResponseObject>}}` followed by an appropriate close code.
+
+4. **Enhanced Graceful Shutdown**:
+   - Updated `GracefullyCloseAllConnections` to close both regular and admin connections with a standard shutdown error message.
+
+These changes ensure that all error responses throughout the codebase maintain a consistent format, improving client-side error handling predictability and making the API more robust.

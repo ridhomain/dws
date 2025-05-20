@@ -3,6 +3,7 @@
 # *.log
 # tmp/
 
+*.xml
 *.md
 **/*.md
 *.json

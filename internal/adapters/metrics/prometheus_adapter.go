@@ -91,6 +91,50 @@ var (
 		},
 		[]string{"source_pod_id"}, // This might require adding source_pod_id to gRPC request
 	)
+
+	GrpcForwardRetryAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_attempts_total",
+			Help: "Total gRPC message forwarding retry attempts.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcForwardRetrySuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_success_total",
+			Help: "Total successful gRPC message forwarding retries.",
+		},
+		[]string{"target_pod_id"},
+	)
+	GrpcForwardRetryFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_grpc_forward_retry_failure_total",
+			Help: "Total failed gRPC message forwarding retries.",
+		},
+		[]string{"target_pod_id"},
+	)
+
+	SessionLockAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_attempts_total",
+			Help: "Total session lock acquisition attempts.",
+		},
+		[]string{"user_type", "lock_type"}, // lock_type: initial_setnx, retry_setnx, force_set
+	)
+	SessionLockSuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_success_total",
+			Help: "Total successful session lock acquisitions.",
+		},
+		[]string{"user_type", "lock_type"},
+	)
+	SessionLockFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_failure_total",
+			Help: "Total failed session lock acquisitions.",
+		},
+		[]string{"user_type", "reason"}, // reason: conflict, redis_error, timeout
+	)
 )
 
 // IncrementActiveConnections increments the active connections gauge.
@@ -151,4 +195,28 @@ func IncrementGrpcMessagesSent(targetPodID string) {
 // IncrementGrpcMessagesReceived increments the counter for messages received via gRPC.
 func IncrementGrpcMessagesReceived(sourcePodID string) {
 	GrpcMessagesReceivedCounter.WithLabelValues(sourcePodID).Inc()
+}
+
+func IncrementGrpcForwardRetryAttempts(targetPodID string) {
+	GrpcForwardRetryAttemptsCounter.WithLabelValues(targetPodID).Inc()
+}
+
+func IncrementGrpcForwardRetrySuccess(targetPodID string) {
+	GrpcForwardRetrySuccessCounter.WithLabelValues(targetPodID).Inc()
+}
+
+func IncrementGrpcForwardRetryFailure(targetPodID string) {
+	GrpcForwardRetryFailureCounter.WithLabelValues(targetPodID).Inc()
+}
+
+func IncrementSessionLockAttempts(userType, lockType string) {
+	SessionLockAttemptsCounter.WithLabelValues(userType, lockType).Inc()
+}
+
+func IncrementSessionLockSuccess(userType, lockType string) {
+	SessionLockSuccessCounter.WithLabelValues(userType, lockType).Inc()
+}
+
+func IncrementSessionLockFailure(userType, reason string) {
+	SessionLockFailureCounter.WithLabelValues(userType, reason).Inc()
 }
