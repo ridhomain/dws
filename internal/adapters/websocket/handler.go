@@ -98,10 +98,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a new context for this specific WebSocket connection's lifecycle.
-	// This context will be passed to the Connection wrapper.
-	// It's derived from r.Context() initially to carry over request-scoped values like request_id.
-	// However, its lifecycle is independent of the HTTP request once the connection is established.
-	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(r.Context())
+	// This context should be independent of the HTTP request's lifecycle once the connection is established.
+	baseCtxForWs := context.Background()
+	// Propagate essential values from the request context, like request_id.
+	// Assuming RequestIDKey is the correct key used by your middleware.
+	if reqID, ok := r.Context().Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.RequestIDKey, reqID)
+		h.logger.Debug(r.Context(), "Propagated request_id to WebSocket lifetime context", "request_id", reqID)
+	} else {
+		// If no request ID in r.Context(), generate a new one for the WebSocket connection itself
+		// This ensures the wsConnLifetimeCtx always has a request_id for logging consistency.
+		newReqID := uuid.NewString()
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.RequestIDKey, newReqID)
+		h.logger.Debug(r.Context(), "No request_id in r.Context(), generated new request_id for WebSocket lifetime context", "new_request_id", newReqID)
+	}
+	// Add other necessary context values from r.Context() to baseCtxForWs if needed.
+
+	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(baseCtxForWs)
 
 	// Session Lock Acquisition (FR-4 part 1)
 	// This context should be short-lived for the lock acquisition attempt.
@@ -206,40 +219,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Pass companyID and agentID for route registration
 	h.connManager.RegisterConnection(sessionKey, wrappedConn, authCtx.CompanyID, authCtx.AgentID)
 
-	// Defer deregistration for when manageConnection exits
-	defer func() {
-		h.logger.Info(wrappedConn.Context(), "Connection management goroutine finished. Deregistering connection.", "sessionKey", sessionKey)
-		duration := time.Since(startTime).Seconds()
-		metrics.ObserveConnectionDuration(duration)
-		h.connManager.DeregisterConnection(sessionKey)
-		// Also attempt to release the session lock owned by this pod when the connection closes cleanly.
-		currentPodID := h.configProvider.Get().Server.PodID
-		if currentPodID != "" {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second) // Use a fresh, short-lived context
-			defer releaseCancel()
-			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, sessionKey, currentPodID); releaseErr != nil {
-				h.logger.Error(wrappedConn.Context(), "Failed to release session lock on connection close", "sessionKey", sessionKey, "error", releaseErr)
-			} else if released {
-				h.logger.Info(wrappedConn.Context(), "Successfully released session lock on connection close", "sessionKey", sessionKey)
-			} else {
-				// This might happen if the lock expired or was taken by another session (e.g. due to kill switch)
-				h.logger.Warn(wrappedConn.Context(), "Failed to release session lock on connection close (lock not held or value mismatch)", "sessionKey", sessionKey, "pod_id_used_for_release", currentPodID)
-			}
+	// Record initial activity for the session
+	if h.connManager.SessionLocker() != nil {
+		adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+		activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+		if activityTTL <= 0 {
+			activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
 		}
+		if errAct := h.connManager.SessionLocker().RecordActivity(wrappedConn.Context(), sessionKey, activityTTL); errAct != nil {
+			h.logger.Error(wrappedConn.Context(), "Failed to record initial session activity", "sessionKey", sessionKey, "error", errAct)
+		} else {
+			h.logger.Debug(wrappedConn.Context(), "Recorded initial session activity", "sessionKey", sessionKey, "activityTTL", activityTTL.String())
+		}
+	}
+
+	// Defer deregistration for when manageConnection exits its goroutine.
+	// This defer is part of ServeHTTP and captures wrappedConn and sessionKey.
+	// It will execute when the safego.Execute goroutine (running manageConnection) finishes.
+	defer func() {
+		h.logger.Info(wrappedConn.Context(), "Connection management goroutine finished (likely due to context cancellation or manageConnection returning). Deregistering connection.", "sessionKey", sessionKey)
+		duration := time.Since(startTime) // startTime is from ServeHTTP's scope
+		metrics.ObserveConnectionDuration(duration.Seconds())
+		h.connManager.DeregisterConnection(sessionKey)
+		// The lock release is handled by DeregisterConnection.
 	}()
 
 	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("WebSocketConnectionManager-%s", sessionKey), func() {
+		// Call manageConnection. When this function (passed to safego.Execute) returns,
+		// the defer func() above in ServeHTTP will be triggered.
 		h.manageConnection(wsConnLifetimeCtx, wrappedConn, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
 	})
 }
 
 // manageConnection handles the lifecycle of a single WebSocket connection.
 // It is responsible for reading messages, sending pings, handling timeouts, and ensuring cleanup.
-// The companyID, agentID, and userID parameters are now authoritative, derived from the validated token.
+// The connCtx passed here is wsConnLifetimeCtx from ServeHTTP.
+// companyID, agentID, userID are authoritative, derived from the validated token.
 func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, companyID, agentID, userID string) {
-	// For normal/graceful closure, we intentionally use a direct Close instead of CloseWithError
-	// since this is an expected termination (e.g., function exit), not an error condition that needs to be reported to the client.
-	defer conn.Close(websocket.StatusNormalClosure, "connection ended") // Ensures WebSocket closes if all other error handling is bypassed
+	// DO NOT add 'defer conn.Close(...)' here.
+	// manageConnection's context (connCtx) will be canceled externally (e.g., by ConnectionManager or if ServeHTTP fails post-goroutine start)
+	// or internally by conn.Close() if a read/write/ping error requires immediate shutdown.
+	// When connCtx is Done, this function will return, and the defer in ServeHTTP will handle DeregisterConnection.
 
 	// Use the authenticated IDs for logging here
 	h.logger.Info(connCtx, "WebSocket connection management started",
@@ -256,6 +276,22 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	}
 	metrics.IncrementMessagesSent(domain.MessageTypeReady)
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
+
+	// DIAGNOSTIC: Refined logging around the delay
+	h.logger.Debug(connCtx, "DIAGNOSTIC: Pre-sleep check. Context error (if any)", "error_before_sleep", fmt.Sprintf("%v", connCtx.Err()))
+
+	time.Sleep(100 * time.Millisecond)
+
+	h.logger.Debug(connCtx, "DIAGNOSTIC: Post-sleep check. Context error (if any)", "error_after_sleep", fmt.Sprintf("%v", connCtx.Err()))
+
+	if connCtx.Err() != nil {
+		h.logger.Error(connCtx, "DIAGNOSTIC: Context WAS CANCELED during/after sleep period", "error", connCtx.Err())
+		// Use a more specific reason for CloseWithError if this path is taken
+		conn.CloseWithError(domain.NewErrorResponse(domain.ErrInternal, "Context canceled during diagnostic sleep", connCtx.Err().Error()), "context canceled (diag sleep)")
+		return
+	} else {
+		h.logger.Debug(connCtx, "DIAGNOSTIC: Context OK after sleep, proceeding to NATS.")
+	}
 
 	var generalNatsSubscription domain.NatsMessageSubscription  // Changed type
 	var specificNatsSubscription domain.NatsMessageSubscription // Changed type
@@ -475,17 +511,32 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			for {
 				select {
 				case <-pinger.C:
-					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
-					if err := conn.Ping(pingWriteCtx); err != nil {
-						h.logger.Error(connCtx, "Failed to send ping", "error", err.Error())
-						pingCancel()
+					// IMPLEMENTATION CHANGE: Don't use conn.Ping() as it doesn't seem to work consistently with received PONGs
+					// Instead, manually write a PING and rely on our OnPongReceived callback which updates LastPongTime()
+					// We've confirmed OnPongReceived works (logs show "Pong received via AcceptOptions callback")
+
+					// The old approach that doesn't work properly:
+					// pingOpCtx, pingOpCancel := context.WithTimeout(context.Background(), 70*time.Second)
+					// if err := conn.Ping(pingOpCtx); err != nil { ... }
+
+					// New approach: just write a PING frame directly
+					writeCtx, writeCancel := context.WithTimeout(connCtx, writeTimeout)
+
+					// Get the underlying *websocket.Conn and use it to send PING directly
+					wsConn := conn.UnderlyingConn()
+					err := wsConn.Ping(writeCtx) // Simple ping without waiting for PONG
+
+					writeCancel()
+					if err != nil {
+						h.logger.Error(connCtx, "Failed to send PING frame", "error", err.Error())
 						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
-						conn.CloseWithError(errResp, "Ping failure")
+						conn.CloseWithError(errResp, "Ping write failure")
 						return
 					}
-					pingCancel()
-					h.logger.Debug(connCtx, "Sent ping")
 
+					h.logger.Debug(connCtx, "Sent ping frame manually") // Changed log to be more specific
+
+					// This check uses OUR lastPongTime, updated by OnPongReceived callback
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
 						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "lastPong", conn.LastPongTime())
 						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
@@ -613,8 +664,8 @@ func (h *Handler) handleSelectChatMessage(
 	companyID, agentID, userID string,
 	payloadData interface{},
 	specificChatNatsMsgHandler domain.NatsMessageHandler, // Changed type
-	currentGeneralSub domain.NatsMessageSubscription, // Changed type
-	currentSpecificSub domain.NatsMessageSubscription, // Changed type
+	currentGeneralSub domain.NatsMessageSubscription,     // Changed type
+	currentSpecificSub domain.NatsMessageSubscription,    // Changed type
 	currentSpecificSubChatID string,
 ) (domain.NatsMessageSubscription, string, error) { // Changed return type
 

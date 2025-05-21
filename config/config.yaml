@@ -46,7 +46,7 @@ app:
   ping_interval_seconds: 20
   shutdown_timeout_seconds: 30
   pong_wait_seconds: 60 # Increased from any previous implicit/default values
-  write_timeout_seconds: 10
+  write_timeout_seconds: 30
   max_missed_pongs: 2
   session_ttl_seconds: 30
   route_ttl_seconds: 30

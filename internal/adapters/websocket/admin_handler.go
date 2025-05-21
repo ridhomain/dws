@@ -119,25 +119,43 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"admin_session_key", adminSessionKey,
 	)
 
-	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "") // Pass empty strings for company/agent for admin conns
+	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "")
+
+	// Record initial activity for the admin session
+	if h.connManager.SessionLocker() != nil {
+		adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+		activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+		if activityTTL <= 0 {
+			activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+		}
+		if errAct := h.connManager.SessionLocker().RecordActivity(wrappedConn.Context(), adminSessionKey, activityTTL); errAct != nil {
+			h.logger.Error(wrappedConn.Context(), "Failed to record initial admin session activity", "adminSessionKey", adminSessionKey, "error", errAct)
+		} else {
+			h.logger.Debug(wrappedConn.Context(), "Recorded initial admin session activity", "adminSessionKey", adminSessionKey, "activityTTL", activityTTL.String())
+		}
+	}
 
 	defer func() {
 		h.logger.Info(wrappedConn.Context(), "Admin connection management goroutine finished. Deregistering admin connection.", "admin_session_key", adminSessionKey)
 		duration := time.Since(startTime).Seconds()
 		metrics.ObserveConnectionDuration(duration)         // Observe for admin connections
 		h.connManager.DeregisterConnection(adminSessionKey) // Uses generic deregister for now
-		// Release lock on clean disconnect
-		if currentPodID != "" {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer releaseCancel()
-			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
-				h.logger.Error(wrappedConn.Context(), "Failed to release admin session lock on connection close", "admin_session_key", adminSessionKey, "error", releaseErr)
-			} else if released {
-				h.logger.Info(wrappedConn.Context(), "Successfully released admin session lock on connection close", "admin_session_key", adminSessionKey)
-			} else {
-				h.logger.Warn(wrappedConn.Context(), "Failed to release admin session lock on connection close (not held or value mismatch)", "admin_session_key", adminSessionKey)
+		// Do not attempt to release the lock here - the ConnectionManager.DeregisterConnection already does this
+		// Uncomment the below code ONLY if you remove the lock release from ConnectionManager.DeregisterConnection
+		/*
+			// Release lock on clean disconnect
+			if currentPodID != "" {
+				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer releaseCancel()
+				if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
+					h.logger.Error(wrappedConn.Context(), "Failed to release admin session lock on connection close", "admin_session_key", adminSessionKey, "error", releaseErr)
+				} else if released {
+					h.logger.Info(wrappedConn.Context(), "Successfully released admin session lock on connection close", "admin_session_key", adminSessionKey)
+				} else {
+					h.logger.Warn(wrappedConn.Context(), "Failed to release admin session lock on connection close (not held or value mismatch)", "admin_session_key", adminSessionKey)
+				}
 			}
-		}
+		*/
 	}()
 
 	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("AdminWebSocketConnectionManager-%s", adminSessionKey), func() {

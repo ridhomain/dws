@@ -121,24 +121,43 @@ func (c *Connection) startWriter() {
 
 				metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
 
-				ctxToWrite := c.connCtx
-				var cancel context.CancelFunc
+				// Create a separate context for write operations that's independent of connection cancellations
 				writeTimeout := time.Duration(c.writeTimeoutSeconds) * time.Second
 				if writeTimeout <= 0 {
 					writeTimeout = 10 * time.Second // Default if not configured
 				}
-				ctxToWrite, cancel = context.WithTimeout(c.connCtx, writeTimeout)
+
+				// Use a background context for the write operation instead of the connection context
+				// This ensures we can complete the write even if the connection context is canceled
+				ctxToWrite, cancel := context.WithTimeout(context.Background(), writeTimeout)
 
 				c.mu.Lock() // Protects wsConn
-				err := c.wsConn.Write(ctxToWrite, websocket.MessageText, msgBytes)
+				var err error
+				// Check if the connection context is already done before attempting to write
+				select {
+				case <-c.connCtx.Done():
+					c.logger.Info(ctxToWrite, "Connection context already done before write attempt, skipping write", "sessionKey", c.sessionKey)
+					err = c.connCtx.Err()
+				default:
+					// Connection context is still valid, attempt the write
+					err = c.wsConn.Write(ctxToWrite, websocket.MessageText, msgBytes)
+				}
 				c.mu.Unlock()
 				cancel()
 
 				if err != nil {
-					c.logger.Error(c.connCtx, "Failed to write message from buffer to WebSocket", "error", err.Error(), "sessionKey", c.sessionKey)
-					// If write fails, the connection is likely compromised.
-					// Close the connection from the managing goroutine's perspective.
-					c.cancelConnCtxFunc() // Signal manageConnection to clean up
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						c.logger.Info(c.connCtx, "WebSocket write canceled or timed out, connection likely closing", "error", err.Error(), "sessionKey", c.sessionKey)
+					} else {
+						c.logger.Error(c.connCtx, "Failed to write message from buffer to WebSocket", "error", err.Error(), "sessionKey", c.sessionKey)
+					}
+
+					// Don't immediately cancel the connection context on every write error
+					// Only do it for non-context related errors that indicate connection problems
+					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+						// Signal manageConnection to clean up for serious connection errors
+						c.cancelConnCtxFunc()
+					}
 					return
 				}
 				// Successfully wrote message
