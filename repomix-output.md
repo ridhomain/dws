@@ -114,40 +114,9 @@ pkg/
     safego.go
 .gitignore
 go.mod
-prometheus.yml
 ```
 
 # Files
-
-## File: prometheus.yml
-```yaml
-global:
-  scrape_interval: 15s
-scrape_configs:
-  - job_name: 'nats'
-    static_configs:
-      - targets: ['nats:8222']
-  - job_name: 'nats_exporter'
-    static_configs:
-      - targets: ['nats_exporter:7777']
-  - job_name: 'tenant_app_A'
-    metrics_path: /metrics
-    dns_sd_configs:
-      - names:
-          - tenant_app_A
-        type: A
-        port: 8080
-  - job_name: 'tenant_app_B'
-    metrics_path: /metrics
-    dns_sd_configs:
-      - names:
-          - tenant_app_B
-        type: A
-        port: 8080
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-```
 
 ## File: internal/adapters/grpc/proto/dws_message_fwd.proto
 ```protobuf
@@ -991,81 +960,6 @@ func (fa *ForwarderAdapter) Stop() {
 }
 ```
 
-## File: internal/adapters/grpc/server.go
-```go
-package grpc
-import (
-	"context"
-	"fmt"
-	"net"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
-)
-type Server struct {
-	gsrv        *grpc.Server
-	logger      domain.Logger
-	cfgProvider config.Provider
-	appCtx      context.Context
-	cancelCtx   context.CancelFunc
-}
-func NewServer(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider, grpcHandler *application.GRPCMessageHandler) (*Server, error) {
-	opts := []grpc.ServerOption{}
-	gsrv := grpc.NewServer(opts...)
-	pb.RegisterMessageForwardingServiceServer(gsrv, grpcHandler)
-	if cfgProvider.Get().Server.EnableReflection {
-		reflection.Register(gsrv)
-		logger.Info(appCtx, "gRPC reflection enabled.")
-	} else {
-		logger.Info(appCtx, "gRPC reflection disabled.")
-	}
-	serverLifecycleCtx, serverLifecycleCancel := context.WithCancel(appCtx)
-	return &Server{
-		gsrv:        gsrv,
-		logger:      logger,
-		cfgProvider: cfgProvider,
-		appCtx:      serverLifecycleCtx,
-		cancelCtx:   serverLifecycleCancel,
-	}, nil
-}
-func (s *Server) Start() error {
-	grpcPort := s.cfgProvider.Get().Server.GRPCPort
-	if grpcPort == 0 {
-		s.logger.Warn(s.appCtx, "gRPC port is not configured or is 0. gRPC server will not start.")
-		return fmt.Errorf("gRPC port not configured")
-	}
-	addr := fmt.Sprintf(":%d", grpcPort)
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		s.logger.Error(s.appCtx, "Failed to listen for gRPC", "address", addr, "error", err)
-		return fmt.Errorf("failed to listen for gRPC on %s: %w", addr, err)
-	}
-	s.logger.Info(s.appCtx, "gRPC server starting", "address", addr)
-	safego.Execute(s.appCtx, s.logger, "GRPCServerServe", func() {
-		if err := s.gsrv.Serve(lis); err != nil && err != grpc.ErrServerStopped {
-			s.logger.Error(s.appCtx, "gRPC server failed to serve", "error", err)
-		}
-		s.logger.Info(s.appCtx, "gRPC server Serve() returned. Ensuring context is cancelled.")
-		s.cancelCtx()
-	})
-	safego.Execute(s.appCtx, s.logger, "GRPCServerContextWatcher", func() {
-		<-s.appCtx.Done()
-		s.logger.Info(context.Background(), "gRPC server context done (e.g. from app shutdown), initiating graceful stop...")
-		s.gsrv.GracefulStop()
-		s.logger.Info(context.Background(), "gRPC server gracefully stopped after context cancellation.")
-	})
-	return nil
-}
-func (s *Server) GracefulStop() {
-	s.logger.Info(s.appCtx, "GracefulStop called for gRPC server. Cancelling its lifecycle context to trigger stop.")
-	s.cancelCtx()
-}
-```
-
 ## File: internal/adapters/http/admin_handlers.go
 ```go
 package http
@@ -1840,6 +1734,90 @@ func AdminSessionKey(adminID string) string {
 }
 func AdminSessionKillChannelKey(adminID string) string {
 	return fmt.Sprintf("session_kill:admin:%s", adminID)
+}
+```
+
+## File: internal/adapters/grpc/server.go
+```go
+package grpc
+import (
+	"context"
+	"fmt"
+	"net"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	pb "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+type Server struct {
+	gsrv        *grpc.Server
+	logger      domain.Logger
+	cfgProvider config.Provider
+	appCtx      context.Context
+	cancelCtx   context.CancelFunc
+}
+func NewServer(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider, grpcHandler *application.GRPCMessageHandler) (*Server, error) {
+	opts := []grpc.ServerOption{}
+	gsrv := grpc.NewServer(opts...)
+	pb.RegisterMessageForwardingServiceServer(gsrv, grpcHandler)
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(gsrv, healthServer)
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	// Conditionally enable gRPC reflection
+	if cfgProvider.Get().Server.EnableReflection {
+		reflection.Register(gsrv)
+		logger.Info(appCtx, "gRPC reflection enabled.")
+	} else {
+		logger.Info(appCtx, "gRPC reflection disabled.")
+	}
+	// Create a new context that can be cancelled independently for this server's lifecycle,
+	// but is derived from the main application context.
+	serverLifecycleCtx, serverLifecycleCancel := context.WithCancel(appCtx)
+	return &Server{
+		gsrv:        gsrv,
+		logger:      logger,
+		cfgProvider: cfgProvider,
+		appCtx:      serverLifecycleCtx,
+		cancelCtx:   serverLifecycleCancel,
+	}, nil
+}
+// Start starts the gRPC server in a new goroutine.
+func (s *Server) Start() error {
+	grpcPort := s.cfgProvider.Get().Server.GRPCPort
+	if grpcPort == 0 {
+		s.logger.Warn(s.appCtx, "gRPC port is not configured or is 0. gRPC server will not start.")
+		return fmt.Errorf("gRPC port not configured")
+	}
+	addr := fmt.Sprintf(":%d", grpcPort)
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		s.logger.Error(s.appCtx, "Failed to listen for gRPC", "address", addr, "error", err)
+		return fmt.Errorf("failed to listen for gRPC on %s: %w", addr, err)
+	}
+	s.logger.Info(s.appCtx, "gRPC server starting", "address", addr)
+	safego.Execute(s.appCtx, s.logger, "GRPCServerServe", func() {
+		if err := s.gsrv.Serve(lis); err != nil && err != grpc.ErrServerStopped {
+			s.logger.Error(s.appCtx, "gRPC server failed to serve", "error", err)
+		}
+		s.logger.Info(s.appCtx, "gRPC server Serve() returned. Ensuring context is cancelled.")
+		s.cancelCtx()
+	})
+	safego.Execute(s.appCtx, s.logger, "GRPCServerContextWatcher", func() {
+		<-s.appCtx.Done()
+		s.logger.Info(context.Background(), "gRPC server context done (e.g. from app shutdown), initiating graceful stop...")
+		s.gsrv.GracefulStop()
+		s.logger.Info(context.Background(), "gRPC server gracefully stopped after context cancellation.")
+	})
+	return nil
+}
+func (s *Server) GracefulStop() {
+	s.logger.Info(s.appCtx, "GracefulStop called for gRPC server. Cancelling its lifecycle context to trigger stop.")
+	s.cancelCtx()
 }
 ```
 
