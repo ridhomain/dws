@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v5.29.3
-// source: internal/adapters/grpc/proto/dws_message_fwd.proto
+// source: dws_message_fwd.proto
 
 package dws_message_fwd
 
@@ -118,5 +118,5 @@ var MessageForwardingService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "internal/adapters/grpc/proto/dws_message_fwd.proto",
+	Metadata: "dws_message_fwd.proto",
 }

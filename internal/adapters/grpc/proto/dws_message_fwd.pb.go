@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.6
 // 	protoc        v5.29.3
-// source: internal/adapters/grpc/proto/dws_message_fwd.proto
+// source: dws_message_fwd.proto
 
 package dws_message_fwd
 
@@ -10,7 +10,6 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	structpb "google.golang.org/protobuf/types/known/structpb"
-	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -26,17 +25,19 @@ const (
 type EnrichedEventPayloadMessage struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	EventId       string                 `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
-	EventType     string                 `protobuf:"bytes,2,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	Source        string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
-	Data          *structpb.Struct       `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"` // For arbitrary JSON-like data
+	CompanyId     string                 `protobuf:"bytes,2,opt,name=company_id,json=companyId,proto3" json:"company_id,omitempty"`
+	AgentId       string                 `protobuf:"bytes,3,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`       // Optional in source JSON, but always string if present
+	MessageId     string                 `protobuf:"bytes,4,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"` // Optional in source JSON
+	ChatId        string                 `protobuf:"bytes,5,opt,name=chat_id,json=chatId,proto3" json:"chat_id,omitempty"`          // Optional in source JSON
+	RowData       *structpb.Struct       `protobuf:"bytes,6,opt,name=row_data,json=rowData,proto3" json:"row_data,omitempty"`       // Contains the actual table row data
+	EventTime     string                 `protobuf:"bytes,7,opt,name=event_time,json=eventTime,proto3" json:"event_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *EnrichedEventPayloadMessage) Reset() {
 	*x = EnrichedEventPayloadMessage{}
-	mi := &file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes[0]
+	mi := &file_dws_message_fwd_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -48,7 +49,7 @@ func (x *EnrichedEventPayloadMessage) String() string {
 func (*EnrichedEventPayloadMessage) ProtoMessage() {}
 
 func (x *EnrichedEventPayloadMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes[0]
+	mi := &file_dws_message_fwd_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -61,7 +62,7 @@ func (x *EnrichedEventPayloadMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnrichedEventPayloadMessage.ProtoReflect.Descriptor instead.
 func (*EnrichedEventPayloadMessage) Descriptor() ([]byte, []int) {
-	return file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescGZIP(), []int{0}
+	return file_dws_message_fwd_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *EnrichedEventPayloadMessage) GetEventId() string {
@@ -71,32 +72,46 @@ func (x *EnrichedEventPayloadMessage) GetEventId() string {
 	return ""
 }
 
-func (x *EnrichedEventPayloadMessage) GetEventType() string {
+func (x *EnrichedEventPayloadMessage) GetCompanyId() string {
 	if x != nil {
-		return x.EventType
+		return x.CompanyId
 	}
 	return ""
 }
 
-func (x *EnrichedEventPayloadMessage) GetTimestamp() *timestamppb.Timestamp {
+func (x *EnrichedEventPayloadMessage) GetAgentId() string {
 	if x != nil {
-		return x.Timestamp
-	}
-	return nil
-}
-
-func (x *EnrichedEventPayloadMessage) GetSource() string {
-	if x != nil {
-		return x.Source
+		return x.AgentId
 	}
 	return ""
 }
 
-func (x *EnrichedEventPayloadMessage) GetData() *structpb.Struct {
+func (x *EnrichedEventPayloadMessage) GetMessageId() string {
 	if x != nil {
-		return x.Data
+		return x.MessageId
+	}
+	return ""
+}
+
+func (x *EnrichedEventPayloadMessage) GetChatId() string {
+	if x != nil {
+		return x.ChatId
+	}
+	return ""
+}
+
+func (x *EnrichedEventPayloadMessage) GetRowData() *structpb.Struct {
+	if x != nil {
+		return x.RowData
 	}
 	return nil
+}
+
+func (x *EnrichedEventPayloadMessage) GetEventTime() string {
+	if x != nil {
+		return x.EventTime
+	}
+	return ""
 }
 
 type PushEventRequest struct {
@@ -112,7 +127,7 @@ type PushEventRequest struct {
 
 func (x *PushEventRequest) Reset() {
 	*x = PushEventRequest{}
-	mi := &file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes[1]
+	mi := &file_dws_message_fwd_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -124,7 +139,7 @@ func (x *PushEventRequest) String() string {
 func (*PushEventRequest) ProtoMessage() {}
 
 func (x *PushEventRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes[1]
+	mi := &file_dws_message_fwd_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -137,7 +152,7 @@ func (x *PushEventRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushEventRequest.ProtoReflect.Descriptor instead.
 func (*PushEventRequest) Descriptor() ([]byte, []int) {
-	return file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescGZIP(), []int{1}
+	return file_dws_message_fwd_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PushEventRequest) GetPayload() *EnrichedEventPayloadMessage {
@@ -185,7 +200,7 @@ type PushEventResponse struct {
 
 func (x *PushEventResponse) Reset() {
 	*x = PushEventResponse{}
-	mi := &file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes[2]
+	mi := &file_dws_message_fwd_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -197,7 +212,7 @@ func (x *PushEventResponse) String() string {
 func (*PushEventResponse) ProtoMessage() {}
 
 func (x *PushEventResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes[2]
+	mi := &file_dws_message_fwd_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -210,7 +225,7 @@ func (x *PushEventResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushEventResponse.ProtoReflect.Descriptor instead.
 func (*PushEventResponse) Descriptor() ([]byte, []int) {
-	return file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescGZIP(), []int{2}
+	return file_dws_message_fwd_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PushEventResponse) GetSuccess() bool {
@@ -227,18 +242,22 @@ func (x *PushEventResponse) GetMessage() string {
 	return ""
 }
 
-var File_internal_adapters_grpc_proto_dws_message_fwd_proto protoreflect.FileDescriptor
+var File_dws_message_fwd_proto protoreflect.FileDescriptor
 
-const file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDesc = "" +
+const file_dws_message_fwd_proto_rawDesc = "" +
 	"\n" +
-	"2internal/adapters/grpc/proto/dws_message_fwd.proto\x12\x0fdws_message_fwd\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/protobuf/struct.proto\"\xd6\x01\n" +
+	"\x15dws_message_fwd.proto\x12\x0fdws_message_fwd\x1a\x1cgoogle/protobuf/struct.proto\"\xfd\x01\n" +
 	"\x1bEnrichedEventPayloadMessage\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1d\n" +
 	"\n" +
-	"event_type\x18\x02 \x01(\tR\teventType\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x16\n" +
-	"\x06source\x18\x04 \x01(\tR\x06source\x12+\n" +
-	"\x04data\x18\x05 \x01(\v2\x17.google.protobuf.StructR\x04data\"\xf8\x01\n" +
+	"company_id\x18\x02 \x01(\tR\tcompanyId\x12\x19\n" +
+	"\bagent_id\x18\x03 \x01(\tR\aagentId\x12\x1d\n" +
+	"\n" +
+	"message_id\x18\x04 \x01(\tR\tmessageId\x12\x17\n" +
+	"\achat_id\x18\x05 \x01(\tR\x06chatId\x122\n" +
+	"\brow_data\x18\x06 \x01(\v2\x17.google.protobuf.StructR\arowData\x12\x1d\n" +
+	"\n" +
+	"event_time\x18\a \x01(\tR\teventTime\"\xf8\x01\n" +
 	"\x10PushEventRequest\x12F\n" +
 	"\apayload\x18\x01 \x01(\v2,.dws_message_fwd.EnrichedEventPayloadMessageR\apayload\x12*\n" +
 	"\x11target_company_id\x18\x02 \x01(\tR\x0ftargetCompanyId\x12&\n" +
@@ -252,58 +271,56 @@ const file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDesc = "" +
 	"\tPushEvent\x12!.dws_message_fwd.PushEventRequest\x1a\".dws_message_fwd.PushEventResponseBVZTgitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto;dws_message_fwdb\x06proto3"
 
 var (
-	file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescOnce sync.Once
-	file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescData []byte
+	file_dws_message_fwd_proto_rawDescOnce sync.Once
+	file_dws_message_fwd_proto_rawDescData []byte
 )
 
-func file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescGZIP() []byte {
-	file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescOnce.Do(func() {
-		file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDesc), len(file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDesc)))
+func file_dws_message_fwd_proto_rawDescGZIP() []byte {
+	file_dws_message_fwd_proto_rawDescOnce.Do(func() {
+		file_dws_message_fwd_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_dws_message_fwd_proto_rawDesc), len(file_dws_message_fwd_proto_rawDesc)))
 	})
-	return file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDescData
+	return file_dws_message_fwd_proto_rawDescData
 }
 
-var file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
-var file_internal_adapters_grpc_proto_dws_message_fwd_proto_goTypes = []any{
+var file_dws_message_fwd_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_dws_message_fwd_proto_goTypes = []any{
 	(*EnrichedEventPayloadMessage)(nil), // 0: dws_message_fwd.EnrichedEventPayloadMessage
 	(*PushEventRequest)(nil),            // 1: dws_message_fwd.PushEventRequest
 	(*PushEventResponse)(nil),           // 2: dws_message_fwd.PushEventResponse
-	(*timestamppb.Timestamp)(nil),       // 3: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),             // 4: google.protobuf.Struct
+	(*structpb.Struct)(nil),             // 3: google.protobuf.Struct
 }
-var file_internal_adapters_grpc_proto_dws_message_fwd_proto_depIdxs = []int32{
-	3, // 0: dws_message_fwd.EnrichedEventPayloadMessage.timestamp:type_name -> google.protobuf.Timestamp
-	4, // 1: dws_message_fwd.EnrichedEventPayloadMessage.data:type_name -> google.protobuf.Struct
-	0, // 2: dws_message_fwd.PushEventRequest.payload:type_name -> dws_message_fwd.EnrichedEventPayloadMessage
-	1, // 3: dws_message_fwd.MessageForwardingService.PushEvent:input_type -> dws_message_fwd.PushEventRequest
-	2, // 4: dws_message_fwd.MessageForwardingService.PushEvent:output_type -> dws_message_fwd.PushEventResponse
-	4, // [4:5] is the sub-list for method output_type
-	3, // [3:4] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+var file_dws_message_fwd_proto_depIdxs = []int32{
+	3, // 0: dws_message_fwd.EnrichedEventPayloadMessage.row_data:type_name -> google.protobuf.Struct
+	0, // 1: dws_message_fwd.PushEventRequest.payload:type_name -> dws_message_fwd.EnrichedEventPayloadMessage
+	1, // 2: dws_message_fwd.MessageForwardingService.PushEvent:input_type -> dws_message_fwd.PushEventRequest
+	2, // 3: dws_message_fwd.MessageForwardingService.PushEvent:output_type -> dws_message_fwd.PushEventResponse
+	3, // [3:4] is the sub-list for method output_type
+	2, // [2:3] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
-func init() { file_internal_adapters_grpc_proto_dws_message_fwd_proto_init() }
-func file_internal_adapters_grpc_proto_dws_message_fwd_proto_init() {
-	if File_internal_adapters_grpc_proto_dws_message_fwd_proto != nil {
+func init() { file_dws_message_fwd_proto_init() }
+func file_dws_message_fwd_proto_init() {
+	if File_dws_message_fwd_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDesc), len(file_internal_adapters_grpc_proto_dws_message_fwd_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_dws_message_fwd_proto_rawDesc), len(file_dws_message_fwd_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   3,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_internal_adapters_grpc_proto_dws_message_fwd_proto_goTypes,
-		DependencyIndexes: file_internal_adapters_grpc_proto_dws_message_fwd_proto_depIdxs,
-		MessageInfos:      file_internal_adapters_grpc_proto_dws_message_fwd_proto_msgTypes,
+		GoTypes:           file_dws_message_fwd_proto_goTypes,
+		DependencyIndexes: file_dws_message_fwd_proto_depIdxs,
+		MessageInfos:      file_dws_message_fwd_proto_msgTypes,
 	}.Build()
-	File_internal_adapters_grpc_proto_dws_message_fwd_proto = out.File
-	file_internal_adapters_grpc_proto_dws_message_fwd_proto_goTypes = nil
-	file_internal_adapters_grpc_proto_dws_message_fwd_proto_depIdxs = nil
+	File_dws_message_fwd_proto = out.File
+	file_dws_message_fwd_proto_goTypes = nil
+	file_dws_message_fwd_proto_depIdxs = nil
 }

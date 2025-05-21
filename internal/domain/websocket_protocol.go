@@ -1,6 +1,8 @@
 package domain
 
 import (
+	// "time" // No longer needed here if EventTime is string throughout
+
 	"github.com/coder/websocket"
 )
 
@@ -34,10 +36,11 @@ func NewReadyMessage() BaseMessage {
 }
 
 // NewEventMessage creates a new message of type "event".
+// It expects eventData to be the domain.EnrichedEventPayload (or any other desired payload struct for events).
 func NewEventMessage(eventData interface{}) BaseMessage {
 	return BaseMessage{
 		Type:    MessageTypeEvent,
-		Payload: eventData,
+		Payload: eventData, // eventData (domain.EnrichedEventPayload) is passed directly
 	}
 }
 

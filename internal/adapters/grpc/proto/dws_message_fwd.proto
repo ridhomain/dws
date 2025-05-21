@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package dws_message_fwd;
 
-import "google/protobuf/timestamp.proto";
 import "google/protobuf/struct.proto";
 
 option go_package = "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto;dws_message_fwd";
@@ -13,10 +12,12 @@ service MessageForwardingService {
 
 message EnrichedEventPayloadMessage {
   string event_id = 1;
-  string event_type = 2;
-  google.protobuf.Timestamp timestamp = 3;
-  string source = 4;
-  google.protobuf.Struct data = 5; // For arbitrary JSON-like data
+  string company_id = 2;
+  string agent_id = 3;    // Optional in source JSON, but always string if present
+  string message_id = 4;  // Optional in source JSON
+  string chat_id = 5;     // Optional in source JSON
+  google.protobuf.Struct row_data = 6; // Contains the actual table row data
+  string event_time = 7;
 }
 
 message PushEventRequest {

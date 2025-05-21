@@ -20,7 +20,6 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	structpb "google.golang.org/protobuf/types/known/structpb"
-	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -201,19 +200,33 @@ func (fa *ForwarderAdapter) ForwardEvent(ctx context.Context, targetPodAddress s
 	}
 
 	client := pb.NewMessageForwardingServiceClient(grpcConn)
-	protoData, errProtoStruct := structpb.NewStruct(event.Data.(map[string]interface{}))
+
+	// Convert event.RowData to map[string]interface{} for structpb.NewStruct
+	var rowDataMap map[string]interface{}
+	if event.RowData != nil {
+		var ok bool
+		rowDataMap, ok = event.RowData.(map[string]interface{})
+		if !ok {
+			fa.logger.Error(ctx, "event.RowData is not a map[string]interface{}", "event_id", event.EventID, "type", fmt.Sprintf("%T", event.RowData))
+			return fmt.Errorf("event.RowData is not a map[string]interface{}: %T", event.RowData)
+		}
+	}
+
+	protoRowData, errProtoStruct := structpb.NewStruct(rowDataMap)
 	if errProtoStruct != nil {
-		fa.logger.Error(ctx, "Failed to convert event.Data to proto.Struct for gRPC", "error", errProtoStruct.Error())
+		fa.logger.Error(ctx, "Failed to convert event.RowData to proto.Struct for gRPC", "error", errProtoStruct.Error(), "event_id", event.EventID)
 		return errProtoStruct
 	}
 
 	grpcRequest := &pb.PushEventRequest{
 		Payload: &pb.EnrichedEventPayloadMessage{
 			EventId:   event.EventID,
-			EventType: event.EventType,
-			Timestamp: timestamppb.New(event.Timestamp),
-			Source:    event.Source,
-			Data:      protoData,
+			CompanyId: event.CompanyID,
+			AgentId:   event.AgentID,
+			MessageId: event.MessageID,
+			ChatId:    event.ChatID,
+			RowData:   protoRowData,
+			EventTime: event.EventTime, // Assuming event.EventTime is now string
 		},
 		TargetCompanyId: targetCompanyID,
 		TargetAgentId:   targetAgentID,

@@ -1,14 +1,13 @@
 package domain
 
-import "time"
-
-// EnrichedEventPayload is a placeholder for the actual structure defined in
-// daisi-cdc-consumer-service/cdc-service-docs/schemas.md.
-// Please replace this with the actual struct definition.
+// EnrichedEventPayload is the structure for messages received from NATS,
+// reflecting the schema defined in upstream-schemas.md.
 type EnrichedEventPayload struct {
 	EventID   string      `json:"event_id"`
-	EventType string      `json:"event_type"`
-	Timestamp time.Time   `json:"timestamp"`
-	Source    string      `json:"source"`
-	Data      interface{} `json:"data"` // This will likely be more specific
+	EventTime string      `json:"event_time"`
+	CompanyID string      `json:"company_id"`
+	AgentID   string      `json:"agent_id,omitempty"`   // omitempty because it's not always present for all event types
+	MessageID string      `json:"message_id,omitempty"` // omitempty as it's specific to 'messages' table
+	ChatID    string      `json:"chat_id,omitempty"`    // omitempty as it's relevant for 'messages' and 'chats'
+	RowData   interface{} `json:"row_data"`             // Contains the actual table row data
 }

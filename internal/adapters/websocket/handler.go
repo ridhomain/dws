@@ -664,8 +664,8 @@ func (h *Handler) handleSelectChatMessage(
 	companyID, agentID, userID string,
 	payloadData interface{},
 	specificChatNatsMsgHandler domain.NatsMessageHandler, // Changed type
-	currentGeneralSub domain.NatsMessageSubscription,     // Changed type
-	currentSpecificSub domain.NatsMessageSubscription,    // Changed type
+	currentGeneralSub domain.NatsMessageSubscription, // Changed type
+	currentSpecificSub domain.NatsMessageSubscription, // Changed type
 	currentSpecificSubChatID string,
 ) (domain.NatsMessageSubscription, string, error) { // Changed return type
 

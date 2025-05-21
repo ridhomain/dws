@@ -87,17 +87,19 @@ func (h *GRPCMessageHandler) PushEvent(ctx context.Context, req *pb.PushEventReq
 		return &pb.PushEventResponse{Success: false, Message: "No active local connection for chat_id"}, nil
 	}
 
-	var mapData map[string]interface{}
-	if req.Payload.Data != nil {
-		mapData = req.Payload.Data.AsMap()
+	var rowDataMap map[string]interface{}
+	if req.Payload.RowData != nil {
+		rowDataMap = req.Payload.RowData.AsMap()
 	}
 
 	domainPayload := domain.EnrichedEventPayload{
 		EventID:   req.Payload.EventId,
-		EventType: req.Payload.EventType,
-		Timestamp: req.Payload.Timestamp.AsTime(),
-		Source:    req.Payload.Source,
-		Data:      mapData,
+		CompanyID: req.Payload.CompanyId,
+		AgentID:   req.Payload.AgentId,
+		MessageID: req.Payload.MessageId,
+		ChatID:    req.Payload.ChatId,
+		EventTime: req.Payload.EventTime,
+		RowData:   rowDataMap,
 	}
 
 	wsMessage := domain.NewEventMessage(domainPayload)
