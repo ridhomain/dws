@@ -39,6 +39,9 @@ COPY config /app/config
 # Ensure the config directory and file have correct permissions if they exist
 # RUN if [ -d /app/config ]; then chown -R appuser:appuser /app/config && chmod -R u+rX,g+rX /app/config; fi
 
+# Install wget for healthchecks
+RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
 # Set permissions for the binary
 RUN chown appuser:appuser /app/daisi-ws-service && chmod u+x /app/daisi-ws-service
 

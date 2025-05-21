@@ -4,13 +4,15 @@
 DOCKER_COMPOSE = docker-compose
 SERVICE_NAME = daisi-ws-service
 GO_FILES = $(shell find . -name '*.go' -not -path "./vendor/*")
+VERSION = "latest"
 
 .PHONY: help
 help:
 	@echo "Makefile for daisi-ws-service"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make build          Build the Docker image for the service."
+	@echo "  make build          Build the Docker image for the service (typically tagged as latest by Docker Compose)."
+	@echo "  make build_hardcoded_tag Build Docker image with the tag defined by HARDCODED_TAG in this Makefile."
 	@echo "  make up             Start all services in detached mode (daisi-ws-service, nats, redis)."
 	@echo "  make down           Stop and remove all services."
 	@echo "  make logs           Tail logs from the daisi-ws-service container."
@@ -31,6 +33,11 @@ help:
 build:
 	@echo "Building Docker image for $(SERVICE_NAME)..."
 	$(DOCKER_COMPOSE) build $(SERVICE_NAME)
+
+.PHONY: build_tag
+build_tag:
+	@echo "Building Docker image for $(SERVICE_NAME) with tag $(VERSION)..."
+	docker build -t daisi/$(SERVICE_NAME):$(VERSION) .
 
 .PHONY: up
 up:

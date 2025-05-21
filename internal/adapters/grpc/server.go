@@ -6,6 +6,8 @@ import (
 	"net"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
@@ -30,6 +32,13 @@ func NewServer(appCtx context.Context, logger domain.Logger, cfgProvider config.
 
 	gsrv := grpc.NewServer(opts...)
 	pb.RegisterMessageForwardingServiceServer(gsrv, grpcHandler)
+
+	// Register health check service
+	healthServer := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(gsrv, healthServer)
+	// Initially, set the status for the overall server "" (empty string) to SERVING.
+	// You can refine this to set status for specific services if needed.
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 
 	// Conditionally enable gRPC reflection
 	if cfgProvider.Get().Server.EnableReflection {

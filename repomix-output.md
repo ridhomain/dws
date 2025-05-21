@@ -114,9 +114,40 @@ pkg/
     safego.go
 .gitignore
 go.mod
+prometheus.yml
 ```
 
 # Files
+
+## File: prometheus.yml
+```yaml
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'nats'
+    static_configs:
+      - targets: ['nats:8222']
+  - job_name: 'nats_exporter'
+    static_configs:
+      - targets: ['nats_exporter:7777']
+  - job_name: 'tenant_app_A'
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names:
+          - tenant_app_A
+        type: A
+        port: 8080
+  - job_name: 'tenant_app_B'
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names:
+          - tenant_app_B
+        type: A
+        port: 8080
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+```
 
 ## File: internal/adapters/grpc/proto/dws_message_fwd.proto
 ```protobuf
