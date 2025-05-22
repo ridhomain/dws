@@ -1,0 +1,370 @@
+version: '3.8'
+
+networks:
+  daisi_network:
+    driver: bridge
+
+# volumes: # Removed as we are using bind mounts to ./data
+#   postgres_data:
+#   nats_data:
+#   redis_data:
+#   prometheus_data:
+#   grafana_data:
+
+services:
+  #----------------------------------------------------------------------------
+  # Core Application Services
+  #----------------------------------------------------------------------------
+  message-event-service:
+    image: daisi/daisi-message-event-service:latest 
+    container_name: daisi-message-event-service
+    environment:
+      POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/message_service_db
+      NATS_URL: nats://nats:4222
+      COMPANY_ID: CompanyGLOBAL00 # Generic ID for single instance
+      LOG_LEVEL: info
+      MES_SERVER_PORT: 8081 # Adjusted port to avoid conflict with ws-service
+      MES_METRICS_ENABLED: "true"
+    ports:
+      - "8081:8081" # Exposing metrics on new port
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    labels:
+      logging: promtail
+      service_name: message-event-service
+
+  ws-service-2:
+    image: daisi/daisi-ws-service:latest
+    ports:
+      - "8083:8080" # HTTP port
+      - "50051:50051" # gRPC port
+    volumes:
+      - ../daisi-ws-service/config:/app/config:ro # Mount local config
+    environment:
+      DAISI_WS_SERVER_HTTP_PORT: 8080
+      DAISI_WS_SERVER_GRPC_PORT: 50051
+      DAISI_WS_SERVER_POD_ID: ws-service-2
+      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
+      DAISI_WS_NATS_URL: nats://nats:4222
+      DAISI_WS_NATS_STREAM_NAME: wa_stream
+      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
+      DAISI_WS_REDIS_ADDRESS: redis:6379
+      DAISI_WS_LOG_LEVEL: debug
+      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-2
+      DAISI_WS_APP_VERSION: unified-local
+      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
+      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
+      DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
+      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+    labels:
+      logging: promtail
+      service_name: ws-service-2
+  
+  ws-service-1:
+    image: daisi/daisi-ws-service:latest
+    ports:
+      - "8084:8080" # HTTP port
+      - "50052:50051" # gRPC port
+    volumes:
+      - ../daisi-ws-service/config:/app/config:ro # Mount local config
+    environment:
+      DAISI_WS_SERVER_HTTP_PORT: 8080
+      DAISI_WS_SERVER_GRPC_PORT: 50051
+      DAISI_WS_SERVER_POD_ID: ws-service-1
+      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
+      DAISI_WS_NATS_URL: nats://nats:4222
+      DAISI_WS_NATS_STREAM_NAME: wa_stream
+      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
+      DAISI_WS_REDIS_ADDRESS: redis:6379
+      DAISI_WS_LOG_LEVEL: debug
+      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-1
+      DAISI_WS_APP_VERSION: unified-local
+      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
+      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
+      DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
+      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+    labels:
+      logging: promtail
+      service_name: ws-service-1
+
+  cdc-consumer-service:
+    image: daisi/daisi-cdc-consumer-service:latest 
+    container_name: daisi-cdc-consumer-service
+    ports:
+      - "8082:8080" # Metrics port, adjusted to avoid conflict (e.g. with ws-service if it also used 8080 for metrics)
+    environment:
+      DAISI_CDC_NATS_URL: "nats://nats:4222"
+      DAISI_CDC_REDIS_ADDR: "redis://redis:6379"
+      DAISI_CDC_LOG_LEVEL: "debug"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    labels:
+      logging: promtail
+      service_name: cdc-consumer-service
+
+  #----------------------------------------------------------------------------
+  # Sequin Service
+  #----------------------------------------------------------------------------
+  sequin:
+    image: sequin/sequin:latest
+    container_name: sequin
+    ports:
+      - "7376:7376"
+    environment:
+      PG_HOSTNAME: postgres # Points to our unified postgres
+      PG_DATABASE: sequin_db # Dedicated DB for Sequin on the main postgres server
+      PG_PORT: 5432
+      PG_USERNAME: postgres
+      PG_PASSWORD: postgres # Use the same as main postgres
+      PG_POOL_SIZE: 20
+      SECRET_KEY_BASE: "wDPLYus0pvD6qJhKJICO4dauYPXfO/Yl782Zjtpew5qRBDp7CZvbWtQmY0eB13If" # Consider changing
+      VAULT_KEY: "2Sig69bIpuSm2kv0VQfDekET2qy8qUZGI8v3/h3ASiY=" # Consider changing
+      REDIS_URL: redis://redis:6379 # Points to our unified redis
+      CONFIG_FILE_PATH: /config/daisi-sequin.yml
+    volumes:
+      - ./daisi-sequin.yml:/config/daisi-sequin.yml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+
+  #----------------------------------------------------------------------------
+  # Backend Infrastructure Services
+  #----------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-bookworm
+    container_name: postgres-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: message_service_db # Default DB for message-event-service
+      # The 'sequin_db' is created by the init script in ./postgres-init/
+    ports:
+      - "5432:5432" # Standard port
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d # For custom init scripts (e.g., create sequin_db)
+    networks:
+      - daisi_network
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d message_service_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.11-alpine 
+    container_name: nats-server
+    command: "--name unified-nats-server --http_port 8222 --jetstream --store_dir /data"
+    ports:
+      - "4222:4222" # Client port
+      - "6222:6222" # Clustering port (optional)
+      - "8222:8222" # Monitoring port
+    volumes:
+      - ./data/nats:/data
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine 
+    container_name: redis-cache
+    ports:
+      - "6379:6379" # Standard port
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - daisi_network
+    healthcheck: # Added healthcheck
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  #----------------------------------------------------------------------------
+  # Logging Services
+  #----------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    ports:
+      - "3100:3100" # Loki API port
+    volumes:
+      - ./data/loki:/loki
+      - ./loki-config.yml:/etc/loki/local-config.yaml:ro # Mount custom config
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: promtail
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro # Docker logs
+      - /var/run/docker.sock:/var/run/docker.sock:ro # Needed for Docker service discovery
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - daisi_network
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  #----------------------------------------------------------------------------
+  # Monitoring & Observability
+  #----------------------------------------------------------------------------
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest # From message-event-service compose
+    container_name: nats-exporter
+    command: "-connz -routez -subz -varz http://nats:8222"
+    ports:
+      - "7777:7777" # Exporter metrics port
+    networks:
+      - daisi_network
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7777/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      - nats-exporter
+      - message-event-service
+      - ws-service-1 # If it exposes /metrics compatible with prometheus
+      - ws-service-2 # If it exposes /metrics compatible with prometheus
+      - cdc-consumer-service # if it exposes /metrics
+      - loki # Add Loki dependency for Grafana
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      # Assuming provisioning files are structured under daisi/grafana/
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro # Custom dashboards
+      - ./data/grafana:/var/lib/grafana # Persistent volume for Grafana data
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin" # Change this!
+      GF_PROVISIONING_PATH: "/etc/grafana/provisioning"
+      GF_DATASOURCES_DEFAULT_DATASOURCE_URL: http://prometheus:9090 # Make sure this aligns with your setup
+      GF_INSTALL_PLUGINS: "https://storage.googleapis.com/integration-artifacts/grafana-lokiexplore-app/grafana-lokiexplore-app-latest.zip;grafana-lokiexplore-app"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - prometheus
+      - loki # Add Loki dependency for Grafana
+    restart: unless-stopped
+
+# Notes for completion:
+# 3. Config files:
+#    - `daisi/grafana/provisioning/datasources/datasource.yml`: Configure Prometheus datasource.
+#    - `daisi/grafana/provisioning/dashboards/dashboards.yml`: Configure dashboard provisioning.
+#    - `daisi/grafana/dashboards/your-dashboard.json`: Place custom dashboard files here.
+#    - `../daisi-ws-service/config`: Ensure this path and its contents are correct for ws-service.
+#    - `../sequin-docker-compose/playground.yml`: Ensure this path is correct for Sequin.
+# 5. Environment Variables: Review all `YOUR_..._HERE` placeholders and update with actual secrets/keys.
+# 6. Data directory: The `./data` directory (and its subdirectories like `./data/postgres`, `./data/nats`, etc.)
+#    will be created on your host machine in the `daisi/` directory when you first run `docker-compose up`.
+#    Ensure you have write permissions for Docker in this location. 

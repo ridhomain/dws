@@ -1,0 +1,56 @@
+{
+  "id": null,
+  "title": "Load Test Overview",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Messages Attempted/sec",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(loadgen_messages_attempted_total[1m])) by (company_id)",
+          "legendFormat": "attempted {{company_id}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Messages Published/sec",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(loadgen_messages_published_total[1m])) by (company_id)",
+          "legendFormat": "published {{company_id}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Publish Errors/sec",
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(loadgen_publish_errors_total[1m])) by (company_id)",
+          "legendFormat": "errors {{company_id}}"
+        }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Success Rate",
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(loadgen_messages_published_total[1m])) / sum(rate(loadgen_messages_attempted_total[1m])) * 100",
+          "legendFormat": "success %"
+        }
+      ],
+      "yaxes": [
+        { "format": "percent", "min": 0, "max": 100 },
+        { "format": "short" }
+      ]
+    }
+  ],
+  "schemaVersion": 25,
+  "version": 1
+}
