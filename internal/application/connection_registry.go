@@ -8,6 +8,7 @@ import (
 	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
 )
 
 // RegisterConnection stores the managed connection and registers its initial chat route.
@@ -63,7 +64,16 @@ func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 		// Attempt to release the session lock associated with this connection
 		podID := cm.configProvider.Get().Server.PodID
 		if podID != "" {
-			released, err := cm.sessionLocker.ReleaseLock(logCtx, sessionKey, podID)
+			// Create a new detached context for ReleaseLock operation to prevent context cancellation issues
+			// This ensures that ReleaseLock can still complete even if the connection context was cancelled
+			releaseCtx := context.Background()
+
+			// Inherit request_id from the original context if possible
+			if reqID, ok := logCtx.Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+				releaseCtx = context.WithValue(releaseCtx, contextkeys.RequestIDKey, reqID)
+			}
+
+			released, err := cm.sessionLocker.ReleaseLock(releaseCtx, sessionKey, podID)
 			if err != nil {
 				cm.logger.Error(logCtx, "Failed to release session lock on deregister", "sessionKey", sessionKey, "podID", podID, "error", err.Error())
 			} else if released {

@@ -144,6 +144,19 @@ func NewViperProvider(appCtx context.Context, logger *zap.Logger) (Provider, err
 	// Set default values (optional, but good practice)
 	// v.SetDefault("server.http_port", 8080)
 	// v.SetDefault("log.level", "info")
+	v.SetDefault("app.session_ttl_seconds", 30)          // Default session TTL to 30 seconds as per TRD/PRD
+	v.SetDefault("app.route_ttl_seconds", 60)            // Example: keeping other defaults, adjust as necessary
+	v.SetDefault("app.ttl_refresh_interval_seconds", 10) // Example: keeping other defaults
+
+	// Defaults for Adaptive TTL for SessionLock to align with 30s fixed requirement if not overridden
+	// By default, we can disable adaptive TTL for session locks to ensure the 30s fixed value is used.
+	// If adaptive TTL is operationally enabled, its MaxTTLSeconds should also be reviewed (e.g., set to 30).
+	v.SetDefault("adaptive_ttl.session_lock.enabled", false)
+	v.SetDefault("adaptive_ttl.session_lock.min_ttl_seconds", 15)             // Example: sensible if adaptive were enabled
+	v.SetDefault("adaptive_ttl.session_lock.max_ttl_seconds", 30)             // Default to 30s if adaptive enabled
+	v.SetDefault("adaptive_ttl.session_lock.activity_threshold_seconds", 120) // Example
+	v.SetDefault("adaptive_ttl.session_lock.active_ttl_seconds", 30)          // Example
+	v.SetDefault("adaptive_ttl.session_lock.inactive_ttl_seconds", 15)        // Example
 
 	// Configure Viper to read from YAML file
 	v.SetConfigName(getEnv("DAISI_WS_CONFIG_NAME", "config"))

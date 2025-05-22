@@ -25,9 +25,11 @@ type ConnectionManager struct {
 	activeAdminConnections sync.Map // Stores [adminSessionKey string] -> domain.ManagedConnection for admin connections
 
 	// For session renewal goroutine
-	renewalStopChan chan struct{}
-	renewalWg       sync.WaitGroup
-	redisClient     *redis.Client
+	renewalStopChan  chan struct{}
+	renewalWg        sync.WaitGroup
+	renewalStopMutex sync.Mutex // Protects renewalStopChan from multiple closes
+	renewalStopped   bool       // Flag to track if the renewal loop has been stopped
+	redisClient      *redis.Client
 }
 
 // NewConnectionManager creates a new ConnectionManager.
@@ -51,6 +53,8 @@ func NewConnectionManager(
 		activeAdminConnections: sync.Map{},
 		renewalStopChan:        make(chan struct{}),
 		renewalWg:              sync.WaitGroup{},
+		renewalStopMutex:       sync.Mutex{},
+		renewalStopped:         false,
 		redisClient:            redisClient,
 	}
 }

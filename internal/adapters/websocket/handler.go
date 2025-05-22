@@ -24,11 +24,13 @@ import (
 	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 
+	"runtime/debug"
+
 	"github.com/google/uuid"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 )
 
-// Handler handles WebSocket connection upgrades and subsequent communication.
+// Handler handles WebSocket connections for the /ws endpoint.
 type Handler struct {
 	logger           domain.Logger
 	configProvider   config.Provider
@@ -36,10 +38,9 @@ type Handler struct {
 	natsAdapter      domain.NatsConsumer
 	routeRegistry    domain.RouteRegistry
 	messageForwarder domain.MessageForwarder
-	// Future dependencies: connectionManager domain.ConnectionManager
 }
 
-// NewHandler creates a new WebSocket Handler.
+// NewHandler creates a new WebSocket handler.
 func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *Handler {
 	return &Handler{
 		logger:           logger,
@@ -233,22 +234,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Defer deregistration for when manageConnection exits its goroutine.
-	// This defer is part of ServeHTTP and captures wrappedConn and sessionKey.
 	// It will execute when the safego.Execute goroutine (running manageConnection) finishes.
 	defer func() {
-		h.logger.Info(wrappedConn.Context(), "Connection management goroutine finished (likely due to context cancellation or manageConnection returning). Deregistering connection.", "sessionKey", sessionKey)
+		h.logger.Info(wrappedConn.Context(), "Connection management lifecycle ending. Deregistering connection.", "sessionKey", sessionKey)
 		duration := time.Since(startTime) // startTime is from ServeHTTP's scope
 		metrics.ObserveConnectionDuration(duration.Seconds())
 		h.connManager.DeregisterConnection(sessionKey)
 		// The lock release is handled by DeregisterConnection.
+		cancelWsConnLifetimeCtx() // Ensure context is cancelled as ServeHTTP exits.
 	}()
 
-	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("WebSocketConnectionManager-%s", sessionKey), func() {
-		// Call manageConnection. When this function (passed to safego.Execute) returns,
-		// the defer func() above in ServeHTTP will be triggered.
-		h.manageConnection(wsConnLifetimeCtx, wrappedConn, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
-	})
+	// Call manageConnection directly.
+	// Panic recovery is integrated here, similar to what safego.Execute provided.
+	defer func() {
+		if r := recover(); r != nil {
+			logCtx := wsConnLifetimeCtx
+			if wsConnLifetimeCtx.Err() != nil {
+				logCtx = context.Background()
+			}
+			h.logger.Error(logCtx, fmt.Sprintf("Panic recovered in WebSocketConnectionManager-%s", sessionKey),
+				"panic_info", fmt.Sprintf("%v", r),
+				"stacktrace", string(debug.Stack()),
+			)
+			// Ensure connection is closed and deregistered on panic within manageConnection
+			// wrappedConn.Close() might be redundant if panic was due to conn error, but good for safety.
+			// Deregistration is handled by the outer defer.
+		}
+	}()
+
+	// When manageConnection returns, the defers in ServeHTTP will be triggered.
+	h.manageConnection(wsConnLifetimeCtx, wrappedConn, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
 }
 
 // manageConnection handles the lifecycle of a single WebSocket connection.
@@ -373,6 +388,15 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			return // Return to let NATS redeliver after AckWait
 		}
 
+		// Debug log for NATS message receipt
+		h.logger.Debug(msgCtx, "Received NATS message",
+			"subject", msg.Subject,
+			"company_id", msgCompanyID,
+			"agent_id", msgAgentID,
+			"chat_id", msgChatID,
+			"data_size", len(msg.Data),
+			"operation", "NatsMessageHandler")
+
 		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID == "" {
 			h.logger.Error(connCtx, "Current PodID is not configured, cannot determine message ownership.", "subject", msg.Subject)
@@ -411,6 +435,32 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					"subject", msg.Subject, "error", errUnmarshal.Error(), "raw_data", string(msg.Data))
 				return // Return to let NATS redeliver after AckWait
 			}
+
+			// Check for duplicate message delivery (message uniqueness)
+			// This helps prevent re-processing if a message is delivered more than once due to NATS redelivery or other reasons
+			eventID := eventPayload.EventID
+			if eventID != "" {
+				// For now, implement a simple in-memory message deduplication check
+				// In a production environment, this could be enhanced with a distributed solution like Redis
+
+				// Create a unique key for this message in this pod
+				messageKey := fmt.Sprintf("%s:%s:%s:%s", msgCompanyID, msgAgentID, msgChatID, eventID)
+
+				// The actual deduplication check would go here
+				// For now, we'll just log that we would check for duplicates
+				h.logger.Debug(msgCtx, "Would check for message uniqueness (not implemented)",
+					"event_id", eventID,
+					"message_key", messageKey,
+					"subject", msg.Subject,
+					"operation", "NatsMessageHandler")
+			}
+
+			// Log delivery attempt to client
+			h.logger.Debug(msgCtx, "Attempting to deliver NATS message to WebSocket client",
+				"subject", msg.Subject,
+				"event_id", eventPayload.EventID,
+				"operation", "NatsMessageHandler")
+
 			wsMessage := domain.NewEventMessage(eventPayload)
 			if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 				h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
@@ -419,6 +469,11 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				return // Do not record activity if write failed
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+				h.logger.Debug(msgCtx, "Successfully delivered NATS message to WebSocket client",
+					"subject", msg.Subject,
+					"event_id", eventPayload.EventID,
+					"operation", "NatsMessageHandler")
+
 				// Record session activity
 				if h.connManager != nil && h.connManager.SessionLocker() != nil {
 					sessionKey := rediskeys.SessionKey(companyID, agentID, userID) // companyID, agentID, userID are from manageConnection scope
@@ -429,6 +484,11 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					}
 					if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
 						h.logger.Error(msgCtx, "Failed to record session activity after specific NATS event write", "sessionKey", sessionKey, "error", errAct)
+					} else {
+						h.logger.Debug(msgCtx, "Recorded session activity after message delivery",
+							"session_key", sessionKey,
+							"ttl", activityTTL.String(),
+							"operation", "NatsMessageHandler")
 					}
 				}
 				// Record message route activity
@@ -441,12 +501,18 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					}
 					if errAct := h.routeRegistry.RecordActivity(msgCtx, messageRouteKey, activityTTL); errAct != nil {
 						h.logger.Error(msgCtx, "Failed to record message route activity after specific NATS event write (owner)", "messageRouteKey", messageRouteKey, "error", errAct)
+					} else {
+						h.logger.Debug(msgCtx, "Recorded message route activity after message delivery",
+							"message_route_key", messageRouteKey,
+							"ttl", activityTTL.String(),
+							"operation", "NatsMessageHandler")
 					}
 				}
 			}
 		} else {
 			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop via MessageForwarder.",
 				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
+
 			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
 				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
 				var domainPayload domain.EnrichedEventPayload
@@ -456,11 +522,22 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					// Or, if this is a permanent error, consider a dead-letter queue strategy (outside current scope).
 					return
 				} else {
+					h.logger.Debug(msgCtx, "Attempting to forward NATS message via gRPC",
+						"subject", msg.Subject,
+						"event_id", domainPayload.EventID,
+						"target_address", gprcTargetAddress,
+						"operation", "NatsMessageHandler")
+
 					if errFwd := h.messageForwarder.ForwardEvent(msgCtx, gprcTargetAddress, &domainPayload, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
 						h.logger.Error(msgCtx, "Failed to forward event via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID, "error", errFwd.Error())
 						// Do NOT ACK if forwarding failed
 						return // Return to let NATS redeliver
 					} else {
+						h.logger.Debug(msgCtx, "Successfully forwarded NATS message via gRPC",
+							"subject", msg.Subject,
+							"event_id", domainPayload.EventID,
+							"target_address", gprcTargetAddress,
+							"operation", "NatsMessageHandler")
 						h.logger.Info(msgCtx, "Successfully initiated event forwarding via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID)
 					}
 				}
@@ -475,6 +552,10 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 
 		if ackErr := msg.Ack(); ackErr != nil {
 			h.logger.Error(msgCtx, "Failed to ACK NATS message after processing", "subject", msg.Subject, "error", ackErr.Error())
+		} else {
+			h.logger.Debug(msgCtx, "Successfully ACKed NATS message",
+				"subject", msg.Subject,
+				"operation", "NatsMessageHandler")
 		}
 	}
 
@@ -643,6 +724,15 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 							h.logger.Debug(connCtx, "Recorded session activity after select_chat", "sessionKey", sessionKey, "activityTTL", activityTTL.String())
 						}
 					}
+				}
+			case domain.MessageTypeReady:
+				h.logger.Info(connCtx, "Received 'ready' message from client. Echoing back.", "type", baseMsg.Type, "payload", baseMsg.Payload)
+				// Echo the received ready message (type and payload) back to the client
+				if err := conn.WriteJSON(baseMsg); err != nil {
+					h.logger.Error(connCtx, "Failed to echo 'ready' message to client", "error", err.Error())
+				} else {
+					metrics.IncrementMessagesSent(domain.MessageTypeReady)
+					h.logger.Info(connCtx, "Successfully echoed 'ready' message to client")
 				}
 			default:
 				h.logger.Warn(connCtx, "Handling unknown message type", "type", baseMsg.Type)

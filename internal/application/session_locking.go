@@ -42,6 +42,15 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 		"ttlSeconds", sessionTTL.Seconds(),
 	)
 
+	cm.logger.Debug(ctx, "Session lock acquisition details",
+		"sessionKey", sessionKey,
+		"podID", podID,
+		"ttlSeconds", sessionTTL.Seconds(),
+		"companyID", companyID,
+		"agentID", agentID,
+		"userID", userID,
+		"operation", "AcquireSessionLockOrNotify")
+
 	metrics.IncrementSessionLockAttempts("user", "initial_setnx")
 	acquired, err := cm.sessionLocker.AcquireLock(ctx, sessionKey, podID, sessionTTL)
 	if err != nil {
@@ -58,6 +67,11 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 			"sessionKey", sessionKey,
 			"podID", podID,
 		)
+		cm.logger.Debug(ctx, "Initial SETNX for session lock succeeded",
+			"sessionKey", sessionKey,
+			"podID", podID,
+			"ttlSeconds", sessionTTL.Seconds(),
+			"operation", "AcquireSessionLockOrNotify")
 		metrics.IncrementSessionLockSuccess("user", "initial_setnx")
 		return true, nil
 	}
@@ -67,14 +81,38 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 		"sessionKey", sessionKey,
 		"newPodIDAttempting", podID,
 	)
+
+	// Instead of trying to access the Redis client directly, we'll use debug logs to report what we know
+	cm.logger.Debug(ctx, "Lock acquisition failed (SETNX), preparing to publish kill message",
+		"sessionKey", sessionKey,
+		"newPodIDAttempting", podID,
+		"operation", "AcquireSessionLockOrNotify")
+
 	killChannel := rediskeys.SessionKillChannelKey(companyID, agentID, userID)
 	killMsg := domain.KillSwitchMessage{NewPodID: podID}
+
+	cm.logger.Debug(ctx, "Preparing to publish session kill message",
+		"killChannel", killChannel,
+		"message", fmt.Sprintf("%+v", killMsg),
+		"sessionKey", sessionKey,
+		"operation", "AcquireSessionLockOrNotify")
+
 	if pubErr := cm.killSwitchPublisher.PublishSessionKill(ctx, killChannel, killMsg); pubErr != nil {
 		cm.logger.Error(ctx, "Failed to publish session kill message",
 			"channel", killChannel,
 			"error", pubErr.Error(),
 		)
+		cm.logger.Debug(ctx, "Session kill message publish failed",
+			"killChannel", killChannel,
+			"newPodID", podID,
+			"error", pubErr.Error(),
+			"operation", "AcquireSessionLockOrNotify")
 		// Do not immediately fail; proceed to retry lock acquisition as the kill message might still be processed.
+	} else {
+		cm.logger.Debug(ctx, "Session kill message published successfully",
+			"killChannel", killChannel,
+			"newPodID", podID,
+			"operation", "AcquireSessionLockOrNotify")
 	}
 
 	currentDelayMs := initialLockRetryDelayMs
@@ -82,15 +120,39 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 		select {
 		case <-time.After(time.Duration(currentDelayMs) * time.Millisecond):
 			cm.logger.Info(ctx, "Retrying AcquireLock (SETNX) for session", "sessionKey", sessionKey, "podID", podID, "attempt", i+1, "delay_ms", currentDelayMs)
+			cm.logger.Debug(ctx, "SETNX retry attempt details",
+				"sessionKey", sessionKey,
+				"podID", podID,
+				"attempt", i+1,
+				"delay_ms", currentDelayMs,
+				"operation", "AcquireSessionLockOrNotify")
+
 			metrics.IncrementSessionLockAttempts("user", "retry_setnx")
 			acquired, err = cm.sessionLocker.AcquireLock(ctx, sessionKey, podID, sessionTTL)
 			if err != nil {
 				cm.logger.Error(ctx, fmt.Sprintf("Failed to retry AcquireLock (SETNX) on attempt %d", i+1), "sessionKey", sessionKey, "error", err.Error())
+				cm.logger.Debug(ctx, "SETNX retry attempt failed with error",
+					"sessionKey", sessionKey,
+					"podID", podID,
+					"attempt", i+1,
+					"error", err.Error(),
+					"operation", "AcquireSessionLockOrNotify")
 				// Continue to next retry attempt or force acquire if Redis error occurs
 			} else if acquired {
 				cm.logger.Info(ctx, fmt.Sprintf("Session lock acquired successfully on SETNX retry attempt %d", i+1), "sessionKey", sessionKey, "podID", podID)
+				cm.logger.Debug(ctx, "SETNX retry attempt succeeded",
+					"sessionKey", sessionKey,
+					"podID", podID,
+					"attempt", i+1,
+					"operation", "AcquireSessionLockOrNotify")
 				metrics.IncrementSessionLockSuccess("user", "retry_setnx")
 				return true, nil
+			} else {
+				cm.logger.Debug(ctx, "SETNX retry attempt failed (lock still held by another pod)",
+					"sessionKey", sessionKey,
+					"podID", podID,
+					"attempt", i+1,
+					"operation", "AcquireSessionLockOrNotify")
 			}
 			// Double the delay for next attempt, up to a maximum
 			currentDelayMs *= 2
@@ -99,6 +161,10 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 			}
 		case <-ctx.Done():
 			cm.logger.Warn(ctx, "Context cancelled during retry delay for session lock", "sessionKey", sessionKey, "error", ctx.Err())
+			cm.logger.Debug(ctx, "Session lock acquisition cancelled due to context",
+				"sessionKey", sessionKey,
+				"error", ctx.Err(),
+				"operation", "AcquireSessionLockOrNotify")
 			metrics.IncrementSessionLockFailure("user", "timeout_context_cancelled")
 			return false, ctx.Err()
 		}
@@ -106,27 +172,54 @@ func (cm *ConnectionManager) AcquireSessionLockOrNotify(ctx context.Context, com
 
 	// All SETNX retries failed, attempt ForceAcquireLock after a final small delay
 	cm.logger.Warn(ctx, "All SETNX retries failed. Attempting ForceAcquireLock (SET) for session after final delay.", "sessionKey", sessionKey, "podID", podID)
+	cm.logger.Debug(ctx, "Preparing for ForceAcquireLock after all SETNX retries failed",
+		"sessionKey", sessionKey,
+		"podID", podID,
+		"delayMs", lockForceAcquireDelayMs,
+		"operation", "AcquireSessionLockOrNotify")
+
 	select {
 	case <-time.After(time.Duration(lockForceAcquireDelayMs) * time.Millisecond):
 		metrics.IncrementSessionLockAttempts("user", "force_set")
 		acquired, err = cm.sessionLocker.ForceAcquireLock(ctx, sessionKey, podID, sessionTTL)
 		if err != nil {
 			cm.logger.Error(ctx, "Failed to ForceAcquireLock (SET)", "sessionKey", sessionKey, "error", err.Error())
+			cm.logger.Debug(ctx, "ForceAcquireLock failed with error",
+				"sessionKey", sessionKey,
+				"podID", podID,
+				"error", err.Error(),
+				"operation", "AcquireSessionLockOrNotify")
 			metrics.IncrementSessionLockFailure("user", "redis_error_force_set")
 			return false, fmt.Errorf("failed to ForceAcquireLock (SET): %w", err)
 		}
 		if acquired {
 			cm.logger.Info(ctx, "Session lock acquired successfully using ForceAcquireLock (SET)", "sessionKey", sessionKey, "podID", podID)
+			cm.logger.Debug(ctx, "ForceAcquireLock succeeded",
+				"sessionKey", sessionKey,
+				"podID", podID,
+				"operation", "AcquireSessionLockOrNotify")
 			metrics.IncrementSessionLockSuccess("user", "force_set")
 			return true, nil
 		}
+		cm.logger.Debug(ctx, "ForceAcquireLock unexpectedly failed despite using SET",
+			"sessionKey", sessionKey,
+			"podID", podID,
+			"operation", "AcquireSessionLockOrNotify")
 	case <-ctx.Done():
 		cm.logger.Warn(ctx, "Context cancelled during final delay before ForceAcquireLock", "sessionKey", sessionKey, "error", ctx.Err())
+		cm.logger.Debug(ctx, "ForceAcquireLock cancelled due to context",
+			"sessionKey", sessionKey,
+			"error", ctx.Err(),
+			"operation", "AcquireSessionLockOrNotify")
 		metrics.IncrementSessionLockFailure("user", "timeout_context_cancelled")
 		return false, ctx.Err()
 	}
 
 	cm.logger.Error(ctx, "All attempts to acquire session lock failed, including ForceAcquireLock.", "sessionKey", sessionKey)
+	cm.logger.Debug(ctx, "Complete failure of all session lock acquisition methods",
+		"sessionKey", sessionKey,
+		"podID", podID,
+		"operation", "AcquireSessionLockOrNotify")
 	metrics.IncrementSessionLockFailure("user", "all_attempts_failed")
 	return false, fmt.Errorf("all attempts to acquire session lock failed for key %s", sessionKey)
 }

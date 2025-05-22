@@ -213,6 +213,12 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
 			)
 
+			h.logger.Debug(msgCtx, "Processing admin NATS message",
+				"subject", msg.Subject,
+				"data_size", len(msg.Data),
+				"admin_id", adminInfo.AdminID,
+				"operation", "AdminNatsMessageHandler")
+
 			var eventPayload domain.EnrichedEventPayload
 			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
 				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
@@ -225,8 +231,25 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+				h.logger.Debug(msgCtx, "Successfully delivered admin NATS message to WebSocket",
+					"subject", msg.Subject,
+					"event_id", eventPayload.EventID,
+					"admin_id", adminInfo.AdminID,
+					"operation", "AdminNatsMessageHandler")
 			}
-			_ = msg.Ack()
+
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(msgCtx, "Failed to ACK admin NATS message",
+					"subject", msg.Subject,
+					"error", ackErr.Error(),
+					"admin_id", adminInfo.AdminID)
+			} else {
+				h.logger.Debug(msgCtx, "Successfully ACKed admin NATS message",
+					"subject", msg.Subject,
+					"event_id", eventPayload.EventID,
+					"admin_id", adminInfo.AdminID,
+					"operation", "AdminNatsMessageHandler")
+			}
 		}
 
 		var subErr error

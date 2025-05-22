@@ -226,6 +226,28 @@ var (
 		},
 		[]string{"key_type"},
 	)
+
+	SessionLockRenewalAttemptsCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_renewal_attempts_total",
+			Help: "Total session lock renewal attempts.",
+		},
+		[]string{"user_type"}, // "user", "admin"
+	)
+	SessionLockRenewalSuccessCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_renewal_success_total",
+			Help: "Total successful session lock renewals.",
+		},
+		[]string{"user_type"},
+	)
+	SessionLockRenewalFailureCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dws_session_lock_renewal_failure_total",
+			Help: "Total failed session lock renewals.",
+		},
+		[]string{"user_type", "reason"}, // reason: "not_owned", "disappeared", "error"
+	)
 )
 
 // IncrementActiveConnections increments the active connections gauge.
@@ -360,4 +382,19 @@ func IncrementRedisTTLDecision(keyType string, decision string) {
 
 func ObserveRedisActivityAge(keyType string, ageSeconds float64) {
 	RedisActivityAgeSeconds.WithLabelValues(keyType).Observe(ageSeconds)
+}
+
+// IncrementSessionLockRenewalAttempt increments the counter for session lock renewal attempts.
+func IncrementSessionLockRenewalAttempt(userType string) {
+	SessionLockRenewalAttemptsCounter.WithLabelValues(userType).Inc()
+}
+
+// IncrementSessionLockRenewalSuccess increments the counter for successful session lock renewals.
+func IncrementSessionLockRenewalSuccess(userType string) {
+	SessionLockRenewalSuccessCounter.WithLabelValues(userType).Inc()
+}
+
+// IncrementSessionLockRenewalFailure increments the counter for failed session lock renewals.
+func IncrementSessionLockRenewalFailure(userType string, reason string) {
+	SessionLockRenewalFailureCounter.WithLabelValues(userType, reason).Inc()
 }

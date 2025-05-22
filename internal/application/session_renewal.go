@@ -55,7 +55,21 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 			select {
 			case <-ticker.C:
 				cm.logger.Debug(appCtx, "Resource renewal tick: attempting to renew active session locks and routes")
+				// Count active connections for logging metrics
+				var activeCount int32 = 0
+
+				// Track successful/failed refresh stats for this tick for debug reporting
+				sessionRefreshStats := struct {
+					attempted    int
+					succeeded    int
+					failed       int
+					notOwned     int
+					errorOccured int
+				}{}
+
+				// Process each active connection for renewal
 				cm.activeConnections.Range(func(key, value interface{}) bool {
+					activeCount++
 					sessionKey, okSessionKey := key.(string)
 					conn, okConn := value.(domain.ManagedConnection)
 					if !okSessionKey || !okConn {
@@ -72,6 +86,17 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 					adaptiveSessionCfg := cfg.AdaptiveTTL.SessionLock
 					actualSessionTTL := defaultSessionTTL // Fallback to original config TTL
 					decisionSession := "default_ttl"
+
+					// Determine userType for metrics, assuming "user" for activeConnections
+					// This might need refinement if activeConnections can store different types of sessions
+					// or if admin connections were also renewed in this loop (they are not currently).
+					userMetricType := "user"
+					// If sessionKey could indicate an admin session, userMetricType could be changed here.
+					// For example: if strings.HasPrefix(sessionKey, "adminsession:") { userMetricType = "admin" }
+
+					// Increment attempt metric before trying to refresh
+					metrics.IncrementSessionLockRenewalAttempt(userMetricType)
+					sessionRefreshStats.attempted++
 
 					if adaptiveSessionCfg.Enabled && cm.sessionLocker != nil && defaultSessionTTL > 0 {
 						activityKey := sessionKey + ":last_active"
@@ -117,15 +142,32 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 					}
 					metrics.IncrementRedisTTLDecision("session_lock", decisionSession)
 
+					// Enhanced debug for session lock renewal
+					cm.logger.Debug(connCtx, "Processing session lock renewal",
+						"sessionKey", sessionKey,
+						"podID", podID,
+						"calculated_ttl", actualSessionTTL.String(),
+						"decision_reason", decisionSession,
+						"operation", "ResourceRenewalTick")
+
 					if cm.sessionLocker != nil && actualSessionTTL > 0 { // Ensure actualSessionTTL is positive
 						metrics.ObserveRedisTTLCalculated("session_lock", actualSessionTTL.Seconds())
 						refreshed, err := cm.sessionLocker.RefreshLock(renewalOpCtx, sessionKey, podID, actualSessionTTL)
 						if err != nil {
+							sessionRefreshStats.errorOccured++
 							cm.logger.Error(connCtx, "Error refreshing session lock", "sessionKey", sessionKey, "podID", podID, "error", err.Error())
-						} else if refreshed {
-							cm.logger.Debug(connCtx, "Successfully refreshed session lock", "sessionKey", sessionKey, "podID", podID, "newTTL", actualSessionTTL.String())
+							metrics.IncrementSessionLockRenewalFailure(userMetricType, "error")
+						} else if !refreshed {
+							// This case means lock was not ours or disappeared before refresh.
+							cm.logger.Warn(connCtx, "Failed to refresh session lock (e.g., not owned by this pod, or key disappeared)", "sessionKey", sessionKey, "podID", podID)
+							// Use 'sessionRefreshStats.failed' to count these non-error refresh failures.
+							// The existing 'notOwned' field in stats might be redundant if we simplify here or can be set based on more detailed future checks if available.
+							sessionRefreshStats.failed++ // Consolidating into 'failed' for now.
+							metrics.IncrementSessionLockRenewalFailure(userMetricType, "failed_to_renew")
 						} else {
-							cm.logger.Warn(connCtx, "Failed to refresh session lock (not owned or expired)", "sessionKey", sessionKey, "podID", podID)
+							cm.logger.Debug(connCtx, "Successfully renewed session lock", "sessionKey", sessionKey, "newTTL", actualSessionTTL.Seconds())
+							sessionRefreshStats.succeeded++
+							metrics.IncrementSessionLockRenewalSuccess(userMetricType)
 						}
 					} else {
 						cm.logger.Debug(connCtx, "Skipping session lock renewal (not configured, TTL is zero, or adaptive TTL resulted in zero)", "sessionKey", sessionKey)
@@ -260,6 +302,16 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 					}
 					return true // continue to next item in sync.Map
 				})
+
+				// Log summary of renewal operations for this tick
+				cm.logger.Debug(appCtx, "Resource renewal tick completed",
+					"active_connections", activeCount,
+					"session_renewal_attempts", sessionRefreshStats.attempted,
+					"session_renewal_succeeded", sessionRefreshStats.succeeded,
+					"session_renewal_failed_not_owned", sessionRefreshStats.failed,
+					"session_renewal_errors", sessionRefreshStats.errorOccured,
+					"operation", "ResourceRenewalTick")
+
 			case <-cm.renewalStopChan:
 				cm.logger.Info(appCtx, "Resource renewal loop stopping as requested.")
 				return
@@ -282,7 +334,22 @@ func (cm *ConnectionManager) StopResourceRenewalLoop() {
 	}
 
 	cm.logger.Info(context.Background(), "Attempting to stop resource renewal loop...")
-	close(cm.renewalStopChan) // Signal the loop to stop
-	cm.renewalWg.Wait()       // Wait for the goroutine to finish
+
+	// Use mutex to prevent multiple goroutines from closing the channel
+	cm.renewalStopMutex.Lock()
+	defer cm.renewalStopMutex.Unlock()
+
+	// Check if the renewal loop has already been stopped
+	if cm.renewalStopped {
+		cm.logger.Info(context.Background(), "Resource renewal loop was already stopped.")
+		return
+	}
+
+	// Signal the loop to stop and mark as stopped
+	close(cm.renewalStopChan)
+	cm.renewalStopped = true
+
+	// Wait for the goroutine to finish
+	cm.renewalWg.Wait()
 	cm.logger.Info(context.Background(), "Resource renewal loop stopped.")
 }
