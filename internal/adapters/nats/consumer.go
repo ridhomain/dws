@@ -9,7 +9,6 @@ import (
 	"github.com/nats-io/nats.go"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 )
 
 // natsSubscriptionWrapper wraps nats.Subscription to implement domain.NatsMessageSubscription.
@@ -164,7 +163,7 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	}
 
 	subject := fmt.Sprintf("wa.%s.%s.chats", companyID, agentID)
-	queueGroup := "ws_fanout" // As per task description
+	queueGroup := "ws_fanout"
 
 	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
 		"subject", subject,
@@ -224,14 +223,12 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
 
-	subject := rediskeys.RouteKeyMessages(companyID, agentID, chatID) // This generates "route:..." which is not a NATS subject
-	// Correct NATS subject format:
-	subject = fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
+	subject := fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
 
-	// Use the same queue group and consumer name as SubscribeToChats for now,
-	// as these messages are part of the overall fanout strategy.
-	queueGroup := "ws_fanout"
-	durableName := a.cfgProvider.Get().NATS.ConsumerName // ws_fanout_consumer or similar
+	// Use a distinct queue group for specific chat messages
+	queueGroup := "ws_fanout_messages_q"
+	durableNameBase := a.cfgProvider.Get().NATS.ConsumerName  // ws_fanout_consumer or similar
+	durableNameForMessages := durableNameBase + "_messages_q" // This becomes 'ws_fanout_messages'
 	ackWaitMessages := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
 	if ackWaitMessages <= 0 {
 		ackWaitMessages = 30 * time.Second // Fallback default
@@ -240,7 +237,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 	a.logger.Info(ctx, "Attempting to subscribe to NATS chat messages subject",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"durable_name", durableName,
+		"durable_name", durableNameForMessages, // Use the derived durable name
 	)
 
 	natsHandler := nats.MsgHandler(handler) // Convert domain.NatsMessageHandler to nats.MsgHandler
@@ -249,8 +246,8 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		subject,
 		queueGroup,
 		natsHandler,
-		nats.Durable(durableName+"_messages"), // Ensure durable name is unique per type of subscription if needed or managed carefully
-		nats.DeliverAll(),
+		nats.Durable(durableNameForMessages), // Use the derived durable name
+		nats.DeliverLastPerSubject(),
 		nats.ManualAck(),
 		nats.AckWait(ackWaitMessages),
 		nats.MaxAckPending(a.natsMaxAckPending),
@@ -260,7 +257,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		a.logger.Error(ctx, "Failed to subscribe to NATS chat messages subject",
 			"subject", subject,
 			"queue_group", queueGroup,
-			"durable_name", durableName+"_messages",
+			"durable_name", durableNameForMessages, // Use the derived durable name
 			"error", err.Error(),
 		)
 		return nil, fmt.Errorf("failed to subscribe to NATS chat messages subject %s: %w", subject, err)
@@ -269,7 +266,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 	a.logger.Info(ctx, "Successfully subscribed to NATS chat messages subject",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"durable_name", durableName+"_messages",
+		"durable_name", durableNameForMessages, // Use the derived durable name
 	)
 	return &natsSubscriptionWrapper{Subscription: sub}, nil
 }
@@ -302,7 +299,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 	}
 	// Subject pattern: wa.<companyIDPattern>.<agentIDPattern>.agents
 	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
-	queueGroup := "ws_fanout"
+	queueGroup := "ws_fanout_admin_events"
 
 	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
 		"subject", subject,
@@ -325,7 +322,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		queueGroup,
 		natsHandler,
 		nats.Durable(durableName+"_admin_agents"), // Make durable name distinct for this type of subscription to avoid conflicts if same base consumer name is used.
-		nats.DeliverAll(),
+		nats.DeliverLastPerSubject(),
 		nats.ManualAck(),
 		nats.AckWait(ackWaitAdmin),
 		nats.MaxAckPending(a.natsMaxAckPending), // Reuse existing config for MaxAckPending
