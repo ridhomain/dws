@@ -115,6 +115,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Add other necessary context values from r.Context() to baseCtxForWs if needed.
 
+	// Propagate authentication-related context values to the WebSocket connection's lifecycle context.
+	// These are essential for operations throughout the connection's lifetime, such as session and route renewal.
+	if authCtx != nil {
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.AuthUserContextKey, authCtx) // Also propagate the full authCtx if needed elsewhere
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.CompanyIDKey, authCtx.CompanyID)
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.AgentIDKey, authCtx.AgentID)
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.UserIDKey, authCtx.UserID)
+		h.logger.Debug(r.Context(), "Propagated CompanyID, AgentID, UserID from authCtx to WebSocket lifetime context",
+			"company_id", authCtx.CompanyID, "agent_id", authCtx.AgentID, "user_id", authCtx.UserID)
+	} else {
+		// This case should ideally be prevented by the check for authCtx earlier,
+		// but as a safeguard, log if it's still nil here.
+		h.logger.Error(r.Context(), "authCtx is nil when attempting to propagate its values to WebSocket lifetime context. This is unexpected.")
+		// Depending on policy, might need to abort connection if critical auth info cannot be propagated.
+		// For now, proceeding will likely lead to issues downstream (like the renewal errors).
+	}
+
 	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(baseCtxForWs)
 
 	// Session Lock Acquisition (FR-4 part 1)
@@ -217,6 +234,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"user", authCtx.UserID,
 		"sessionKey", sessionKey)
 
+	// --- START ADDITION ---
+	debugCompanyID, _ := wrappedConn.Context().Value(contextkeys.CompanyIDKey).(string)
+	debugAgentID, _ := wrappedConn.Context().Value(contextkeys.AgentIDKey).(string)
+	h.logger.Debug(wrappedConn.Context(), "DEBUG: Pre-RegisterConnection context check",
+		"debug_company_id_from_conn_ctx", debugCompanyID,
+		"debug_agent_id_from_conn_ctx", debugAgentID,
+		"sessionKey", sessionKey)
+	// --- END ADDITION ---
+
 	// Pass companyID and agentID for route registration
 	h.connManager.RegisterConnection(sessionKey, wrappedConn, authCtx.CompanyID, authCtx.AgentID)
 
@@ -315,6 +341,12 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	// Handler for general chat events (e.g., chat list updates)
 	generalChatEventsNatsHandler := func(msg *nats.Msg) {
 		metrics.IncrementNatsMessagesReceived(msg.Subject)
+		defer func() {
+			if err := msg.Ack(); err != nil {
+				h.logger.Error(context.TODO(), "Failed to ACK general chat event NATS message", "subject", msg.Subject, "error", err)
+			}
+		}()
+
 		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
 		if natsRequestID == "" {
 			natsRequestID = uuid.NewString()
@@ -325,28 +357,27 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		var eventPayload domain.EnrichedEventPayload
 		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
 			h.logger.Error(msgCtx, "Failed to unmarshal general chat event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
-			return // Return to let NATS redeliver after AckWait
+			return // Ack will be handled by defer
 		}
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
-			return // Do not record activity if write failed
-		} else {
-			metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-			// Record session activity after successful write
-			if h.connManager != nil && h.connManager.SessionLocker() != nil {
-				sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-				adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
-				activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
-				if activityTTL <= 0 {
-					activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
-				}
-				if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
-					h.logger.Error(msgCtx, "Failed to record session activity after general NATS event write", "sessionKey", sessionKey, "error", errAct)
-				}
+			return // Ack will be handled by defer
+		}
+
+		metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+		// Record session activity after successful write
+		if h.connManager != nil && h.connManager.SessionLocker() != nil {
+			sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+			adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+			activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+			if activityTTL <= 0 {
+				activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+			}
+			if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
+				h.logger.Error(msgCtx, "Failed to record session activity after general NATS event write", "sessionKey", sessionKey, "error", errAct)
 			}
 		}
-		_ = msg.Ack()
 	}
 
 	// Initial subscription to general wa.C.A.chats topic
@@ -385,10 +416,14 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject)
 		if err != nil {
 			h.logger.Error(msgCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
-			return // Return to let NATS redeliver after AckWait
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(msgCtx, "Failed to ACK NATS message after subject parse error", "subject", msg.Subject, "error", ackErr.Error())
+			} else {
+				h.logger.Debug(msgCtx, "Successfully ACKed NATS message after subject parse error", "subject", msg.Subject)
+			}
+			return
 		}
 
-		// Debug log for NATS message receipt
 		h.logger.Debug(msgCtx, "Received NATS message",
 			"subject", msg.Subject,
 			"company_id", msgCompanyID,
@@ -400,7 +435,12 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		currentPodID := h.configProvider.Get().Server.PodID
 		if currentPodID == "" {
 			h.logger.Error(connCtx, "Current PodID is not configured, cannot determine message ownership.", "subject", msg.Subject)
-			return // Return to let NATS redeliver after AckWait
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(connCtx, "Failed to ACK NATS message due to missing PodID config", "subject", msg.Subject, "error", ackErr.Error())
+			} else {
+				h.logger.Debug(connCtx, "Successfully ACKed NATS message due to missing PodID config", "subject", msg.Subject)
+			}
+			return
 		}
 
 		ownerPodID, err := h.routeRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
@@ -409,155 +449,157 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 				h.logger.Warn(connCtx, "No owning pod found for message route in Redis, potential race or cleanup issue. NACKing message.", "subject", msg.Subject, "chat_id_from_subject", msgChatID)
 				if nakErr := msg.Nak(); nakErr != nil {
 					h.logger.Error(connCtx, "Failed to NACK NATS message for ErrNoOwningPod", "subject", msg.Subject, "error", nakErr.Error())
+					// If Nak fails, Ack to prevent redelivery loop
+					if ackErr := msg.Ack(); ackErr != nil {
+						h.logger.Error(connCtx, "Failed to ACK NATS message after failed NACK (ErrNoOwningPod)", "subject", msg.Subject, "error", ackErr.Error())
+					} else {
+						h.logger.Debug(connCtx, "Successfully ACKed NATS message after failed NACK (ErrNoOwningPod)", "subject", msg.Subject)
+					}
 				}
-				return // Return to let NATS redeliver after AckWait
-			} else {
-				h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
-				return // Return to let NATS redeliver after AckWait
+				return // Message NAK'd (or ACK'd if NAK failed)
 			}
+			h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(connCtx, "Failed to ACK NATS message after Redis owner lookup error", "subject", msg.Subject, "error", ackErr.Error())
+			} else {
+				h.logger.Debug(connCtx, "Successfully ACKed NATS message after Redis owner lookup error", "subject", msg.Subject)
+			}
+			return
 		}
 
-		var isOwner bool
-		if ownerPodID == currentPodID {
-			isOwner = true
-		} else {
-			isOwner = false
-			if ownerPodID == "" {
-				h.logger.Error(connCtx, "Internal logic inconsistency: ownerPodID is empty after GetOwningPodForMessageRoute succeeded. Assuming not owner.", "subject", msg.Subject)
-			}
-		}
+		isOwner := ownerPodID == currentPodID
 
-		if isOwner {
-			h.logger.Info(msgCtx, "Current pod IS THE OWNER of the message route. Delivering locally.", "subject", msg.Subject, "podID", currentPodID)
-			var eventPayload domain.EnrichedEventPayload
-			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
-				h.logger.Error(msgCtx, "Failed to unmarshal NATS message into EnrichedEventPayload (owner)",
-					"subject", msg.Subject, "error", errUnmarshal.Error(), "raw_data", string(msg.Data))
-				return // Return to let NATS redeliver after AckWait
-			}
+		if !isOwner {
+			h.logger.Info(msgCtx, "This pod is NOT the owner of the message route. Attempting to forward.",
+				"subject", msg.Subject, "owner_pod_id", ownerPodID, "current_pod_id", currentPodID, "chat_id_from_subject", msgChatID)
 
-			// Check for duplicate message delivery (message uniqueness)
-			// This helps prevent re-processing if a message is delivered more than once due to NATS redelivery or other reasons
-			eventID := eventPayload.EventID
-			if eventID != "" {
-				// For now, implement a simple in-memory message deduplication check
-				// In a production environment, this could be enhanced with a distributed solution like Redis
-
-				// Create a unique key for this message in this pod
-				messageKey := fmt.Sprintf("%s:%s:%s:%s", msgCompanyID, msgAgentID, msgChatID, eventID)
-
-				// The actual deduplication check would go here
-				// For now, we'll just log that we would check for duplicates
-				h.logger.Debug(msgCtx, "Would check for message uniqueness (not implemented)",
-					"event_id", eventID,
-					"message_key", messageKey,
-					"subject", msg.Subject,
-					"operation", "NatsMessageHandler")
-			}
-
-			// Log delivery attempt to client
-			h.logger.Debug(msgCtx, "Attempting to deliver NATS message to WebSocket client",
-				"subject", msg.Subject,
-				"event_id", eventPayload.EventID,
-				"operation", "NatsMessageHandler")
-
-			wsMessage := domain.NewEventMessage(eventPayload)
-			if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
-				h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
-					"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
-				)
-				return // Do not record activity if write failed
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-				h.logger.Debug(msgCtx, "Successfully delivered NATS message to WebSocket client",
-					"subject", msg.Subject,
-					"event_id", eventPayload.EventID,
-					"operation", "NatsMessageHandler")
-
-				// Record session activity
-				if h.connManager != nil && h.connManager.SessionLocker() != nil {
-					sessionKey := rediskeys.SessionKey(companyID, agentID, userID) // companyID, agentID, userID are from manageConnection scope
-					adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
-					activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
-					if activityTTL <= 0 {
-						activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
-					}
-					if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
-						h.logger.Error(msgCtx, "Failed to record session activity after specific NATS event write", "sessionKey", sessionKey, "error", errAct)
-					} else {
-						h.logger.Debug(msgCtx, "Recorded session activity after message delivery",
-							"session_key", sessionKey,
-							"ttl", activityTTL.String(),
-							"operation", "NatsMessageHandler")
-					}
-				}
-				// Record message route activity
-				if h.routeRegistry != nil {
-					messageRouteKey := rediskeys.RouteKeyMessages(msgCompanyID, msgAgentID, msgChatID)
-					adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
-					activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
-					if activityTTL <= 0 {
-						activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
-					}
-					if errAct := h.routeRegistry.RecordActivity(msgCtx, messageRouteKey, activityTTL); errAct != nil {
-						h.logger.Error(msgCtx, "Failed to record message route activity after specific NATS event write (owner)", "messageRouteKey", messageRouteKey, "error", errAct)
-					} else {
-						h.logger.Debug(msgCtx, "Recorded message route activity after message delivery",
-							"message_route_key", messageRouteKey,
-							"ttl", activityTTL.String(),
-							"operation", "NatsMessageHandler")
-					}
-				}
-			}
-		} else {
-			h.logger.Info(msgCtx, "Current pod IS NOT THE OWNER of the message route. Attempting gRPC hop via MessageForwarder.",
-				"subject", msg.Subject, "current_pod_id", currentPodID, "owner_pod_id", ownerPodID)
-
-			if ownerPodID != "" { // Ensure there is a specific owner pod to forward to
-				gprcTargetAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
-				var domainPayload domain.EnrichedEventPayload
-				if errUnmarshal := json.Unmarshal(msg.Data, &domainPayload); errUnmarshal != nil {
-					h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for gRPC forwarding (MessageForwarder)", "subject", msg.Subject, "error", errUnmarshal.Error())
-					// Do NOT ACK if unmarshal failed for forwarding logic consistency, let NATS redeliver.
-					// Or, if this is a permanent error, consider a dead-letter queue strategy (outside current scope).
-					return
+			var eventPayloadToForward domain.EnrichedEventPayload
+			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayloadToForward); errUnmarshal != nil {
+				h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for forwarding (non-owner)", "subject", msg.Subject, "error", errUnmarshal.Error())
+				// Ack since unmarshalling failed, message is likely malformed.
+				if ackErr := msg.Ack(); ackErr != nil {
+					h.logger.Error(msgCtx, "Failed to ACK NATS message after unmarshal error for forwarding (non-owner)", "subject", msg.Subject, "error", ackErr.Error())
 				} else {
-					h.logger.Debug(msgCtx, "Attempting to forward NATS message via gRPC",
-						"subject", msg.Subject,
-						"event_id", domainPayload.EventID,
-						"target_address", gprcTargetAddress,
-						"operation", "NatsMessageHandler")
+					h.logger.Debug(msgCtx, "Successfully ACKed NATS message after unmarshal error for forwarding (non-owner)", "subject", msg.Subject)
+				}
+				return
+			}
 
-					if errFwd := h.messageForwarder.ForwardEvent(msgCtx, gprcTargetAddress, &domainPayload, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
-						h.logger.Error(msgCtx, "Failed to forward event via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID, "error", errFwd.Error())
-						// Do NOT ACK if forwarding failed
-						return // Return to let NATS redeliver
+			targetGRPCAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
+			if errFwd := h.messageForwarder.ForwardEvent(msgCtx, targetGRPCAddress, &eventPayloadToForward, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
+				h.logger.Error(msgCtx, "Failed to forward NATS message to owner pod (non-owner). NACKing.",
+					"subject", msg.Subject, "owner_pod_id", ownerPodID, "target_grpc_address", targetGRPCAddress, "error", errFwd.Error())
+				if nakErr := msg.Nak(); nakErr != nil {
+					h.logger.Error(msgCtx, "Failed to NACK NATS message after forwarding error (non-owner)", "subject", msg.Subject, "error", nakErr.Error())
+					if ackErr := msg.Ack(); ackErr != nil {
+						h.logger.Error(connCtx, "Failed to ACK NATS message after failed NACK (non-owner, forwarding error)", "subject", msg.Subject, "error", ackErr.Error())
 					} else {
-						h.logger.Debug(msgCtx, "Successfully forwarded NATS message via gRPC",
-							"subject", msg.Subject,
-							"event_id", domainPayload.EventID,
-							"target_address", gprcTargetAddress,
-							"operation", "NatsMessageHandler")
-						h.logger.Info(msgCtx, "Successfully initiated event forwarding via MessageForwarder", "target_address", gprcTargetAddress, "event_id", domainPayload.EventID)
+						h.logger.Debug(connCtx, "Successfully ACKed NATS message after failed NACK (non-owner, forwarding error)", "subject", msg.Subject)
 					}
 				}
 			} else {
-				h.logger.Warn(msgCtx, "No specific owner pod ID found for gRPC hop (MessageForwarder), message will not be forwarded.", "subject", msg.Subject)
-				// If not forwarded, and not owned locally, this message is effectively dropped by this pod.
-				// We should still ACK it to prevent NATS redelivery if this is the terminal state for this pod.
-				// However, if ErrNoOwningPod was hit earlier and NACKed, this path won't be reached for that message.
-				// Assuming if ownerPodID is empty here, it's a scenario where the message shouldn't be processed by this pod.
+				h.logger.Info(msgCtx, "Successfully forwarded NATS message to owner pod (non-owner). ACKed.",
+					"subject", msg.Subject, "owner_pod_id", ownerPodID, "target_grpc_address", targetGRPCAddress)
+				if ackErr := msg.Ack(); ackErr != nil {
+					h.logger.Error(msgCtx, "Failed to ACK NATS message after successful forwarding (non-owner)", "subject", msg.Subject, "error", ackErr.Error())
+				} else {
+					h.logger.Debug(msgCtx, "Successfully ACKed NATS message after successful forwarding (non-owner)", "subject", msg.Subject)
+				}
 			}
+			return // Message processed by non-owner (forwarded or NAK'd/ACK'd)
 		}
 
-		if ackErr := msg.Ack(); ackErr != nil {
-			h.logger.Error(msgCtx, "Failed to ACK NATS message after processing", "subject", msg.Subject, "error", ackErr.Error())
-		} else {
-			h.logger.Debug(msgCtx, "Successfully ACKed NATS message",
-				"subject", msg.Subject,
-				"operation", "NatsMessageHandler")
+		// This pod is the owner
+		h.logger.Info(msgCtx, "This pod is the owner of the message route. Processing NATS message.",
+			"subject", msg.Subject, "company_id", msgCompanyID, "agent_id", msgAgentID, "chat_id", msgChatID, "pod_id", currentPodID)
+
+		var eventPayload domain.EnrichedEventPayload
+		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
+			h.logger.Error(msgCtx, "Failed to unmarshal NATS message payload (owner)",
+				"subject", msg.Subject, "chat_id_from_subject", msgChatID, "error", errUnmarshal.Error(),
+			)
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(msgCtx, "Failed to ACK NATS message after unmarshal error (owner)", "subject", msg.Subject, "error", ackErr.Error())
+			} else {
+				h.logger.Debug(msgCtx, "Successfully ACKed NATS message after unmarshal error (owner)", "subject", msg.Subject)
+			}
+			return
 		}
-	}
+
+		if conn == nil || connCtx.Err() != nil { // Check connection context for cancellation
+			h.logger.Warn(msgCtx, "WebSocket connection is closed, nil, or context cancelled. Cannot deliver NATS message. Acking.",
+				"subject", msg.Subject, "company_id", companyID, "agent_id", agentID, "user_id", userID, "chat_id_from_payload", eventPayload.ChatID)
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(msgCtx, "Failed to ACK NATS message for closed/nil/cancelled WebSocket connection (owner)", "subject", msg.Subject, "error", ackErr.Error())
+			} else {
+				h.logger.Debug(msgCtx, "Successfully ACKed NATS message for closed/nil/cancelled WebSocket connection (owner)", "subject", msg.Subject)
+			}
+			return
+		}
+
+		wsMessage := domain.NewEventMessage(eventPayload)
+		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
+			h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
+				"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
+			)
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(msgCtx, "Failed to ACK NATS message after WebSocket write error (owner)", "subject", msg.Subject, "error", ackErr.Error())
+			} else {
+				h.logger.Debug(msgCtx, "Successfully ACKed NATS message after WebSocket write error (owner)", "subject", msg.Subject)
+			}
+			return
+		}
+
+		metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+		h.logger.Debug(msgCtx, "Successfully delivered NATS message to WebSocket client",
+			"subject", msg.Subject,
+			"event_id", eventPayload.EventID,
+			"operation", "NatsMessageHandler")
+
+		if h.connManager != nil && h.connManager.SessionLocker() != nil {
+			sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+			adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+			activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+			if activityTTL <= 0 {
+				activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+			}
+			if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
+				h.logger.Error(msgCtx, "Failed to record session activity after specific NATS event write", "sessionKey", sessionKey, "error", errAct)
+			} else {
+				h.logger.Debug(msgCtx, "Recorded session activity after message delivery",
+					"session_key", sessionKey,
+					"ttl", activityTTL.String(),
+					"operation", "NatsMessageHandler")
+			}
+		}
+		if h.routeRegistry != nil {
+			messageRouteKey := rediskeys.RouteKeyMessages(msgCompanyID, msgAgentID, msgChatID)
+			adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
+			activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
+			if activityTTL <= 0 {
+				activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
+			}
+			if errAct := h.routeRegistry.RecordActivity(msgCtx, messageRouteKey, activityTTL); errAct != nil {
+				h.logger.Error(msgCtx, "Failed to record message route activity",
+					"subject", msg.Subject, "company_id", msgCompanyID, "agent_id", msgAgentID, "chat_id", msgChatID, "error", errAct.Error(),
+				)
+			} else {
+				h.logger.Debug(msgCtx, "Recorded message route activity after message delivery by owner",
+					"message_route_key", messageRouteKey, "ttl", activityTTL.String())
+			}
+		}
+		if err := msg.Ack(); err != nil {
+			h.logger.Error(msgCtx, "Failed to ACK NATS message after successful processing (owner)", "subject", msg.Subject, "error", err.Error())
+		} else {
+			h.logger.Debug(msgCtx, "Successfully ACKed NATS message after successful processing (owner)", "subject", msg.Subject)
+		}
+	} // End of specificChatNatsMessageHandler
+
+	// Do NOT subscribe to specific chat messages initially with an empty chatID.
+	// Subscription to specific messages will happen within handleSelectChatMessage
+	// after a valid select_chat message is received from the client.
+	// currentSpecificChatID remains "" initially.
+	// specificNatsSubscription remains nil initially.
 
 	// Defer cleanup for all subscriptions
 	defer func() {

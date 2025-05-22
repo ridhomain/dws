@@ -13,6 +13,15 @@ import (
 
 // RegisterConnection stores the managed connection and registers its initial chat route.
 func (cm *ConnectionManager) RegisterConnection(sessionKey string, conn domain.ManagedConnection, companyID, agentID string) {
+	debugRegCompanyID, _ := conn.Context().Value(contextkeys.CompanyIDKey).(string)
+	debugRegAgentID, _ := conn.Context().Value(contextkeys.AgentIDKey).(string)
+	cm.logger.Debug(conn.Context(), "DEBUG: Inside RegisterConnection context check",
+		"debug_reg_company_id", debugRegCompanyID,
+		"debug_reg_agent_id", debugRegAgentID,
+		"passed_company_id_param", companyID, // companyID param passed to function
+		"passed_agent_id_param", agentID, // agentID param passed to function
+		"sessionKey", sessionKey)
+
 	cm.activeConnections.Store(sessionKey, conn)
 	metrics.IncrementActiveConnections()
 	cm.logger.Info(conn.Context(), "WebSocket connection registered with ConnectionManager", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr())

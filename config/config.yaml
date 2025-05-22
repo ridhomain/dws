@@ -49,7 +49,7 @@ app:
   write_timeout_seconds: 30
   max_missed_pongs: 2
   session_ttl_seconds: 30
-  route_ttl_seconds: 30
+  route_ttl_seconds: 300
   ttl_refresh_interval_seconds: 10
   nats_max_ack_pending: 5000
   session_lock_retry_delay_ms: 250
@@ -74,12 +74,12 @@ app:
 # Adaptive TTL Configuration
 adaptive_ttl:
   session_lock:
-    enabled: true
-    min_ttl_seconds: 60
-    max_ttl_seconds: 300
+    enabled: false
+    min_ttl_seconds: 15
+    max_ttl_seconds: 30
     activity_threshold_seconds: 120
-    active_ttl_seconds: 180
-    inactive_ttl_seconds: 60
+    active_ttl_seconds: 30
+    inactive_ttl_seconds: 15
   message_route:
     enabled: true
     min_ttl_seconds: 300

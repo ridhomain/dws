@@ -54,8 +54,12 @@ func InitialZapLoggerProvider() (*zap.Logger, func(), error) {
 		// Syncing flushes any buffered log entries.
 		// It's good practice, especially before application exit.
 		if syncErr := logger.Sync(); syncErr != nil {
-			// Log to stderr if sync fails, as the logger itself might be compromised.
-			fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
+			// Ignore "invalid argument" errors when syncing, which commonly occur in
+			// containerized environments when syncing to /dev/stderr
+			if syncErr.Error() != "sync /dev/stderr: invalid argument" {
+				// Only log non-container-specific sync errors
+				fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
+			}
 		}
 	}
 	return logger, cleanup, nil
