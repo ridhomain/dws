@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -178,9 +179,18 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 						companyID, _ := connCtx.Value(contextkeys.CompanyIDKey).(string)
 						agentID, _ := connCtx.Value(contextkeys.AgentIDKey).(string)
 
+						// Check if this is an admin connection (admin sessions don't have companyID/agentID)
+						// Admin session keys follow the pattern "session:admin:adminID"
+						isAdminConnection := strings.HasPrefix(sessionKey, "session:admin:")
+
 						if companyID == "" || agentID == "" {
-							cm.logger.Error(connCtx, "Missing companyID or agentID in connection context, cannot renew routes", "sessionKey", sessionKey)
-							return true // continue to next item
+							if isAdminConnection {
+								cm.logger.Debug(connCtx, "Skipping route renewal for admin connection (admin connections don't manage routes)", "sessionKey", sessionKey)
+								return true // continue to next item - this is expected for admin connections
+							} else {
+								cm.logger.Error(connCtx, "Missing companyID or agentID in connection context, cannot renew routes", "sessionKey", sessionKey)
+								return true // continue to next item
+							}
 						}
 
 						// Chat Route (route:<c>:<a>:chats) Renewal

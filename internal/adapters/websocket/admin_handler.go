@@ -3,8 +3,10 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"runtime/debug"
@@ -374,14 +376,32 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		}
 
 		if errRead != nil {
-			// Remove the pong timeout check here since it's handled by the pinger
+			// Check if error is due to context cancellation (graceful shutdown)
+			if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
+				h.logger.Info(connCtx, "Admin connection read loop exiting due to context cancellation (graceful shutdown)", "admin_id", adminInfo.AdminID)
+				return
+			}
+
+			// Check if error is due to context deadline exceeded
+			if errors.Is(errRead, context.DeadlineExceeded) || connCtx.Err() == context.DeadlineExceeded {
+				h.logger.Info(connCtx, "Admin connection read loop exiting due to context deadline exceeded", "admin_id", adminInfo.AdminID)
+				return
+			}
+
+			// Handle WebSocket specific close statuses
 			closeStatus := websocket.CloseStatus(errRead)
 			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
 				h.logger.Info(connCtx, "Admin connection closed normally by client", "admin_id", adminInfo.AdminID, "status", closeStatus.String())
 			} else if closeStatus == websocket.StatusNoStatusRcvd {
 				h.logger.Info(connCtx, "Admin connection closed without status (likely network issue)", "admin_id", adminInfo.AdminID, "error", errRead.Error())
 			} else {
-				h.logger.Error(connCtx, "Admin connection read error", "error", errRead.Error(), "admin_id", adminInfo.AdminID, "close_status", closeStatus.String())
+				// Check if the error message contains context-related errors that might not be caught by errors.Is
+				errMsg := strings.ToLower(errRead.Error())
+				if strings.Contains(errMsg, "context canceled") || strings.Contains(errMsg, "context cancelled") {
+					h.logger.Info(connCtx, "Admin connection read error due to context cancellation (graceful shutdown)", "admin_id", adminInfo.AdminID, "error", errRead.Error())
+				} else {
+					h.logger.Error(connCtx, "Admin connection read error", "error", errRead.Error(), "admin_id", adminInfo.AdminID, "close_status", closeStatus.String())
+				}
 			}
 			return
 		}
