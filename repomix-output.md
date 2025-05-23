@@ -45,6 +45,15 @@ cmd/
     main.go
 config/
   config.yaml
+deploy/
+  postgres-init/
+    init-sequin-db.sh
+  daisi-sequin.yml
+  docker-compose.yaml
+  loki-config.yml
+  prometheus.yml
+  promtail-config.yml
+  setup.sql
 internal/
   adapters/
     config/
@@ -112,11 +121,570 @@ pkg/
     keys.go
   safego/
     safego.go
+.dockerignore
 .gitignore
+env.example
 go.mod
 ```
 
 # Files
+
+## File: deploy/postgres-init/init-sequin-db.sh
+```bash
+set -e
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    CREATE DATABASE sequin_db;
+    GRANT ALL PRIVILEGES ON DATABASE sequin_db TO "$POSTGRES_USER";
+    \connect sequin_db "$POSTGRES_USER"
+    -- You can add any Sequin-specific extensions or initial schema setup here if needed.
+    -- For example: CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+EOSQL
+echo "Database 'sequin_db' created and configured for user '$POSTGRES_USER'"
+```
+
+## File: deploy/daisi-sequin.yml
+```yaml
+account:
+  name: "Daisi"
+users:
+  - account: "Daisi"
+    email: "admin@sequinstream.com"
+    password: "password"
+databases:
+  - name: message_service_db
+    port: 5432
+    ssl: false
+    ipv6: false
+    hostname: postgres
+    password: postgres
+    username: postgres
+    pool_size: 10
+    database: message_service_db
+    use_local_tunnel: false
+    slot_name: daisi_slot
+    publication_name: daisi_pub
+sinks:
+  - name: global00_messages_sink
+    status: active
+    table: daisi_CompanyGLOBAL00.messages
+    filters: []
+    transform: none
+    destination:
+      port: 4222
+      type: nats
+      host: nats
+      tls: false
+    actions:
+      - insert
+      - update
+      - delete
+    batch_size: 1
+    database: message_service_db
+    timestamp_format: iso8601
+    max_retry_count:
+    load_shedding_policy: pause_on_full
+    active_backfill:
+    group_column_names:
+      - message_id
+      - message_date
+  - name: global00_chats_sink
+    status: active
+    table: daisi_CompanyGLOBAL00.chats
+    filters: []
+    transform: none
+    destination:
+      port: 4222
+      type: nats
+      host: nats
+      tls: false
+    actions:
+      - insert
+      - update
+      - delete
+    batch_size: 1
+    database: message_service_db
+    timestamp_format: iso8601
+    max_retry_count:
+    load_shedding_policy: pause_on_full
+    active_backfill:
+    group_column_names:
+      - chat_id
+  - name: global00_agents_sink
+    status: active
+    table: daisi_CompanyGLOBAL00.agents
+    filters: []
+    transform: none
+    destination:
+      port: 4222
+      type: nats
+      host: nats
+      tls: false
+    actions:
+      - insert
+      - update
+      - delete
+    batch_size: 1
+    database: message_service_db
+    timestamp_format: iso8601
+    max_retry_count:
+    load_shedding_policy: pause_on_full
+    active_backfill:
+    group_column_names:
+      - agent_id
+```
+
+## File: deploy/docker-compose.yaml
+```yaml
+version: '3.8'
+networks:
+  daisi_network:
+    driver: bridge
+services:
+  message-event-service:
+    image: daisi/daisi-message-event-service:latest
+    container_name: daisi-message-event-service
+    environment:
+      POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/message_service_db
+      NATS_URL: nats://nats:4222
+      COMPANY_ID: CompanyGLOBAL00
+      LOG_LEVEL: info
+      MES_SERVER_PORT: 8081
+      MES_METRICS_ENABLED: "true"
+    ports:
+      - "8081:8081"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    labels:
+      logging: promtail
+      service_name: message-event-service
+  ws-service-2:
+    image: daisi/daisi-ws-service:latest
+    ports:
+      - "8083:8080"
+      - "50051:50051"
+    volumes:
+      - ../daisi-ws-service/config:/app/config:ro
+    environment:
+      DAISI_WS_SERVER_HTTP_PORT: 8080
+      DAISI_WS_SERVER_GRPC_PORT: 50051
+      DAISI_WS_SERVER_POD_ID: ws-service-2
+      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
+      DAISI_WS_NATS_URL: nats://nats:4222
+      DAISI_WS_NATS_STREAM_NAME: wa_stream
+      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
+      DAISI_WS_REDIS_ADDRESS: redis:6379
+      DAISI_WS_LOG_LEVEL: debug
+      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-2
+      DAISI_WS_APP_VERSION: unified-local
+      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
+      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
+      DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
+      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+    labels:
+      logging: promtail
+      service_name: ws-service-2
+  ws-service-1:
+    image: daisi/daisi-ws-service:latest
+    ports:
+      - "8084:8080"
+      - "50052:50051"
+    volumes:
+      - ../daisi-ws-service/config:/app/config:ro
+    environment:
+      DAISI_WS_SERVER_HTTP_PORT: 8080
+      DAISI_WS_SERVER_GRPC_PORT: 50051
+      DAISI_WS_SERVER_POD_ID: ws-service-1
+      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
+      DAISI_WS_NATS_URL: nats://nats:4222
+      DAISI_WS_NATS_STREAM_NAME: wa_stream
+      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
+      DAISI_WS_REDIS_ADDRESS: redis:6379
+      DAISI_WS_LOG_LEVEL: debug
+      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-1
+      DAISI_WS_APP_VERSION: unified-local
+      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
+      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
+      DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
+      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+    labels:
+      logging: promtail
+      service_name: ws-service-1
+  cdc-consumer-service:
+    image: daisi/daisi-cdc-consumer-service:latest
+    container_name: daisi-cdc-consumer-service
+    ports:
+      - "8082:8080"
+    environment:
+      DAISI_CDC_NATS_URL: "nats://nats:4222"
+      DAISI_CDC_REDIS_ADDR: "redis://redis:6379"
+      DAISI_CDC_LOG_LEVEL: "debug"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    labels:
+      logging: promtail
+      service_name: cdc-consumer-service
+  sequin:
+    image: sequin/sequin:latest
+    container_name: sequin
+    ports:
+      - "7376:7376"
+    environment:
+      PG_HOSTNAME: postgres
+      PG_DATABASE: sequin_db
+      PG_PORT: 5432
+      PG_USERNAME: postgres
+      PG_PASSWORD: postgres
+      PG_POOL_SIZE: 20
+      SECRET_KEY_BASE: "wDPLYus0pvD6qJhKJICO4dauYPXfO/Yl782Zjtpew5qRBDp7CZvbWtQmY0eB13If"
+      VAULT_KEY: "2Sig69bIpuSm2kv0VQfDekET2qy8qUZGI8v3/h3ASiY="
+      REDIS_URL: redis://redis:6379
+      CONFIG_FILE_PATH: /config/daisi-sequin.yml
+    volumes:
+      - ./daisi-sequin.yml:/config/daisi-sequin.yml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+  postgres:
+    image: postgres:17-bookworm
+    container_name: postgres-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: message_service_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    networks:
+      - daisi_network
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d message_service_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  nats:
+    image: nats:2.11-alpine
+    container_name: nats-server
+    command: "--name unified-nats-server --http_port 8222 --jetstream --store_dir /data"
+    ports:
+      - "4222:4222"
+      - "6222:6222"
+      - "8222:8222"
+    volumes:
+      - ./data/nats:/data
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./data/loki:/loki
+      - ./loki-config.yml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: promtail
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - daisi_network
+    depends_on:
+      - loki
+    restart: unless-stopped
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest
+    container_name: nats-exporter
+    command: "-connz -routez -subz -varz http://nats:8222"
+    ports:
+      - "7777:7777"
+    networks:
+      - daisi_network
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7777/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      - nats-exporter
+      - message-event-service
+      - ws-service-1
+      - ws-service-2
+      - cdc-consumer-service
+      - loki
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./data/grafana:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_PROVISIONING_PATH: "/etc/grafana/provisioning"
+      GF_DATASOURCES_DEFAULT_DATASOURCE_URL: http://prometheus:9090
+      GF_INSTALL_PLUGINS: "https://storage.googleapis.com/integration-artifacts/grafana-lokiexplore-app/grafana-lokiexplore-app-latest.zip;grafana-lokiexplore-app"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+```
+
+## File: deploy/loki-config.yml
+```yaml
+auth_enabled: false
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+pattern_ingester:
+  enabled: true
+limits_config:
+  volume_enabled: true
+  allow_structured_metadata: true
+ruler:
+  alertmanager_url: http://localhost:9093
+memberlist:
+  join_members: []
+```
+
+## File: deploy/prometheus.yml
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: 'message-event-service'
+    static_configs:
+      - targets: ['message-event-service:8081']
+  - job_name: 'ws-service-1'
+    static_configs:
+      - targets: ['ws-service-1:8080']
+  - job_name: 'ws-service-2'
+    static_configs:
+      - targets: ['ws-service-2:8080']
+  - job_name: 'cdc-consumer-service'
+    static_configs:
+      - targets: ['cdc-consumer-service:8080']
+  - job_name: 'nats-exporter'
+    static_configs:
+      - targets: ['nats-exporter:7777']
+  - job_name: 'sequin'
+    static_configs:
+      - targets: ['sequin:8376']
+```
+
+## File: deploy/promtail-config.yml
+```yaml
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+positions:
+  filename: /tmp/positions.yaml
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+scrape_configs:
+  - job_name: containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["logging=promtail"]
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'logstream'
+      - source_labels: ['__meta_docker_container_label_service_name']
+        target_label: 'service'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'compose_service'
+```
+
+## File: deploy/setup.sql
+```sql
+CREATE PUBLICATION IF NOT EXISTS daisi_pub FOR ALL TABLES WITH (publish_via_partition_root = true);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_replication_slots
+        WHERE slot_name = 'daisi_slot'
+    ) THEN
+        PERFORM pg_create_logical_replication_slot('daisi_slot', 'pgoutput');
+    END IF;
+END;
+$$;
+DO $$
+    DECLARE
+        v_schema_name TEXT := 'daisi_CompanyAAA01';
+        v_table_name TEXT := 'messages';
+        t regclass;
+    BEGIN
+        EXECUTE format('ALTER TABLE %I.chats REPLICA IDENTITY FULL', v_schema_name);
+        EXECUTE format('ALTER TABLE %I.agents REPLICA IDENTITY FULL', v_schema_name);
+        EXECUTE format('ALTER TABLE %I.%I REPLICA IDENTITY FULL', v_schema_name, v_table_name);
+        FOR t IN
+            SELECT inhrelid::regclass
+            FROM pg_catalog.pg_inherits
+            WHERE inhparent = (quote_ident(v_schema_name) || '.' || quote_ident(v_table_name))::regclass
+            LOOP
+                EXECUTE format('ALTER TABLE %s REPLICA IDENTITY FULL;', t);
+            END LOOP;
+    END;
+$$;
+```
 
 ## File: internal/adapters/logger/zap_adapter.go
 ```go
@@ -489,6 +1057,12 @@ func Execute(ctx context.Context, logger domain.Logger, goroutineName string, fn
 }
 ```
 
+## File: .dockerignore
+```
+*.md
+**/*.md
+```
+
 ## File: .gitignore
 ```
 # Logs
@@ -520,6 +1094,39 @@ node_modules/
 # Task files
 tasks.json
 tasks/
+```
+
+## File: env.example
+```
+# Daisi WebSocket Service Environment Variables
+# Copy this file to .env and modify as needed for your environment
+
+# Server Configuration
+DAISI_WS_SERVER_HTTP_PORT=8080
+DAISI_WS_SERVER_GRPC_PORT=50051
+DAISI_WS_SERVER_POD_ID=ws-service-1
+DAISI_WS_SERVER_ENABLE_REFLECTION=true
+
+# NATS Configuration
+DAISI_WS_NATS_URL=nats://localhost:4222
+DAISI_WS_NATS_STREAM_NAME=wa_stream
+DAISI_WS_NATS_CONSUMER_NAME=ws_fanout
+
+# Redis Configuration
+DAISI_WS_REDIS_ADDRESS=localhost:6379
+
+# Logging Configuration
+DAISI_WS_LOG_LEVEL=debug
+
+# Application Configuration
+DAISI_WS_APP_SERVICE_NAME=daisi-ws-service-replica-1
+DAISI_WS_APP_VERSION=unified-local
+
+# Authentication Configuration
+DAISI_WS_AUTH_SECRET_TOKEN=n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv
+DAISI_WS_AUTH_TOKEN_AES_KEY=270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6
+DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY=SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX
+DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY=97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b
 ```
 
 ## File: cmd/daisi-ws-service/main.go
@@ -1756,203 +2363,6 @@ func CompanyTokenAuthMiddleware(authService *application.AuthService, logger dom
 }
 ```
 
-## File: internal/adapters/redis/kill_switch_pubsub.go
-```go
-package redis
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"runtime/debug"
-	"time"
-	"github.com/redis/go-redis/v9"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type KillSwitchPubSubAdapter struct {
-	redisClient *redis.Client
-	logger      domain.Logger
-	sub         *redis.PubSub
-}
-func NewKillSwitchPubSubAdapter(redisClient *redis.Client, logger domain.Logger) *KillSwitchPubSubAdapter {
-	return &KillSwitchPubSubAdapter{
-		redisClient: redisClient,
-		logger:      logger,
-	}
-}
-func (a *KillSwitchPubSubAdapter) PublishSessionKill(ctx context.Context, channel string, message domain.KillSwitchMessage) error {
-	a.logger.Debug(ctx, "Preparing to publish session kill message",
-		"channel", channel,
-		"new_pod_id", message.NewPodID,
-		"operation", "PublishSessionKill")
-	payloadBytes, errMarshal := json.Marshal(message)
-	if errMarshal != nil {
-		a.logger.Error(ctx, "Failed to marshal KillSwitchMessage for publishing", "channel", channel, "error", errMarshal.Error())
-		return fmt.Errorf("failed to marshal KillSwitchMessage: %w", errMarshal)
-	}
-	a.logger.Debug(ctx, "Publishing session kill message with payload",
-		"channel", channel,
-		"new_pod_id", message.NewPodID,
-		"payload", string(payloadBytes),
-		"operation", "PublishSessionKill")
-	var publishAttemptErr error
-	var receiverCount int64
-	maxRetries := 3
-	retryDelay := 100 * time.Millisecond
-	for i := 0; i < maxRetries; i++ {
-		select {
-		case <-ctx.Done():
-			a.logger.Error(ctx, "Context cancelled before publishing session kill message", "channel", channel, "error", ctx.Err())
-			return ctx.Err()
-		default:
-		}
-		result := a.redisClient.Publish(ctx, channel, string(payloadBytes))
-		receiverCount, publishAttemptErr = result.Result()
-		if publishAttemptErr == nil {
-			break
-		}
-		a.logger.Warn(ctx, "Failed to publish session kill message, retrying...",
-			"channel", channel, "attempt", i+1, "max_attempts", maxRetries, "error", publishAttemptErr.Error())
-		if i < maxRetries-1 {
-			select {
-			case <-time.After(retryDelay):
-			case <-ctx.Done():
-				a.logger.Error(ctx, "Context cancelled during publish retry wait for session kill message", "channel", channel, "error", ctx.Err())
-				return ctx.Err()
-			}
-			retryDelay *= 2
-		}
-	}
-	if publishAttemptErr != nil {
-		a.logger.Error(ctx, "Failed to publish session kill message to Redis after multiple retries", "channel", channel, "error", publishAttemptErr.Error())
-		return fmt.Errorf("failed to publish to Redis channel '%s' after %d retries: %w", channel, maxRetries, publishAttemptErr)
-	}
-	a.logger.Debug(ctx, "Session kill message publish result",
-		"channel", channel,
-		"new_pod_id", message.NewPodID,
-		"receiver_count", receiverCount,
-		"operation", "PublishSessionKill")
-	a.logger.Info(ctx, "Successfully published session kill message", "channel", channel, "new_pod_id", message.NewPodID, "receiver_count", receiverCount)
-	return nil
-}
-func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Context, pattern string, handler domain.KillSwitchMessageHandler) error {
-	a.logger.Info(ctx, "Initiating persistent subscription routine for Redis pattern", "pattern", pattern)
-	if a.sub != nil {
-		a.logger.Warn(ctx, "Subscription attempt on an adapter that may already have an active subscription goroutine", "pattern", pattern)
-	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				a.logger.Error(context.Background(), "Panic recovered in persistent Redis PubSub routine",
-					"pattern", pattern, "panic_info", fmt.Sprintf("%v", r), "stacktrace", string(debug.Stack()))
-			}
-			if a.sub != nil {
-				a.logger.Info(context.Background(), "Closing PubSub subscription from defer in persistent routine", "pattern", pattern)
-				if err := a.sub.Close(); err != nil {
-					a.logger.Error(context.Background(), "Error closing Redis subscription in defer", "pattern", pattern, "error", err)
-				}
-				a.sub = nil
-			}
-			a.logger.Info(context.Background(), "Persistent subscription routine for Redis pattern has exited", "pattern", pattern)
-		}()
-		initialRetryDelay := 2 * time.Second
-		maxRetryDelay := 30 * time.Second
-		currentRetryDelay := initialRetryDelay
-		for {
-			select {
-			case <-ctx.Done():
-				a.logger.Info(ctx, "Context cancelled, stopping persistent subscription attempts.", "pattern", pattern)
-				return
-			default:
-			}
-			a.logger.Info(ctx, "Attempting to establish Redis PSubscribe", "pattern", pattern, "current_retry_delay_if_needed", currentRetryDelay.String())
-			psCtx := a.redisClient.PSubscribe(ctx, pattern)
-			_, err := psCtx.Receive(ctx)
-			if err != nil {
-				a.logger.Error(ctx, "Failed to establish or confirm Redis PSubscribe", "pattern", pattern, "error", err, "next_retry_in", currentRetryDelay.String())
-				if psCtx != nil {
-					_ = psCtx.Close()
-				}
-				select {
-				case <-time.After(currentRetryDelay):
-					newDelay := currentRetryDelay * 2
-					if newDelay > maxRetryDelay {
-						currentRetryDelay = maxRetryDelay
-					} else {
-						currentRetryDelay = newDelay
-					}
-					continue
-				case <-ctx.Done():
-					a.logger.Info(ctx, "Context cancelled during PSubscribe retry wait", "pattern", pattern)
-					return
-				}
-			}
-			a.logger.Info(ctx, "Successfully subscribed to Redis pattern, entering message processing loop", "pattern", pattern)
-			a.sub = psCtx
-			currentRetryDelay = initialRetryDelay
-			msgChan := a.sub.Channel()
-			processingMessages := true
-			for processingMessages {
-				select {
-				case msg, ok := <-msgChan:
-					if !ok {
-						a.logger.Warn(ctx, "Redis pub/sub message channel closed. Will attempt to resubscribe.", "pattern", pattern)
-						processingMessages = false
-						continue
-					}
-					a.logger.Debug(ctx, "Received message on Redis subscription",
-						"channel", msg.Channel, "pattern", msg.Pattern, "payload", msg.Payload)
-					var killMsg domain.KillSwitchMessage
-					if errUnmarshal := json.Unmarshal([]byte(msg.Payload), &killMsg); errUnmarshal != nil {
-						a.logger.Error(ctx, "Failed to unmarshal KillSwitchMessage from pub/sub",
-							"channel", msg.Channel, "payload", msg.Payload, "error", errUnmarshal.Error())
-						continue
-					}
-					a.logger.Info(ctx, "Received session kill message", "channel", msg.Channel, "new_pod_id", killMsg.NewPodID)
-					if errHandler := handler(msg.Channel, killMsg); errHandler != nil {
-						a.logger.Error(ctx, "Error in KillSwitchMessageHandler",
-							"channel", msg.Channel, "new_pod_id", killMsg.NewPodID, "error", errHandler.Error())
-					}
-				case <-ctx.Done():
-					a.logger.Info(ctx, "Context cancelled (during message processing). Stopping Redis message processor and subscription routine.", "pattern", pattern)
-					processingMessages = false
-					return
-				}
-			}
-			if a.sub != nil {
-				a.logger.Info(ctx, "Closing current PubSub subscription object before attempting to resubscribe", "pattern", pattern)
-				if errClose := a.sub.Close(); errClose != nil {
-					a.logger.Error(ctx, "Error closing pubsub before resubscribe", "pattern", pattern, "error", errClose)
-				}
-				a.sub = nil
-			}
-			select {
-			case <-time.After(initialRetryDelay / 2):
-			case <-ctx.Done():
-				a.logger.Info(ctx, "Context cancelled during brief pause before resubscription attempt", "pattern", pattern)
-				return
-			}
-		}
-	}()
-	return nil
-}
-func (a *KillSwitchPubSubAdapter) Close() error {
-	a.logger.Info(context.Background(), "Close called on KillSwitchPubSubAdapter")
-	if a.sub != nil {
-		a.logger.Info(context.Background(), "Attempting to close active Redis pub/sub subscription object.")
-		err := a.sub.Close()
-		a.sub = nil
-		if err != nil {
-			a.logger.Error(context.Background(), "Error closing Redis pub/sub subscription via adapter's Close method", "error", err.Error())
-			return fmt.Errorf("error closing Redis pub/sub: %w", err)
-		}
-		a.logger.Info(context.Background(), "Redis pub/sub subscription object closed via adapter's Close method.")
-		return nil
-	}
-	a.logger.Info(context.Background(), "No active Redis pub/sub subscription object to close in adapter.")
-	return nil
-}
-```
-
 ## File: internal/adapters/redis/session_lock_manager.go
 ```go
 package redis
@@ -2576,6 +2986,274 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250512202823-5a2f75b736a9 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+```
+
+## File: internal/adapters/redis/kill_switch_pubsub.go
+```go
+package redis
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"runtime/debug"
+	"sync"
+	"time"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type KillSwitchPubSubAdapter struct {
+	redisClient *redis.Client
+	logger      domain.Logger
+	sub         *redis.PubSub
+	subMutex    sync.Mutex
+	wg          sync.WaitGroup
+	cancelCtx   context.CancelFunc
+	ctx         context.Context
+}
+func NewKillSwitchPubSubAdapter(redisClient *redis.Client, logger domain.Logger) *KillSwitchPubSubAdapter {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &KillSwitchPubSubAdapter{
+		redisClient: redisClient,
+		logger:      logger,
+		cancelCtx:   cancel,
+		ctx:         ctx,
+	}
+}
+func (a *KillSwitchPubSubAdapter) safeCloseSub(logPattern string) bool {
+	a.subMutex.Lock()
+	defer a.subMutex.Unlock()
+	if a.sub != nil {
+		a.logger.Info(context.Background(), "Closing PubSub subscription", "pattern", logPattern)
+		if err := a.sub.Close(); err != nil {
+			errMsg := err.Error()
+			if errMsg == "redis: client is closed" {
+				a.logger.Info(context.Background(), "PubSub close: Redis client already closed", "pattern", logPattern)
+			} else {
+				a.logger.Error(context.Background(), "Error closing PubSub subscription", "pattern", logPattern, "error", err)
+			}
+		} else {
+			a.logger.Info(context.Background(), "PubSub subscription closed successfully", "pattern", logPattern)
+		}
+		a.sub = nil
+		return true
+	}
+	return false
+}
+func (a *KillSwitchPubSubAdapter) safeSetSub(newSub *redis.PubSub) {
+	a.subMutex.Lock()
+	defer a.subMutex.Unlock()
+	a.sub = newSub
+}
+func (a *KillSwitchPubSubAdapter) safeGetChannel() <-chan *redis.Message {
+	a.subMutex.Lock()
+	defer a.subMutex.Unlock()
+	if a.sub != nil {
+		return a.sub.Channel()
+	}
+	return nil
+}
+func (a *KillSwitchPubSubAdapter) PublishSessionKill(ctx context.Context, channel string, message domain.KillSwitchMessage) error {
+	a.logger.Debug(ctx, "Preparing to publish session kill message",
+		"channel", channel,
+		"new_pod_id", message.NewPodID,
+		"operation", "PublishSessionKill")
+	payloadBytes, errMarshal := json.Marshal(message)
+	if errMarshal != nil {
+		a.logger.Error(ctx, "Failed to marshal KillSwitchMessage for publishing", "channel", channel, "error", errMarshal.Error())
+		return fmt.Errorf("failed to marshal KillSwitchMessage: %w", errMarshal)
+	}
+	a.logger.Debug(ctx, "Publishing session kill message with payload",
+		"channel", channel,
+		"new_pod_id", message.NewPodID,
+		"payload", string(payloadBytes),
+		"operation", "PublishSessionKill")
+	var publishAttemptErr error
+	var receiverCount int64
+	maxRetries := 3
+	retryDelay := 100 * time.Millisecond
+	for i := 0; i < maxRetries; i++ {
+		select {
+		case <-ctx.Done():
+			a.logger.Error(ctx, "Context cancelled before publishing session kill message", "channel", channel, "error", ctx.Err())
+			return ctx.Err()
+		default:
+		}
+		result := a.redisClient.Publish(ctx, channel, string(payloadBytes))
+		receiverCount, publishAttemptErr = result.Result()
+		if publishAttemptErr == nil {
+			break
+		}
+		a.logger.Warn(ctx, "Failed to publish session kill message, retrying...",
+			"channel", channel, "attempt", i+1, "max_attempts", maxRetries, "error", publishAttemptErr.Error())
+		if i < maxRetries-1 {
+			select {
+			case <-time.After(retryDelay):
+			case <-ctx.Done():
+				a.logger.Error(ctx, "Context cancelled during publish retry wait for session kill message", "channel", channel, "error", ctx.Err())
+				return ctx.Err()
+			}
+			retryDelay *= 2
+		}
+	}
+	if publishAttemptErr != nil {
+		a.logger.Error(ctx, "Failed to publish session kill message to Redis after multiple retries", "channel", channel, "error", publishAttemptErr.Error())
+		return fmt.Errorf("failed to publish to Redis channel '%s' after %d retries: %w", channel, maxRetries, publishAttemptErr)
+	}
+	a.logger.Debug(ctx, "Session kill message publish result",
+		"channel", channel,
+		"new_pod_id", message.NewPodID,
+		"receiver_count", receiverCount,
+		"operation", "PublishSessionKill")
+	a.logger.Info(ctx, "Successfully published session kill message", "channel", channel, "new_pod_id", message.NewPodID, "receiver_count", receiverCount)
+	return nil
+}
+func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Context, pattern string, handler domain.KillSwitchMessageHandler) error {
+	a.logger.Info(ctx, "Initiating persistent subscription routine for Redis pattern", "pattern", pattern)
+	if a.sub != nil {
+		a.logger.Warn(ctx, "Subscription attempt on an adapter that may already have an active subscription goroutine", "pattern", pattern)
+	}
+	a.wg.Add(1)
+	go func() {
+		defer func() {
+			a.wg.Done()
+			if r := recover(); r != nil {
+				a.logger.Error(context.Background(), "Panic recovered in persistent Redis PubSub routine",
+					"pattern", pattern, "panic_info", fmt.Sprintf("%v", r), "stacktrace", string(debug.Stack()))
+			}
+			a.safeCloseSub(pattern)
+			a.logger.Info(context.Background(), "Persistent subscription routine for Redis pattern has exited", "pattern", pattern)
+		}()
+		initialRetryDelay := 2 * time.Second
+		maxRetryDelay := 30 * time.Second
+		currentRetryDelay := initialRetryDelay
+		for {
+			select {
+			case <-a.ctx.Done():
+				a.logger.Info(context.Background(), "Adapter context cancelled, stopping persistent subscription attempts.", "pattern", pattern)
+				return
+			case <-ctx.Done():
+				a.logger.Info(ctx, "Caller context cancelled, stopping persistent subscription attempts.", "pattern", pattern)
+				return
+			default:
+			}
+			a.logger.Info(ctx, "Attempting to establish Redis PSubscribe", "pattern", pattern, "current_retry_delay_if_needed", currentRetryDelay.String())
+			combinedCtx, cancel := context.WithCancel(ctx)
+			go func() {
+				select {
+				case <-a.ctx.Done():
+					cancel()
+				case <-combinedCtx.Done():
+				}
+			}()
+			psCtx := a.redisClient.PSubscribe(combinedCtx, pattern)
+			_, err := psCtx.Receive(combinedCtx)
+			if err != nil {
+				cancel()
+				a.logger.Error(ctx, "Failed to establish or confirm Redis PSubscribe", "pattern", pattern, "error", err, "next_retry_in", currentRetryDelay.String())
+				if psCtx != nil {
+					_ = psCtx.Close()
+				}
+				select {
+				case <-a.ctx.Done():
+					a.logger.Info(context.Background(), "Adapter context cancelled during retry, stopping subscription attempts.", "pattern", pattern)
+					return
+				default:
+				}
+				select {
+				case <-time.After(currentRetryDelay):
+					newDelay := currentRetryDelay * 2
+					if newDelay > maxRetryDelay {
+						currentRetryDelay = maxRetryDelay
+					} else {
+						currentRetryDelay = newDelay
+					}
+					continue
+				case <-a.ctx.Done():
+					a.logger.Info(context.Background(), "Adapter context cancelled during retry wait, stopping subscription attempts.", "pattern", pattern)
+					cancel()
+					return
+				case <-ctx.Done():
+					a.logger.Info(ctx, "Caller context cancelled during PSubscribe retry wait", "pattern", pattern)
+					cancel()
+					return
+				}
+			}
+			a.logger.Info(ctx, "Successfully subscribed to Redis pattern, entering message processing loop", "pattern", pattern)
+			a.safeSetSub(psCtx)
+			currentRetryDelay = initialRetryDelay
+			msgChan := a.safeGetChannel()
+			if msgChan == nil {
+				a.logger.Error(ctx, "Failed to get message channel after successful subscription", "pattern", pattern)
+				cancel()
+				continue
+			}
+			processingMessages := true
+			for processingMessages {
+				select {
+				case msg, ok := <-msgChan:
+					if !ok {
+						a.logger.Warn(ctx, "Redis pub/sub message channel closed. Will attempt to resubscribe.", "pattern", pattern)
+						processingMessages = false
+						continue
+					}
+					a.logger.Debug(ctx, "Received message on Redis subscription",
+						"channel", msg.Channel, "pattern", msg.Pattern, "payload", msg.Payload)
+					var killMsg domain.KillSwitchMessage
+					if errUnmarshal := json.Unmarshal([]byte(msg.Payload), &killMsg); errUnmarshal != nil {
+						a.logger.Error(ctx, "Failed to unmarshal KillSwitchMessage from pub/sub",
+							"channel", msg.Channel, "payload", msg.Payload, "error", errUnmarshal.Error())
+						continue
+					}
+					a.logger.Info(ctx, "Received session kill message", "channel", msg.Channel, "new_pod_id", killMsg.NewPodID)
+					if errHandler := handler(msg.Channel, killMsg); errHandler != nil {
+						a.logger.Error(ctx, "Error in KillSwitchMessageHandler",
+							"channel", msg.Channel, "new_pod_id", killMsg.NewPodID, "error", errHandler.Error())
+					}
+				case <-a.ctx.Done():
+					a.logger.Info(context.Background(), "Adapter context cancelled (during message processing). Stopping Redis message processor and subscription routine.", "pattern", pattern)
+					processingMessages = false
+					cancel()
+					return
+				case <-ctx.Done():
+					a.logger.Info(ctx, "Caller context cancelled (during message processing). Stopping Redis message processor and subscription routine.", "pattern", pattern)
+					processingMessages = false
+					cancel()
+					return
+				}
+			}
+			cancel()
+			a.safeCloseSub(pattern)
+			select {
+			case <-a.ctx.Done():
+				a.logger.Info(context.Background(), "Adapter context cancelled, not attempting resubscription.", "pattern", pattern)
+				return
+			default:
+			}
+			select {
+			case <-time.After(initialRetryDelay / 2):
+			case <-a.ctx.Done():
+				a.logger.Info(context.Background(), "Adapter context cancelled during brief pause before resubscription attempt", "pattern", pattern)
+				return
+			case <-ctx.Done():
+				a.logger.Info(ctx, "Caller context cancelled during brief pause before resubscription attempt", "pattern", pattern)
+				return
+			}
+		}
+	}()
+	return nil
+}
+func (a *KillSwitchPubSubAdapter) Close() error {
+	a.logger.Info(context.Background(), "Close called on KillSwitchPubSubAdapter")
+	if a.cancelCtx != nil {
+		a.logger.Info(context.Background(), "Cancelling adapter context to stop all subscription goroutines...")
+		a.cancelCtx()
+	}
+	a.safeCloseSub("Close-method")
+	a.logger.Info(context.Background(), "Waiting for Redis pub/sub goroutines to complete...")
+	a.wg.Wait()
+	a.logger.Info(context.Background(), "All Redis pub/sub goroutines have completed.")
+	return nil
+}
 ```
 
 ## File: internal/adapters/websocket/router.go
@@ -4041,6 +4719,60 @@ func (cm *ConnectionManager) StopAdminKillSwitchListener() error {
 }
 ```
 
+## File: internal/application/connection_manager.go
+```go
+package application
+import (
+	"sync"
+	"github.com/redis/go-redis/v9"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+)
+type ConnectionManager struct {
+	logger                 domain.Logger
+	configProvider         config.Provider
+	sessionLocker          domain.SessionLockManager
+	killSwitchPublisher    domain.KillSwitchPublisher
+	killSwitchSubscriber   domain.KillSwitchSubscriber
+	routeRegistry          domain.RouteRegistry
+	activeConnections      sync.Map
+	activeAdminConnections sync.Map
+	renewalStopChan  chan struct{}
+	renewalWg        sync.WaitGroup
+	renewalStopMutex sync.Mutex
+	renewalStopped   bool
+	redisClient      *redis.Client
+}
+func NewConnectionManager(
+	logger domain.Logger,
+	configProvider config.Provider,
+	sessionLocker domain.SessionLockManager,
+	killSwitchPublisher domain.KillSwitchPublisher,
+	killSwitchSubscriber domain.KillSwitchSubscriber,
+	routeRegistry domain.RouteRegistry,
+	redisClient *redis.Client,
+) *ConnectionManager {
+	return &ConnectionManager{
+		logger:                 logger,
+		configProvider:         configProvider,
+		sessionLocker:          sessionLocker,
+		killSwitchPublisher:    killSwitchPublisher,
+		killSwitchSubscriber:   killSwitchSubscriber,
+		routeRegistry:          routeRegistry,
+		activeConnections:      sync.Map{},
+		activeAdminConnections: sync.Map{},
+		renewalStopChan:        make(chan struct{}),
+		renewalWg:              sync.WaitGroup{},
+		renewalStopMutex:       sync.Mutex{},
+		renewalStopped:         false,
+		redisClient:            redisClient,
+	}
+}
+func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
+	return cm.routeRegistry
+}
+```
+
 ## File: internal/application/session_renewal.go
 ```go
 package application
@@ -4048,6 +4780,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"github.com/redis/go-redis/v9"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
@@ -4182,9 +4915,15 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 					if cm.routeRegistry != nil && defaultRouteTTL > 0 {
 						companyID, _ := connCtx.Value(contextkeys.CompanyIDKey).(string)
 						agentID, _ := connCtx.Value(contextkeys.AgentIDKey).(string)
+						isAdminConnection := strings.HasPrefix(sessionKey, "session:admin:")
 						if companyID == "" || agentID == "" {
-							cm.logger.Error(connCtx, "Missing companyID or agentID in connection context, cannot renew routes", "sessionKey", sessionKey)
-							return true
+							if isAdminConnection {
+								cm.logger.Debug(connCtx, "Skipping route renewal for admin connection (admin connections don't manage routes)", "sessionKey", sessionKey)
+								return true
+							} else {
+								cm.logger.Error(connCtx, "Missing companyID or agentID in connection context, cannot renew routes", "sessionKey", sessionKey)
+								return true
+							}
 						}
 						chatRouteKey := rediskeys.RouteKeyChats(companyID, agentID)
 						adaptiveChatRouteCfg := cfg.AdaptiveTTL.ChatRoute
@@ -4586,7 +5325,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		queueGroup,
 		natsHandler,
 		nats.Durable(durableName+"_admin_agents"),
-		nats.DeliverLastPerSubject(),
+		nats.DeliverNew(),
 		nats.ManualAck(),
 		nats.AckWait(ackWaitAdmin),
 		nats.MaxAckPending(a.natsMaxAckPending),
@@ -4606,60 +5345,6 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		"durable_name", durableName+"_admin_agents",
 	)
 	return &natsSubscriptionWrapper{Subscription: sub}, nil
-}
-```
-
-## File: internal/application/connection_manager.go
-```go
-package application
-import (
-	"sync"
-	"github.com/redis/go-redis/v9"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-)
-type ConnectionManager struct {
-	logger                 domain.Logger
-	configProvider         config.Provider
-	sessionLocker          domain.SessionLockManager
-	killSwitchPublisher    domain.KillSwitchPublisher
-	killSwitchSubscriber   domain.KillSwitchSubscriber
-	routeRegistry          domain.RouteRegistry
-	activeConnections      sync.Map
-	activeAdminConnections sync.Map
-	renewalStopChan  chan struct{}
-	renewalWg        sync.WaitGroup
-	renewalStopMutex sync.Mutex
-	renewalStopped   bool
-	redisClient      *redis.Client
-}
-func NewConnectionManager(
-	logger domain.Logger,
-	configProvider config.Provider,
-	sessionLocker domain.SessionLockManager,
-	killSwitchPublisher domain.KillSwitchPublisher,
-	killSwitchSubscriber domain.KillSwitchSubscriber,
-	routeRegistry domain.RouteRegistry,
-	redisClient *redis.Client,
-) *ConnectionManager {
-	return &ConnectionManager{
-		logger:                 logger,
-		configProvider:         configProvider,
-		sessionLocker:          sessionLocker,
-		killSwitchPublisher:    killSwitchPublisher,
-		killSwitchSubscriber:   killSwitchSubscriber,
-		routeRegistry:          routeRegistry,
-		activeConnections:      sync.Map{},
-		activeAdminConnections: sync.Map{},
-		renewalStopChan:        make(chan struct{}),
-		renewalWg:              sync.WaitGroup{},
-		renewalStopMutex:       sync.Mutex{},
-		renewalStopped:         false,
-		redisClient:            redisClient,
-	}
-}
-func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
-	return cm.routeRegistry
 }
 ```
 
@@ -4784,307 +5469,6 @@ func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.S
 }
 ```
 
-## File: internal/adapters/websocket/admin_handler.go
-```go
-package websocket
-import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"net/http"
-	"strings"
-	"time"
-	"github.com/coder/websocket"
-	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
-)
-type AdminHandler struct {
-	logger         domain.Logger
-	configProvider config.Provider
-	connManager    *application.ConnectionManager
-	natsAdapter    domain.NatsConsumer
-}
-func NewAdminHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer) *AdminHandler {
-	return &AdminHandler{
-		logger:         logger,
-		configProvider: cfgProvider,
-		connManager:    connManager,
-		natsAdapter:    natsAdapter,
-	}
-}
-func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	adminCtx, ok := r.Context().Value(contextkeys.AdminUserContextKey).(*domain.AdminUserContext)
-	if !ok || adminCtx == nil {
-		h.logger.Error(r.Context(), "AdminUserContext not found after middleware chain for /ws/admin")
-		domain.NewErrorResponse(domain.ErrInternal, "Authentication context missing", "Server configuration error.").WriteJSON(w, http.StatusInternalServerError)
-		return
-	}
-	h.logger.Info(r.Context(), "/ws/admin endpoint hit by admin", "admin_id", adminCtx.AdminID)
-	adminSessionKey := rediskeys.AdminSessionKey(adminCtx.AdminID)
-	currentPodID := h.configProvider.Get().Server.PodID
-	lockAcqCtx, lockAcqCancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer lockAcqCancel()
-	acquired, err := h.connManager.AcquireAdminSessionLockOrNotify(lockAcqCtx, adminCtx.AdminID)
-	if err != nil {
-		h.logger.Error(r.Context(), "Failed during admin session lock acquisition attempt via ConnectionManager", "error", err, "admin_id", adminCtx.AdminID)
-		domain.NewErrorResponse(domain.ErrInternal, "Failed to process admin session.", err.Error()).WriteJSON(w, http.StatusInternalServerError)
-		return
-	}
-	if !acquired {
-		h.logger.Warn(r.Context(), "Admin session lock not acquired (conflict)", "admin_id", adminCtx.AdminID)
-		metrics.IncrementSessionConflicts("admin")
-		domain.NewErrorResponse(domain.ErrSessionConflict, "Admin session already active elsewhere.", "").WriteJSON(w, http.StatusConflict)
-		return
-	}
-	h.logger.Info(r.Context(), "Admin session lock successfully acquired", "admin_session_key", adminSessionKey)
-	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(r.Context())
-	var wrappedConn *Connection
-	startTime := time.Now()
-	opts := websocket.AcceptOptions{
-		Subprotocols: []string{"json.v1"},
-		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
-			if wrappedConn != nil {
-				h.logger.Debug(wrappedConn.Context(), "Admin Pong received")
-				wrappedConn.UpdateLastPongTime()
-			}
-		},
-	}
-	c, err := websocket.Accept(w, r, &opts)
-	if err != nil {
-		h.logger.Error(r.Context(), "Admin WebSocket upgrade failed", "error", err, "admin_id", adminCtx.AdminID)
-		if currentPodID != "" {
-			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer releaseCancel()
-			// This should use the actual podID that acquired the lock
-			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
-				h.logger.Error(r.Context(), "Failed to release admin session lock after upgrade failure", "sessionKey", adminSessionKey, "error", releaseErr)
-			} else if released {
-				h.logger.Info(r.Context(), "Successfully released admin session lock after upgrade failure", "sessionKey", adminSessionKey)
-			}
-		}
-		cancelWsConnLifetimeCtx()
-		return
-	}
-	metrics.IncrementConnectionsTotal()
-	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider, adminSessionKey)
-	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
-		"remoteAddr", wrappedConn.RemoteAddr(),
-		"subprotocol", c.Subprotocol(),
-		"admin_id", adminCtx.AdminID,
-		"admin_session_key", adminSessionKey,
-	)
-	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "")
-	// Record initial activity for the admin session
-	if h.connManager.SessionLocker() != nil {
-		adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
-		activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
-		if activityTTL <= 0 {
-			activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
-		}
-		if errAct := h.connManager.SessionLocker().RecordActivity(wrappedConn.Context(), adminSessionKey, activityTTL); errAct != nil {
-			h.logger.Error(wrappedConn.Context(), "Failed to record initial admin session activity", "adminSessionKey", adminSessionKey, "error", errAct)
-		} else {
-			h.logger.Debug(wrappedConn.Context(), "Recorded initial admin session activity", "adminSessionKey", adminSessionKey, "activityTTL", activityTTL.String())
-		}
-	}
-	defer func() {
-		h.logger.Info(wrappedConn.Context(), "Admin connection management goroutine finished. Deregistering admin connection.", "admin_session_key", adminSessionKey)
-		duration := time.Since(startTime).Seconds()
-		metrics.ObserveConnectionDuration(duration)
-		h.connManager.DeregisterConnection(adminSessionKey)
-	}()
-	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("AdminWebSocketConnectionManager-%s", adminSessionKey), func() {
-		h.manageAdminConnection(wsConnLifetimeCtx, wrappedConn, adminCtx)
-	})
-}
-func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Connection, adminInfo *domain.AdminUserContext) {
-	defer conn.Close(websocket.StatusNormalClosure, "admin connection ended")
-	h.logger.Info(connCtx, "Admin WebSocket connection management started",
-		"admin_id", adminInfo.AdminID,
-		"remote_addr", conn.RemoteAddr(),
-	)
-	readyMessage := domain.NewReadyMessage()
-	if err := conn.WriteJSON(readyMessage); err != nil {
-		h.logger.Error(connCtx, "Failed to send 'ready' message to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
-		return
-	}
-	metrics.IncrementMessagesSent(domain.MessageTypeReady)
-	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
-	var natsSubscription domain.NatsMessageSubscription
-	if h.natsAdapter != nil {
-		companyPattern := adminInfo.SubscribedCompanyID
-		agentPattern := adminInfo.SubscribedAgentID
-		if companyPattern == "" {
-			companyPattern = "*"
-		} // Default to wildcard if not specified
-		if agentPattern == "" {
-			agentPattern = "*"
-		} // Default to wildcard if not specified
-		natsMsgHandler := func(msg *nats.Msg) {
-			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
-			// Start: request_id handling for NATS message
-			natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
-			if natsRequestID == "" {
-				natsRequestID = uuid.NewString()
-				h.logger.Debug(connCtx, "Generated new request_id for Admin NATS message", "subject", msg.Subject, "new_request_id", natsRequestID, "admin_id", adminInfo.AdminID)
-			} else {
-				h.logger.Debug(connCtx, "Using existing request_id from Admin NATS message header", "subject", msg.Subject, "request_id", natsRequestID, "admin_id", adminInfo.AdminID)
-			}
-			msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
-			h.logger.Info(msgCtx, "Admin NATS: Received message on agent events subject",
-				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
-			)
-			h.logger.Debug(msgCtx, "Processing admin NATS message",
-				"subject", msg.Subject,
-				"data_size", len(msg.Data),
-				"admin_id", adminInfo.AdminID,
-				"operation", "AdminNatsMessageHandler")
-			var eventPayload domain.EnrichedEventPayload
-			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
-				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-				_ = msg.Ack()
-				return
-			}
-			wsMessage := domain.NewEventMessage(eventPayload)
-			if err := conn.WriteJSON(wsMessage); err != nil {
-				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-				h.logger.Debug(msgCtx, "Successfully delivered admin NATS message to WebSocket",
-					"subject", msg.Subject,
-					"event_id", eventPayload.EventID,
-					"admin_id", adminInfo.AdminID,
-					"operation", "AdminNatsMessageHandler")
-			}
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(msgCtx, "Failed to ACK admin NATS message",
-					"subject", msg.Subject,
-					"error", ackErr.Error(),
-					"admin_id", adminInfo.AdminID)
-			} else {
-				h.logger.Debug(msgCtx, "Successfully ACKed admin NATS message",
-					"subject", msg.Subject,
-					"event_id", eventPayload.EventID,
-					"admin_id", adminInfo.AdminID,
-					"operation", "AdminNatsMessageHandler")
-			}
-		}
-		var subErr error
-		natsSubscription, subErr = h.natsAdapter.SubscribeToAgentEvents(connCtx, companyPattern, agentPattern, natsMsgHandler)
-		if subErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events for admin",
-				"companyPattern", companyPattern, "agentPattern", agentPattern, "error", subErr.Error(), "admin_id", adminInfo.AdminID,
-			)
-			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to agent events", subErr.Error())
-			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
-				h.logger.Error(connCtx, "Failed to send NATS subscription error to admin client", "error", sendErr.Error())
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeError)
-			}
-		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events for admin",
-				"companyPattern", companyPattern, "agentPattern", agentPattern, "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID,
-			)
-			defer func() {
-				if natsSubscription != nil {
-					h.logger.Info(connCtx, "Unsubscribing from NATS agent events for admin", "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID)
-					if unsubErr := natsSubscription.Drain(); unsubErr != nil {
-						h.logger.Error(connCtx, "Error draining NATS admin subscription", "subject", natsSubscription.Subject, "error", unsubErr.Error())
-					}
-				}
-			}()
-		}
-	} else {
-		h.logger.Warn(connCtx, "NATS adapter not available for admin handler, cannot subscribe to agent events.", "admin_id", adminInfo.AdminID)
-	}
-	appCfg := conn.config
-	pingInterval := time.Duration(appCfg.PingIntervalSeconds) * time.Second
-	pongWaitDuration := time.Duration(appCfg.PongWaitSeconds) * time.Second
-	writeTimeout := time.Duration(appCfg.WriteTimeoutSeconds) * time.Second
-	if writeTimeout <= 0 {
-		writeTimeout = 10 * time.Second
-	}
-	if pingInterval > 0 {
-		pinger := time.NewTicker(pingInterval)
-		defer pinger.Stop()
-		safego.Execute(connCtx, conn.logger, fmt.Sprintf("AdminWebSocketPinger-%s", conn.RemoteAddr()), func() {
-			for {
-				select {
-				case <-pinger.C:
-					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
-					if err := conn.Ping(pingWriteCtx); err != nil {
-						h.logger.Error(connCtx, "Failed to send admin ping", "error", err.Error(), "admin_id", adminInfo.AdminID)
-						pingCancel()
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
-						conn.CloseWithError(errResp, "Admin Ping failure")
-						return
-					}
-					pingCancel()
-					h.logger.Debug(connCtx, "Sent ping to admin client", "admin_id", adminInfo.AdminID)
-					if time.Since(conn.LastPongTime()) > pongWaitDuration {
-						h.logger.Warn(connCtx, "Admin Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "admin_id", adminInfo.AdminID)
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
-						conn.CloseWithError(errResp, "Admin Pong timeout")
-						return
-					}
-				case <-connCtx.Done():
-					h.logger.Info(connCtx, "Admin connection context done in pinger, stopping pinger.", "admin_id", adminInfo.AdminID)
-					return
-				}
-			}
-		})
-	}
-	for {
-		var readCtx context.Context
-		var cancelRead context.CancelFunc
-		if pongWaitDuration > 0 {
-			readCtx, cancelRead = context.WithTimeout(connCtx, pongWaitDuration)
-		} else {
-			readCtx = connCtx
-		}
-		msgType, p, errRead := conn.ReadMessage(readCtx)
-		if cancelRead != nil {
-			cancelRead()
-		}
-		if errRead != nil {
-			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
-				h.logger.Warn(connCtx, "Admin Pong timeout: No message received. Closing connection.", "admin_id", adminInfo.AdminID)
-				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within configured timeout period.")
-				conn.CloseWithError(errResp, "Admin Pong timeout")
-				return
-			}
-			closeStatus := websocket.CloseStatus(errRead)
-			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
-				h.logger.Info(connCtx, "Admin WebSocket connection closed by peer", "status_code", closeStatus, "admin_id", adminInfo.AdminID)
-			} else if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
-				h.logger.Info(connCtx, "Admin WebSocket connection context canceled.", "admin_id", adminInfo.AdminID)
-			} else if closeStatus == -1 && (strings.Contains(strings.ToLower(errRead.Error()), "eof") || strings.Contains(strings.ToLower(errRead.Error()), "closed")) {
-				h.logger.Info(connCtx, "Admin WebSocket read EOF or closed. Peer disconnected.", "admin_id", adminInfo.AdminID, "error", errRead.Error())
-			} else {
-				h.logger.Error(connCtx, "Error reading from admin WebSocket", "error", errRead.Error(), "admin_id", adminInfo.AdminID)
-			}
-			return
-		}
-		h.logger.Debug(connCtx, "Received message from admin WebSocket", "type", msgType.String(), "payload_len", len(p), "admin_id", adminInfo.AdminID)
-		if msgType == websocket.MessageText {
-			metrics.IncrementMessagesReceived("admin_text_message")
-			h.logger.Info(connCtx, "Admin client sent a text message.", "payload", string(p))
-		} else if msgType == websocket.MessageBinary {
-			metrics.IncrementMessagesReceived("admin_binary_message")
-		}
-	}
-}
-```
-
 ## File: config/config.yaml
 ```yaml
 server:
@@ -5167,6 +5551,336 @@ adaptive_ttl:
     activity_threshold_seconds: 3600
     active_ttl_seconds: 3600
     inactive_ttl_seconds: 1800
+```
+
+## File: internal/adapters/websocket/admin_handler.go
+```go
+package websocket
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+	"runtime/debug"
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
+)
+type AdminHandler struct {
+	logger         domain.Logger
+	configProvider config.Provider
+	connManager    *application.ConnectionManager
+	natsAdapter    domain.NatsConsumer
+}
+func NewAdminHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer) *AdminHandler {
+	return &AdminHandler{
+		logger:         logger,
+		configProvider: cfgProvider,
+		connManager:    connManager,
+		natsAdapter:    natsAdapter,
+	}
+}
+func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	adminCtx, ok := r.Context().Value(contextkeys.AdminUserContextKey).(*domain.AdminUserContext)
+	if !ok || adminCtx == nil {
+		h.logger.Error(r.Context(), "AdminUserContext not found after middleware chain for /ws/admin")
+		domain.NewErrorResponse(domain.ErrInternal, "Authentication context missing", "Server configuration error.").WriteJSON(w, http.StatusInternalServerError)
+		return
+	}
+	h.logger.Info(r.Context(), "/ws/admin endpoint hit by admin", "admin_id", adminCtx.AdminID)
+	adminSessionKey := rediskeys.AdminSessionKey(adminCtx.AdminID)
+	currentPodID := h.configProvider.Get().Server.PodID
+	lockAcqCtx, lockAcqCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer lockAcqCancel()
+	acquired, err := h.connManager.AcquireAdminSessionLockOrNotify(lockAcqCtx, adminCtx.AdminID)
+	if err != nil {
+		h.logger.Error(r.Context(), "Failed during admin session lock acquisition attempt via ConnectionManager", "error", err, "admin_id", adminCtx.AdminID)
+		domain.NewErrorResponse(domain.ErrInternal, "Failed to process admin session.", err.Error()).WriteJSON(w, http.StatusInternalServerError)
+		return
+	}
+	if !acquired {
+		h.logger.Warn(r.Context(), "Admin session lock not acquired (conflict)", "admin_id", adminCtx.AdminID)
+		metrics.IncrementSessionConflicts("admin")
+		domain.NewErrorResponse(domain.ErrSessionConflict, "Admin session already active elsewhere.", "").WriteJSON(w, http.StatusConflict)
+		return
+	}
+	h.logger.Info(r.Context(), "Admin session lock successfully acquired", "admin_session_key", adminSessionKey)
+	baseCtxForWs := context.Background()
+	if reqID, ok := r.Context().Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.RequestIDKey, reqID)
+		h.logger.Debug(r.Context(), "Propagated request_id to admin WebSocket lifetime context", "request_id", reqID)
+	} else {
+		newReqID := uuid.NewString()
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.RequestIDKey, newReqID)
+		h.logger.Debug(r.Context(), "No request_id in r.Context(), generated new request_id for admin WebSocket lifetime context", "new_request_id", newReqID)
+	}
+	if adminCtx != nil {
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.AdminUserContextKey, adminCtx)
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.UserIDKey, adminCtx.AdminID)
+		h.logger.Debug(r.Context(), "Propagated AdminUserContext to WebSocket lifetime context", "admin_id", adminCtx.AdminID)
+	}
+	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(baseCtxForWs)
+	var wrappedConn *Connection
+	startTime := time.Now()
+	opts := websocket.AcceptOptions{
+		Subprotocols: []string{"json.v1"},
+		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
+			if wrappedConn != nil {
+				h.logger.Debug(wrappedConn.Context(), "Admin Pong received")
+				wrappedConn.UpdateLastPongTime()
+			}
+		},
+	}
+	c, err := websocket.Accept(w, r, &opts)
+	if err != nil {
+		h.logger.Error(r.Context(), "Admin WebSocket upgrade failed", "error", err, "admin_id", adminCtx.AdminID)
+		if currentPodID != "" {
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer releaseCancel()
+			// This should use the actual podID that acquired the lock
+			if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
+				h.logger.Error(r.Context(), "Failed to release admin session lock after upgrade failure", "sessionKey", adminSessionKey, "error", releaseErr)
+			} else if released {
+				h.logger.Info(r.Context(), "Successfully released admin session lock after upgrade failure", "sessionKey", adminSessionKey)
+			}
+		}
+		cancelWsConnLifetimeCtx()
+		return
+	}
+	metrics.IncrementConnectionsTotal()
+	wrappedConn = NewConnection(wsConnLifetimeCtx, cancelWsConnLifetimeCtx, c, r.RemoteAddr, h.logger, h.configProvider, adminSessionKey)
+	h.logger.Info(wrappedConn.Context(), "Admin WebSocket connection established",
+		"remoteAddr", wrappedConn.RemoteAddr(),
+		"subprotocol", c.Subprotocol(),
+		"admin_id", adminCtx.AdminID,
+		"admin_session_key", adminSessionKey,
+	)
+	h.connManager.RegisterConnection(adminSessionKey, wrappedConn, "", "")
+	// Record initial activity for the admin session
+	if h.connManager.SessionLocker() != nil {
+		adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+		activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+		if activityTTL <= 0 {
+			activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+		}
+		if errAct := h.connManager.SessionLocker().RecordActivity(wrappedConn.Context(), adminSessionKey, activityTTL); errAct != nil {
+			h.logger.Error(wrappedConn.Context(), "Failed to record initial admin session activity", "adminSessionKey", adminSessionKey, "error", errAct)
+		} else {
+			h.logger.Debug(wrappedConn.Context(), "Recorded initial admin session activity", "adminSessionKey", adminSessionKey, "activityTTL", activityTTL.String())
+		}
+	}
+	defer func() {
+		h.logger.Info(wrappedConn.Context(), "Admin connection management lifecycle ending. Deregistering admin connection.", "admin_session_key", adminSessionKey)
+		duration := time.Since(startTime).Seconds()
+		metrics.ObserveConnectionDuration(duration)
+		h.connManager.DeregisterConnection(adminSessionKey)
+		cancelWsConnLifetimeCtx()
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			logCtx := wsConnLifetimeCtx
+			if wsConnLifetimeCtx.Err() != nil {
+				logCtx = context.Background()
+			}
+			h.logger.Error(logCtx, fmt.Sprintf("Panic recovered in AdminWebSocketConnectionManager-%s", adminSessionKey),
+				"panic_info", fmt.Sprintf("%v", r),
+				"stacktrace", string(debug.Stack()),
+			)
+		}
+	}()
+	h.manageAdminConnection(wsConnLifetimeCtx, wrappedConn, adminCtx)
+}
+func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Connection, adminInfo *domain.AdminUserContext) {
+	defer conn.Close(websocket.StatusNormalClosure, "admin connection ended")
+	h.logger.Info(connCtx, "Admin WebSocket connection management started",
+		"admin_id", adminInfo.AdminID,
+		"remote_addr", conn.RemoteAddr(),
+	)
+	readyMessage := domain.NewReadyMessage()
+	if err := conn.WriteJSON(readyMessage); err != nil {
+		h.logger.Error(connCtx, "Failed to send 'ready' message to admin client", "error", err.Error(), "admin_id", adminInfo.AdminID)
+		return
+	}
+	metrics.IncrementMessagesSent(domain.MessageTypeReady)
+	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
+	var natsSubscription domain.NatsMessageSubscription
+	if h.natsAdapter != nil {
+		companyPattern := adminInfo.SubscribedCompanyID
+		agentPattern := adminInfo.SubscribedAgentID
+		if companyPattern == "" {
+			companyPattern = "*"
+		} // Default to wildcard if not specified
+		if agentPattern == "" {
+			agentPattern = "*"
+		} // Default to wildcard if not specified
+		natsMsgHandler := func(msg *nats.Msg) {
+			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
+			// Start: request_id handling for NATS message
+			natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
+			if natsRequestID == "" {
+				natsRequestID = uuid.NewString()
+				h.logger.Debug(connCtx, "Generated new request_id for Admin NATS message", "subject", msg.Subject, "new_request_id", natsRequestID, "admin_id", adminInfo.AdminID)
+			} else {
+				h.logger.Debug(connCtx, "Using existing request_id from Admin NATS message header", "subject", msg.Subject, "request_id", natsRequestID, "admin_id", adminInfo.AdminID)
+			}
+			msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
+			h.logger.Info(msgCtx, "Admin NATS: Received message on agent events subject",
+				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
+			)
+			h.logger.Debug(msgCtx, "Processing admin NATS message",
+				"subject", msg.Subject,
+				"data_size", len(msg.Data),
+				"admin_id", adminInfo.AdminID,
+				"operation", "AdminNatsMessageHandler")
+			var eventPayload domain.EnrichedEventPayload
+			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
+				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+				_ = msg.Ack()
+				return
+			}
+			wsMessage := domain.NewEventMessage(eventPayload)
+			if err := conn.WriteJSON(wsMessage); err != nil {
+				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+				return
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
+				h.logger.Debug(msgCtx, "Successfully delivered admin NATS message to WebSocket",
+					"subject", msg.Subject,
+					"event_id", eventPayload.EventID,
+					"admin_id", adminInfo.AdminID,
+					"operation", "AdminNatsMessageHandler")
+			}
+			if ackErr := msg.Ack(); ackErr != nil {
+				h.logger.Error(msgCtx, "Failed to ACK admin NATS message",
+					"subject", msg.Subject,
+					"error", ackErr.Error(),
+					"admin_id", adminInfo.AdminID)
+			} else {
+				h.logger.Debug(msgCtx, "Successfully ACKed admin NATS message",
+					"subject", msg.Subject,
+					"event_id", eventPayload.EventID,
+					"admin_id", adminInfo.AdminID,
+					"operation", "AdminNatsMessageHandler")
+			}
+		}
+		var subErr error
+		natsSubscription, subErr = h.natsAdapter.SubscribeToAgentEvents(connCtx, companyPattern, agentPattern, natsMsgHandler)
+		if subErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events for admin",
+				"companyPattern", companyPattern, "agentPattern", agentPattern, "error", subErr.Error(), "admin_id", adminInfo.AdminID,
+			)
+			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to agent events", subErr.Error())
+			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
+				h.logger.Error(connCtx, "Failed to send NATS subscription error to admin client", "error", sendErr.Error())
+			} else {
+				metrics.IncrementMessagesSent(domain.MessageTypeError)
+			}
+		} else {
+			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events for admin",
+				"companyPattern", companyPattern, "agentPattern", agentPattern, "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID,
+			)
+			defer func() {
+				if natsSubscription != nil {
+					h.logger.Info(connCtx, "Unsubscribing from NATS agent events for admin", "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID)
+					if unsubErr := natsSubscription.Drain(); unsubErr != nil {
+						h.logger.Error(connCtx, "Error draining NATS admin subscription", "subject", natsSubscription.Subject, "error", unsubErr.Error())
+					}
+				}
+			}()
+		}
+	} else {
+		h.logger.Warn(connCtx, "NATS adapter not available for admin handler, cannot subscribe to agent events.", "admin_id", adminInfo.AdminID)
+	}
+	appCfg := conn.config
+	pingInterval := time.Duration(appCfg.PingIntervalSeconds) * time.Second
+	pongWaitDuration := time.Duration(appCfg.PongWaitSeconds) * time.Second
+	writeTimeout := time.Duration(appCfg.WriteTimeoutSeconds) * time.Second
+	if writeTimeout <= 0 {
+		writeTimeout = 10 * time.Second
+	}
+	h.logger.Info(connCtx, "Admin connection configuration",
+		"admin_id", adminInfo.AdminID,
+		"ping_interval", pingInterval.String(),
+		"pong_wait_duration", pongWaitDuration.String(),
+		"write_timeout", writeTimeout.String(),
+		"context_deadline", func() string {
+			if deadline, ok := connCtx.Deadline(); ok {
+				return deadline.String()
+			}
+			return "no deadline"
+		}())
+	if pingInterval > 0 {
+		safego.Execute(connCtx, h.logger, fmt.Sprintf("AdminPinger-%s", conn.RemoteAddr()), func() {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-connCtx.Done():
+					h.logger.Info(connCtx, "Admin connection context done in pinger, stopping pinger.", "admin_id", adminInfo.AdminID)
+					return
+				case <-ticker.C:
+					writeCtx, cancel := context.WithTimeout(connCtx, writeTimeout)
+					if err := conn.Ping(writeCtx); err != nil {
+						h.logger.Error(writeCtx, "Admin ping failed", "error", err.Error(), "admin_id", adminInfo.AdminID)
+						cancel()
+						return
+					}
+					cancel()
+					h.logger.Debug(connCtx, "Admin ping sent successfully", "admin_id", adminInfo.AdminID)
+				}
+			}
+		})
+	}
+	for {
+		var readCtx context.Context
+		var cancelRead context.CancelFunc
+		readCtx = connCtx
+		msgType, p, errRead := conn.ReadMessage(readCtx)
+		if cancelRead != nil {
+			cancelRead()
+		}
+		if errRead != nil {
+			if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
+				h.logger.Info(connCtx, "Admin connection read loop exiting due to context cancellation (graceful shutdown)", "admin_id", adminInfo.AdminID)
+				return
+			}
+			if errors.Is(errRead, context.DeadlineExceeded) || connCtx.Err() == context.DeadlineExceeded {
+				h.logger.Info(connCtx, "Admin connection read loop exiting due to context deadline exceeded", "admin_id", adminInfo.AdminID)
+				return
+			}
+			closeStatus := websocket.CloseStatus(errRead)
+			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
+				h.logger.Info(connCtx, "Admin connection closed normally by client", "admin_id", adminInfo.AdminID, "status", closeStatus.String())
+			} else if closeStatus == websocket.StatusNoStatusRcvd {
+				h.logger.Info(connCtx, "Admin connection closed without status (likely network issue)", "admin_id", adminInfo.AdminID, "error", errRead.Error())
+			} else {
+				errMsg := strings.ToLower(errRead.Error())
+				if strings.Contains(errMsg, "context canceled") || strings.Contains(errMsg, "context cancelled") {
+					h.logger.Info(connCtx, "Admin connection read error due to context cancellation (graceful shutdown)", "admin_id", adminInfo.AdminID, "error", errRead.Error())
+				} else {
+					h.logger.Error(connCtx, "Admin connection read error", "error", errRead.Error(), "admin_id", adminInfo.AdminID, "close_status", closeStatus.String())
+				}
+			}
+			return
+		}
+		if msgType == websocket.MessageText {
+			h.logger.Debug(connCtx, "Admin received text message", "admin_id", adminInfo.AdminID, "message_size", len(p))
+		} else {
+			h.logger.Debug(connCtx, "Admin received non-text message", "admin_id", adminInfo.AdminID, "message_type", msgType.String(), "message_size", len(p))
+		}
+	}
+}
 ```
 
 ## File: internal/bootstrap/wire_gen.go
@@ -5680,6 +6394,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 	"github.com/google/wire"
 	"github.com/nats-io/nats.go"
@@ -5711,9 +6426,12 @@ func InitialZapLoggerProvider() (*zap.Logger, func(), error) {
 	}
 	cleanup := func() {
 		if syncErr := logger.Sync(); syncErr != nil {
-			if syncErr.Error() != "sync /dev/stderr: invalid argument" {
-				fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
+			errMsg := syncErr.Error()
+			if strings.Contains(errMsg, "sync /dev/stderr:") &&
+				(strings.Contains(errMsg, "invalid argument") || strings.Contains(errMsg, "bad file descriptor")) {
+				return
 			}
+			fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
 		}
 	}
 	return logger, cleanup, nil
@@ -5774,6 +6492,7 @@ func NewApp(
 		if app.connectionManager != nil {
 			app.connectionManager.StopKillSwitchListener()
 			app.connectionManager.StopResourceRenewalLoop()
+			time.Sleep(50 * time.Millisecond)
 		}
 		if app.grpcServer != nil {
 			app.logger.Info(context.Background(), "Stopping gRPC server during app cleanup...")

@@ -2,198 +2,246 @@
 
 ## 1. High-level Overview
 
-The Daisi WebSocket Service (daisi-ws-service) is a Go application designed to provide real-time WebSocket connectivity for agents and users in the Daisi platform. It serves as a critical communication gateway that handles WebSocket connections, authentication, session management, and message routing. Its primary functions include:
+The Daisi WebSocket Service (daisi-ws-service) is a sophisticated Go application designed to provide real-time WebSocket connectivity for both users and administrators in the Daisi platform. Built with Go 1.23 and clean architecture principles, it serves as a critical communication gateway handling WebSocket connections, dual authentication systems, distributed session management, and intelligent message routing between NATS JetStream and browser clients.
 
-*   **WebSocket Connection Management:** Establishing, maintaining, and gracefully closing WebSocket connections with clients.
-*   **Authentication:** Validating client tokens for both regular users and admin users before allowing connections.
-*   **Session Management:** Ensuring exclusive user sessions with Redis-based locking mechanisms to prevent duplicate connections.
-*   **Message Routing:** Registering routes in Redis to enable proper message delivery across multiple service instances.
-*   **Event Forwarding:** Using gRPC to forward events between service instances when messages need to be delivered to users connected to different pods.
-*   **NATS Integration:** Subscribing to NATS subjects for real-time events that need to be pushed to connected clients.
-*   **Monitoring & Observability:** Providing metrics via Prometheus and structured logging via Zap.
-*   **Resilience:** Implementing circuit breaker patterns, panic recovery, and connection health checks to maintain system stability.
+### Primary Functions
 
-The service is designed with a clean architecture approach, separating domain logic, application services, and infrastructure adapters. It uses Google Wire for dependency injection and offers configuration via YAML files and environment variables.
+*   **Dual WebSocket Endpoints:** User connections at `/ws/{company}/{agent}` and admin connections at `/ws/admin`
+*   **Advanced Session Management:** Exclusive sessions with Redis-based distributed locking and automatic session migration
+*   **Dual Authentication System:** API key + AES-GCM encrypted tokens for users and admins with Redis caching
+*   **Intelligent Message Routing:** Redis-based route registry with automatic cross-pod message forwarding via gRPC
+*   **NATS JetStream Integration:** Durable consumers with queue groups for reliable message processing
+*   **Adaptive TTL Management:** Activity-based TTL optimization for session locks and routes
+*   **Advanced WebSocket Features:** Buffered sending, backpressure handling, compression support, ping/pong health checks
+*   **Circuit Breaker Pattern:** Fault-tolerant gRPC communication with connection pooling
+*   **Comprehensive Observability:** Prometheus metrics, structured Zap logging, health checks
+*   **Hot Configuration Reload:** File watching and SIGHUP signal support
 
-## 2. Core Components and Interactions
+The service follows clean architecture principles with hexagonal pattern, using Google Wire for compile-time dependency injection and offering extensive configuration via YAML files and environment variables.
 
-The system follows a modular design with clear separation of concerns:
+## 2. Core Components and Architecture
 
 ```mermaid
 graph TD
-    A[Client Browsers/Apps] -- "WebSocket (WSS)" --> B(WebSocket Handler)
-    B <--> C(Connection Manager)
+    A[User Clients] -- "WebSocket /ws/{company}/{agent}" --> B(WebSocket Handler)
+    A2[Admin Clients] -- "WebSocket /ws/admin" --> B2(Admin WebSocket Handler)
     
-    C -- "Authentication" --> D(Auth Service)
-    D -- "Token Validation" --> E[(Redis Cache)]
+    B --> C(Connection Manager)
+    B2 --> C
     
-    C -- "Session Locking" --> F(Session Lock Manager)
-    F -- "Exclusive Locks" --> E
+    C --> D(Auth Service)
+    D --> E[(Redis Cache)]
+    D --> E2[(Admin Token Cache)]
     
-    C -- "Route Registration" --> G(Route Registry)
-    G -- "Route Storage" --> E
+    C --> F(Session Lock Manager)
+    F --> E
     
-    H[NATS Server] -- "Events" --> I(NATS Consumer)
+    C --> G(Route Registry)
+    G --> E
+    
+    H[NATS JetStream] --> I(NATS Consumer)
     I --> C
     
-    J[Other Pods] -- "gRPC" --> K(Message Forwarder)
+    J[Other Service Pods] -- "gRPC" --> K(Message Forwarder)
     K --> C
     
-    C -- "gRPC" --> J
+    C --> K
+    K --> J
     
-    L[Prometheus] -- "Scrape" --> M(Metrics Adapter)
+    L[Kill Switch Publisher] --> E
+    E --> M[Kill Switch Subscriber]
+    M --> C
     
-    N[Admin HTTP API] --> O(Admin Handlers)
+    N[Prometheus] --> O(Metrics Adapter)
     
-    subgraph Application Services
+    P[HTTP Token API] --> Q(Admin Handlers)
+    
+    subgraph "Application Layer"
         C
         D
-        P(Kill Switch)
-        Q(Session Renewal)
+        R(Session Renewal)
+        S(Kill Switch Manager)
+        T(GRPC Message Handler)
     end
     
-    subgraph Infrastructure Adapters
+    subgraph "Adapters Layer"
         B
+        B2
         F
         G
         I
         K
-        M
         O
+        Q
+        E
+        E2
+    end
+    
+    subgraph "Domain Layer"
+        U[Interfaces & Models]
     end
 ```
 
-**Component Breakdown:**
+### Component Breakdown
 
-*   **`main.go` (Application Entrypoint):**
-    *   Initializes the application using `bootstrap.InitializeApp()`.
-    *   Creates the application context and starts the service.
-    *   Manages graceful shutdown.
+#### Entry Point & Bootstrap
+*   **`cmd/daisi-ws-service/main.go`:** Application entry point using `bootstrap.InitializeApp()` with context management and graceful shutdown
 
-*   **`bootstrap` (Dependency Injection & Initialization):**
-    *   Uses Google Wire (`wire_gen.go`) to assemble the application graph.
-    *   `InitializeApp()`: Constructs and returns the `App` struct, which holds instances of all major components.
-    *   Manages the lifecycle (creation and cleanup) of these components.
+*   **`internal/bootstrap/`:** Google Wire dependency injection with compile-time code generation:
+    - `wire.go`: Wire provider definitions
+    - `wire_gen.go`: Generated initialization code  
+    - `providers.go`: Component provider functions
+    - `app.go`: Main application structure
 
-*   **`ConfigProvider` (`adapters/config/config.go`):**
-    *   Uses Viper to load configuration from `config.yaml` and environment variables.
-    *   Provides access to configuration values throughout the application.
+#### Configuration & Logging
+*   **`internal/adapters/config/ConfigProvider`:** Viper-based configuration loading from YAML and environment variables with hot-reload via file watching and SIGHUP signal handling
 
-*   **`Logger` (`adapters/logger/zap_adapter.go`):**
-    *   Uses Zap for structured, leveled logging.
-    *   Supports adding contextual information (request ID, user ID, company ID, etc.) to log messages.
-    *   Implements the domain.Logger interface for consistent logging throughout the application.
+*   **`internal/adapters/logger/ZapAdapter`:** Structured logging implementation with contextual information extraction (request_id, user_id, company_id, agent_id, event_id)
 
-*   **`WebSocket Handler` (`adapters/websocket/handler.go`):**
-    *   Upgrades HTTP connections to WebSocket protocol.
-    *   Initializes the WebSocket connection with proper configuration.
-    *   Delegates connection management to the Connection Manager.
-    *   Handles WebSocket protocol messages (ping/pong, close frames).
+#### WebSocket Infrastructure
+*   **`internal/adapters/websocket/Handler`:** User WebSocket endpoint handler (`/ws/{company}/{agent}`) with authentication middleware chain
 
-*   **`Connection Manager` (`application/connection_manager.go`):**
-    *   Core service that manages WebSocket connections.
-    *   Maintains a registry of active connections.
-    *   Coordinates with Session Lock Manager to ensure exclusive sessions.
-    *   Handles client messages, particularly for chat selection.
-    *   Manages route registration and message distribution.
+*   **`internal/adapters/websocket/AdminHandler`:** Admin WebSocket endpoint handler (`/ws/admin`) with separate authentication flow
 
-*   **`Auth Service` (`application/auth_service.go`):**
-    *   Validates user and admin tokens.
-    *   Uses Redis for token caching to improve performance.
-    *   Decrypts and verifies token payloads.
+*   **`internal/adapters/websocket/Connection`:** Enhanced WebSocket connection wrapper with:
+    - Buffered message sending with configurable capacity (default 100)
+    - Backpressure handling policies: `drop_oldest` or `block`
+    - Asynchronous writer goroutine with panic recovery
+    - Ping/pong health check management
+    - Context-aware lifecycle management
 
-*   **`Session Lock Manager` (`adapters/redis/session_lock_manager.go`):**
-    *   Uses Redis to implement distributed locks for user sessions.
-    *   Provides mechanisms for acquiring, refreshing, and releasing locks.
-    *   Helps ensure a user can only have one active connection across the service's pods.
+*   **`internal/adapters/websocket/Router`:** WebSocket route registration with middleware chains
 
-*   **`Route Registry` (`adapters/redis/route_registry.go`):**
-    *   Maps users and chats to specific service pods.
-    *   Enables message routing across multiple service instances.
-    *   Automatically expires routes that are no longer active.
+#### Core Business Logic
+*   **`internal/application/ConnectionManager`:** Central orchestrator managing:
+    - Active connections registry (`sync.Map`)
+    - Session lock coordination
+    - Route registration and management
+    - Cross-pod message forwarding decisions
+    - Session migration via kill switch
 
-*   **`NATS Consumer` (`adapters/nats/consumer.go`):**
-    *   Subscribes to NATS subjects for real-time events.
-    *   Routes incoming NATS messages to the appropriate WebSocket connections.
+*   **`internal/application/AuthService`:** Dual authentication system:
+    - Company user tokens: AES-GCM encrypted with company_id, agent_id, user_id, expires_at
+    - Admin tokens: AES-GCM encrypted with admin_id, subscription patterns, company restrictions
+    - Redis caching with configurable TTL (30s users, 60s admins)
+    - Token validation and context extraction
 
-*   **`Message Forwarder` (`adapters/grpc/forwarder_adapter.go`):**
-    *   Uses gRPC to forward messages between service pods.
-    *   Maintains a connection pool with circuit breaker functionality.
-    *   Enables seamless message delivery regardless of which pod a client is connected to.
+#### Session & Route Management
+*   **`internal/adapters/redis/SessionLockManagerAdapter`:** Distributed session locking:
+    - Redis SETNX operations for exclusive session acquisition
+    - Lock keys: `session:{company}:{agent}:{user}` and `session:admin:{admin_id}`
+    - TTL management with activity tracking
+    - Force acquisition with SET operations
+    - Lua scripts for atomic operations
 
-*   **`Kill Switch` (`application/kill_switch.go`):**
-    *   Mechanism to force disconnect sessions when needed.
-    *   Uses Redis PubSub for cross-pod communication.
-    *   Essential for managing session migrations.
+*   **`internal/adapters/redis/RouteRegistryAdapter`:** Route management using Redis sets:
+    - Chat routes: `route:{company}:{agent}:chats`
+    - Message routes: `route:{company}:{agent}:messages:{chat_id}`
+    - Pod membership tracking with SADD/SREM operations
+    - TTL-based automatic cleanup
+    - Activity recording for adaptive TTL
 
-*   **`Metrics Adapter` (`adapters/metrics/prometheus_adapter.go`):**
-    *   Collects operational metrics using Prometheus.
-    *   Monitors connection counts, message rates, authentication success/failure, and more.
+#### Messaging Infrastructure
+*   **`internal/adapters/nats/ConsumerAdapter`:** NATS JetStream integration:
+    - Durable consumer `ws_fanout` with queue groups
+    - Subject subscriptions: `wa.{company}.{agent}.chats`, `wa.{company}.{agent}.messages.{chat_id}`, `wa.{company}.{agent}.agents`
+    - Manual acknowledgment for reliability
+    - Connection resilience with retry logic
 
-*   **`Admin Handlers` (`adapters/http/admin_handlers.go`):**
-    *   Provides HTTP endpoints for administrative functions.
-    *   Includes token generation and system management capabilities.
+*   **`internal/adapters/grpc/ForwarderAdapter`:** Cross-pod gRPC communication:
+    - Connection pooling with health monitoring
+    - Circuit breaker implementation (5 failures trigger 30s open state)
+    - Retry logic for transient failures (UNAVAILABLE, DEADLINE_EXCEEDED)
+    - Idle connection cleanup (300s default)
+    - Protocol Buffer message serialization
 
-*   **`SafeGo` (`pkg/safego/safego.go`):**
-    *   Utility for running goroutines with panic recovery.
-    *   Enhances system resilience by preventing cascading failures from panicked goroutines.
+*   **`internal/application/GRPCMessageHandler`:** gRPC server handler for incoming message forwarding requests
 
-## 3. Data Flow Diagram
+#### Session Migration
+*   **`internal/adapters/redis/KillSwitchPubSubAdapter`:** Redis pub/sub for session migration:
+    - User channels: `session_kill:{company}:{agent}:{user}`
+    - Admin channels: `session_kill:admin:{admin_id}`
+    - Pattern-based subscription with message routing
+    - Graceful connection termination
 
-The primary data flow through the service involves several key scenarios:
+*   **`internal/application/KillSwitchManager`:** Session migration orchestration with message handling and connection cleanup
 
-### 3.1 WebSocket Connection Establishment
+#### Observability
+*   **`internal/adapters/metrics/PrometheusAdapter`:** Comprehensive metrics:
+    - Connection metrics: `dws_active_connections`, `dws_connection_duration_seconds`
+    - Message metrics: `dws_messages_sent_total`, `dws_messages_received_total`
+    - Authentication metrics: `dws_auth_success_total`, `dws_auth_failure_total`
+    - gRPC metrics: `dws_grpc_messages_sent_total`, `dws_grpc_forward_retry_attempts_total`
+    - Session lock metrics: `dws_session_lock_attempts_total`, `dws_session_lock_success_total`
+    - Buffer metrics: `dws_websocket_buffer_used_count`, `dws_websocket_messages_dropped_total`
+
+*   **`pkg/safego/SafeGo`:** Panic-safe goroutine execution with stack trace logging
+
+## 3. Data Flow Diagrams
+
+### 3.1 User WebSocket Connection Establishment
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant WS as WebSocket Handler
+    participant Router as WebSocket Router
     participant Auth as Auth Service
     participant Redis
     participant ConnMgr as Connection Manager
     participant SessionLock as Session Lock Manager
     participant RouteReg as Route Registry
     participant NATS
+    participant KillSwitch as Kill Switch Publisher
 
-    Client->>WS: WebSocket Connect Request (with token)
-    WS->>Auth: Validate token
-    Auth->>Redis: Check token cache
+    Client->>Router: WebSocket Connect (/ws/company123/agent456?token=...&x-api-key=...)
+    Router->>Auth: Validate API key middleware
+    Router->>Auth: Validate user token middleware
+    Auth->>Redis: GET token_cache:sha256(token)
     
-    alt Token in cache
-        Redis-->>Auth: Return cached user context
-    else Token not in cache
-        Auth->>Auth: Decrypt & validate token
-        Auth->>Redis: Cache validated token
+    alt Token in cache and valid
+        Redis-->>Auth: Return cached AuthenticatedUserContext
+    else Token not in cache or expired
+        Auth->>Auth: Decrypt AES-GCM token with TokenAESKey
+        Auth->>Auth: Validate expires_at and required fields
+        Auth->>Redis: SET token_cache:sha256(token) with TTL 30s
         Redis-->>Auth: OK
     end
     
-    Auth-->>WS: Authentication result
+    Auth-->>Router: AuthenticatedUserContext (company_id, agent_id, user_id)
+    Router->>ConnMgr: HandleConnection with context
     
-    alt Authentication Success
-        WS->>ConnMgr: Create new connection
-        ConnMgr->>SessionLock: Try acquire session lock
-        SessionLock->>Redis: SETNX session:{company}:{agent}:{user}
+    ConnMgr->>SessionLock: AcquireLock(session:company123:agent456:user789, podID)
+    SessionLock->>Redis: SETNX session:company123:agent456:user789 podID EX 30
+    
+    alt Lock acquired successfully
+        Redis-->>SessionLock: 1 (success)
+        SessionLock-->>ConnMgr: Lock acquired
+    else Lock failed (user already connected)
+        Redis-->>SessionLock: 0 (failed)
+        ConnMgr->>KillSwitch: PublishSessionKill(session_kill:company123:agent456:user789, {new_pod_id: podID})
+        KillSwitch->>Redis: PUBLISH session_kill:company123:agent456:user789 JSON
         
-        alt Lock acquired
-            Redis-->>SessionLock: Lock success
-            SessionLock-->>ConnMgr: Lock acquired
-            ConnMgr->>RouteReg: Register chat route
-            RouteReg->>Redis: SADD route:{company}:{agent}:chats
-            Redis-->>RouteReg: OK
-            ConnMgr->>NATS: Subscribe to agent events
-            NATS-->>ConnMgr: Subscription OK
-            ConnMgr->>Client: Send "ready" message
-        else Lock failed (user already connected)
-            Redis-->>SessionLock: Lock failed
-            SessionLock-->>ConnMgr: Lock failed
-            ConnMgr->>Client: Send error & close connection
+        Note over ConnMgr: Retry with exponential backoff (250ms base delay)
+        ConnMgr->>SessionLock: AcquireLock retry attempts
+        
+        alt Retries exhausted
+            ConnMgr->>SessionLock: ForceAcquireLock (SET operation)
+            SessionLock->>Redis: SET session:company123:agent456:user789 podID EX 30
+            Redis-->>SessionLock: OK
         end
-    else Authentication Failed
-        WS->>Client: Close with auth failure code
     end
+    
+    ConnMgr->>RouteReg: RegisterChatRoute(company123, agent456, podID)
+    RouteReg->>Redis: SADD route:company123:agent456:chats podID
+    RouteReg->>Redis: EXPIRE route:company123:agent456:chats 300
+    
+    ConnMgr->>NATS: SubscribeToChats(company123, agent456, messageHandler)
+    NATS-->>ConnMgr: Subscription with durable consumer ws_fanout
+    
+    ConnMgr->>Client: WriteJSON({type: "ready"})
 ```
 
-### 3.2 Message Delivery (Chat Selection & Routing)
+### 3.2 Chat Selection and Message Routing
 
 ```mermaid
 sequenceDiagram
@@ -205,188 +253,406 @@ sequenceDiagram
     participant Forwarder as Message Forwarder
     participant OtherPod as Other Service Pod
 
-    Client->>ConnMgr: Select chat (chat_id)
-    ConnMgr->>RouteReg: Register message route
-    RouteReg->>Redis: SADD route:{company}:{agent}:messages:{chat_id}
-    Redis-->>RouteReg: OK
-    RouteReg-->>ConnMgr: Route registered
+    Client->>ConnMgr: ReadMessage: {type: "select_chat", payload: {chat_id: "chat123"}}
+    ConnMgr->>ConnMgr: SetCurrentChatID("chat123")
     
-    alt Event from NATS for this chat
-        NATS->>ConnMgr: Event for chat_id
-        ConnMgr->>Client: Forward event to WebSocket
-    else Event needs to be delivered to another pod
-        NATS->>ConnMgr: Event for different chat_id
-        ConnMgr->>RouteReg: Get owning pod for chat_id
-        RouteReg->>Redis: SMEMBERS route:...
-        Redis-->>RouteReg: Pod ID
-        RouteReg-->>ConnMgr: Target pod ID
-        ConnMgr->>Forwarder: Forward event to target pod
-        Forwarder->>OtherPod: gRPC PushEvent
+    ConnMgr->>RouteReg: RegisterMessageRoute(company123, agent456, chat123, podID)
+    RouteReg->>Redis: SADD route:company123:agent456:messages:chat123 podID
+    RouteReg->>Redis: EXPIRE route:company123:agent456:messages:chat123 300
+    
+    ConnMgr->>NATS: SubscribeToChatMessages(company123, agent456, chat123, messageHandler)
+    NATS-->>ConnMgr: Subscription to wa.company123.agent456.messages.chat123
+    
+    Note over NATS: External event arrives
+    NATS->>ConnMgr: Message on wa.company123.agent456.messages.chat123
+    ConnMgr->>ConnMgr: Parse EnrichedEventPayload from NATS message
+    
+    ConnMgr->>RouteReg: GetOwningPodForMessageRoute(company123, agent456, chat123)
+    RouteReg->>Redis: SMEMBERS route:company123:agent456:messages:chat123
+    Redis-->>RouteReg: [podID1, podID2] (example)
+    
+    alt This pod owns the route
+        RouteReg-->>ConnMgr: podID (this pod)
+        ConnMgr->>ConnMgr: Find local connection by sessionKey prefix
+        ConnMgr->>Client: WriteJSON({type: "event", payload: eventData})
+        ConnMgr->>RouteReg: RecordActivity(messageRouteKey, adaptiveTTL)
+    else Different pod owns the route
+        RouteReg-->>ConnMgr: otherPodID
+        ConnMgr->>Forwarder: ForwardEvent(targetPodAddress, event, company123, agent456, chat123, sourcePodID)
+        
+        Forwarder->>Forwarder: Get/create gRPC connection with circuit breaker check
+        Forwarder->>OtherPod: gRPC PushEvent(EnrichedEventPayloadMessage)
+        
+        alt gRPC success
+            OtherPod-->>Forwarder: {success: true}
+            Forwarder->>Forwarder: Record success, reset circuit breaker failures
+        else gRPC failure (retryable)
+            OtherPod-->>Forwarder: UNAVAILABLE/DEADLINE_EXCEEDED
+            Forwarder->>Forwarder: Retry with 200ms delay
+            Forwarder->>OtherPod: gRPC PushEvent retry
+        else gRPC failure (circuit breaker)
+            Forwarder->>Forwarder: Record failure, potentially open circuit (5 failures)
+        end
     end
 ```
 
-### 3.3 Session Migration (Kill Switch)
+### 3.3 Admin WebSocket Connection and System-Wide Event Streaming
 
 ```mermaid
 sequenceDiagram
-    participant NewClient
-    participant Pod2 as New Pod
+    participant AdminClient
+    participant AdminHandler
+    participant Auth as Auth Service
+    participant ConnMgr as Connection Manager
+    participant NATS
     participant Redis
-    participant Pod1 as Original Pod
-    participant OldClient
 
-    NewClient->>Pod2: Connect with token
-    Pod2->>Redis: Try acquire session lock
-    Redis-->>Pod2: Lock failed (held by Pod1)
-    Pod2->>Redis: Force acquire lock
-    Redis-->>Pod2: Lock acquired
+    AdminClient->>AdminHandler: WebSocket Connect (/ws/admin?token=...&x-api-key=...)
+    AdminHandler->>Auth: Validate API key middleware
+    AdminHandler->>Auth: ProcessAdminToken(tokenB64)
     
-    Pod2->>Redis: Publish session_kill message
-    Redis-->>Pod1: session_kill message
-    Pod1->>OldClient: Close connection with going away code
-    Pod1->>Redis: Release session lock
+    Auth->>Redis: GET token_cache:admin_sha256(token)
     
-    Pod2->>NewClient: Send "ready" message
+    alt Admin token in cache
+        Redis-->>Auth: Return cached AdminUserContext
+    else Admin token not cached
+        Auth->>Auth: Decrypt AES-GCM with AdminTokenAESKey
+        Auth->>Auth: Validate AdminUserContext fields and expires_at
+        Auth->>Redis: SET token_cache:admin_sha256(token) TTL 60s
+    end
+    
+    Auth-->>AdminHandler: AdminUserContext{admin_id, subscribed_company_id, subscribed_agent_id, company_id_restriction}
+    
+    AdminHandler->>ConnMgr: AcquireAdminSessionLockOrNotify(admin_id)
+    ConnMgr->>Redis: SETNX session:admin:admin123 podID EX 30
+    
+    alt Admin lock acquired
+        Redis-->>ConnMgr: 1 (success)
+        AdminHandler->>ConnMgr: RegisterConnection(adminSessionKey, connection, "", "")
+        AdminHandler->>AdminClient: WriteJSON({type: "ready"})
+        
+        Note over AdminHandler: Setup NATS subscription for system-wide events
+        AdminHandler->>NATS: SubscribeToAgentEvents(companyPattern="*", agentPattern="*", handler)
+        NATS-->>AdminHandler: Subscription to wa.*.*.agents with queue group
+        
+        loop System Events
+            NATS->>AdminHandler: Agent events from all companies/agents
+            AdminHandler->>AdminHandler: Parse EnrichedEventPayload
+            AdminHandler->>AdminClient: WriteJSON({type: "event", payload: systemEvent})
+            AdminHandler->>NATS: Ack() message
+        end
+        
+    else Admin lock failed (admin already connected)
+        Redis-->>ConnMgr: 0 (failed)
+        AdminHandler->>AdminClient: Close with SessionConflict error
+    end
 ```
 
-## 4. Key Design Decisions and Rationale
+## 4. Key Technical Implementation Details
 
-*   **Clean Architecture with Hexagonal Pattern:**
-    *   **Rationale:** Clear separation between domain logic, application services, and infrastructure adapters. This makes the code more maintainable and testable while keeping domain logic isolated from external dependencies.
+### Clean Architecture with Google Wire
+*   **Domain Layer:** Pure business interfaces in `internal/domain/` (Logger, NatsConsumer, SessionLockManager, RouteRegistry, MessageForwarder, etc.)
+*   **Application Layer:** Business logic orchestration in `internal/application/` (ConnectionManager, AuthService, GRPCMessageHandler)
+*   **Adapters Layer:** Infrastructure implementations in `internal/adapters/` (Redis, NATS, WebSocket, gRPC, HTTP)
+*   **Dependency Injection:** Compile-time with Google Wire, no runtime reflection
 
-*   **Redis for Distributed Coordination:**
-    *   **Rationale:** Redis provides fast, in-memory operations essential for distributed locking, session management, route registration, and token caching. Its PubSub capabilities also enable cross-pod communication for session kill switches.
+### Redis Distributed Coordination
+*   **Session Lock Keys:** 
+    - Users: `session:{company}:{agent}:{user}` 
+    - Admins: `session:admin:{admin_id}`
+*   **Route Registry Keys:**
+    - Chat routes: `route:{company}:{agent}:chats`
+    - Message routes: `route:{company}:{agent}:messages:{chat_id}`
+*   **Kill Switch Channels:**
+    - Users: `session_kill:{company}:{agent}:{user}`
+    - Admins: `session_kill:admin:{admin_id}`
+*   **Token Cache Keys:** `token_cache:sha256(rawToken)` and `token_cache:admin_sha256(rawToken)`
 
-*   **gRPC for Pod-to-Pod Communication:**
-    *   **Rationale:** Efficient binary protocol with strong typing through Protocol Buffers. Enables low-latency, high-throughput communication between service pods for message forwarding.
-    *   **Connection Pooling & Circuit Breaker:** Optimizes resource usage and provides fault tolerance if a pod becomes unreachable.
+### gRPC Protocol Buffer Schema
+```protobuf
+// internal/adapters/grpc/proto/dws_message_fwd.proto
+service MessageForwardingService {
+  rpc PushEvent(PushEventRequest) returns (PushEventResponse);
+}
 
-*   **NATS for Event Subscription:**
-    *   **Rationale:** High-performance messaging system ideal for fan-out event delivery patterns. NATS offers the subject-based routing model that fits well with the service's needs for granular subscriptions.
+message EnrichedEventPayloadMessage {
+  string event_id = 1;
+  string company_id = 2;
+  string agent_id = 3;
+  string message_id = 4;
+  string chat_id = 5;
+  google.protobuf.Struct row_data = 6;
+  string event_time = 7;
+}
+```
 
-*   **Token-based Authentication with AES-GCM Encryption:**
-    *   **Rationale:** Secure, stateless authentication using encrypted tokens containing user context. Redis caching improves performance by reducing repeated decryption operations.
+### NATS Subject Patterns
+*   **General Chat Events:** `wa.{company}.{agent}.chats`
+*   **Specific Chat Messages:** `wa.{company}.{agent}.messages.{chat_id}`
+*   **Admin Agent Events:** `wa.{company}.{agent}.agents`
+*   **JetStream Configuration:** Durable consumer `ws_fanout`, manual acknowledgment, queue groups for load balancing
 
-*   **Exclusive Session Management:**
-    *   **Rationale:** Ensures users have only one active connection across the entire service cluster, preventing problems with duplicate message delivery and conflicting state.
+### Authentication Token Structure
+```go
+// User Token (AES-GCM encrypted)
+type AuthenticatedUserContext struct {
+    CompanyID string    `json:"company_id"`
+    AgentID   string    `json:"agent_id"`
+    UserID    string    `json:"user_id"`
+    ExpiresAt time.Time `json:"expires_at"`
+    Token     string    `json:"-"` // Raw token for caching
+}
 
-*   **Route Registration System:**
-    *   **Rationale:** Enables efficient message routing across multiple service pods. The TTL-based design automatically cleans up stale routes if pods crash or connections drop unexpectedly.
+// Admin Token (AES-GCM encrypted)  
+type AdminUserContext struct {
+    AdminID              string    `json:"admin_id"`
+    ExpiresAt            time.Time `json:"expires_at"`
+    SubscribedCompanyID  string    `json:"subscribed_company_id,omitempty"`
+    SubscribedAgentID    string    `json:"subscribed_agent_id,omitempty"`
+    CompanyIDRestriction string    `json:"company_id_restriction,omitempty"`
+    Token                string    `json:"-"`
+}
+```
 
-*   **Zap for Structured Logging:**
-    *   **Rationale:** High-performance logging with structured data formats that are easily parseable by log aggregation systems. Context enrichment provides detailed tracing capabilities.
+### WebSocket Message Protocol
+```go
+// Server-to-Client Messages
+type BaseMessage struct {
+    Type    string      `json:"type"`    // "ready", "event", "error"
+    Payload interface{} `json:"payload,omitempty"`
+}
 
-*   **Prometheus for Metrics:**
-    *   **Rationale:** Industry-standard observability system that enables real-time monitoring, alerting, and visualization of service health and performance metrics.
+// Client-to-Server Messages
+type SelectChatMessagePayload struct {
+    ChatID string `json:"chat_id"`
+}
+```
 
-*   **Safe Goroutines with Panic Recovery:**
-    *   **Rationale:** The `safego` package ensures that panics in goroutines don't bring down the entire service, enhancing system resilience and stability.
+### Circuit Breaker Implementation
+*   **Failure Threshold:** 5 consecutive failures per target pod
+*   **Open Duration:** 30 seconds (configurable)
+*   **Tracked Failures:** Connection errors, gRPC UNAVAILABLE/DEADLINE_EXCEEDED
+*   **Success Reset:** Any successful gRPC call resets failure count
+*   **Connection Cleanup:** Circuit trip closes pooled connections
 
-*   **Admin API for Token Generation:**
-    *   **Rationale:** Provides a secure mechanism for generating authenticated tokens for both regular users and administrators.
+### Adaptive TTL System
+```yaml
+adaptive_ttl:
+  session_lock:
+    enabled: false  # Currently disabled
+    min_ttl_seconds: 15
+    max_ttl_seconds: 30
+    activity_threshold_seconds: 120
+  message_route:
+    enabled: true   # Active for message routes
+    min_ttl_seconds: 300
+    max_ttl_seconds: 900
+    activity_threshold_seconds: 600
+```
 
-*   **Google Wire for Dependency Injection:**
-    *   **Rationale:** Compile-time dependency injection that eliminates runtime reflection overhead while still providing clean component wiring and initialization.
+## 5. Configuration System
 
-## 5. System Constraints and Limitations
+### Primary Configuration File (config/config.yaml)
+```yaml
+server:
+  http_port: 8080
+  grpc_port: 50051
+  pod_id: ""  # Set via DAISI_WS_SERVER_POD_ID
+  enable_reflection: false
 
-*   **Redis Dependency:**
-    *   The service heavily relies on Redis for core functionality (session locking, route registry, token caching, kill switch). Any Redis outage would significantly impact service operation.
-    *   Redis memory consumption scales with the number of active connections and routes.
+nats:
+  url: "nats://nats:4222"
+  stream_name: "wa_stream"
+  consumer_name: "ws_fanout"
+  retry_on_failed_connect: true
 
-*   **Connection Scalability:**
-    *   Each WebSocket connection maintains state and consumes resources (goroutines, memory).
-    *   The service needs to be horizontally scalable to handle a large number of concurrent WebSocket connections.
-    *   Session migration between pods (using the kill switch) can cause brief connection interruptions.
+redis:
+  address: "redis:6379"
+  
+auth:
+  secret_token: ""  # Set via DAISI_WS_AUTH_SECRET_TOKEN
+  token_aes_key: ""  # Set via DAISI_WS_AUTH_TOKEN_AES_KEY (64-char hex)
+  admin_token_aes_key: ""  # Set via DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY
+  token_generation_admin_key: ""  # Set via DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY
+  token_cache_ttl_seconds: 30
+  admin_token_cache_ttl_seconds: 60
 
-*   **Message Ordering:**
-    *   While NATS itself preserves message order within a subject, the overall system doesn't guarantee strict global message ordering across different sources or when message forwarding between pods is involved.
+app:
+  session_ttl_seconds: 30
+  route_ttl_seconds: 300
+  ttl_refresh_interval_seconds: 10
+  websocket_message_buffer_size: 100
+  websocket_backpressure_drop_policy: "drop_oldest"  # or "block"
+  ping_interval_seconds: 20
+  pong_wait_seconds: 60
+  write_timeout_seconds: 30
+  grpc_client_forward_timeout_seconds: 5
+  grpc_pool_idle_timeout_seconds: 300
+  grpc_pool_health_check_interval_seconds: 60
+  grpc_circuitbreaker_fail_threshold: 5
+  grpc_circuitbreaker_open_duration_seconds: 30
+```
 
-*   **Token Security:**
-    *   Security depends on the strength of the AES encryption keys.
-    *   Token TTL management is critical to prevent long-lived access after user permissions change.
+### Environment Variable Overrides
+All configuration values can be overridden using the `DAISI_WS_` prefix:
+```bash
+DAISI_WS_SERVER_HTTP_PORT=8080
+DAISI_WS_SERVER_POD_ID=ws-service-1
+DAISI_WS_NATS_URL=nats://localhost:4222
+DAISI_WS_REDIS_ADDRESS=localhost:6379
+DAISI_WS_AUTH_SECRET_TOKEN=your-secret-token
+DAISI_WS_AUTH_TOKEN_AES_KEY=your-64-char-hex-key
+```
 
-*   **Network Reliability:**
-    *   WebSocket connections are sensitive to network quality and may require reconnection logic on the client side.
-    *   gRPC connections between pods could be impacted by network partitions.
+## 6. Observability and Monitoring
 
-*   **Potential Bottlenecks:**
-    *   Redis operations during high-traffic periods (connection spikes).
-    *   gRPC message forwarding under heavy cross-pod traffic.
-    *   NATS subject fanout with many subscribers.
+### Prometheus Metrics (Detailed)
+*   **Connection Metrics:**
+    - `dws_active_connections`: Current active WebSocket connections by type
+    - `dws_connections_total`: Total connections established counter
+    - `dws_connection_duration_seconds`: Connection lifetime histogram
 
-*   **Error Handling:**
-    *   While the service implements circuit breakers and panic recovery, some error scenarios might still lead to connection drops and require client-side reconnection logic.
+*   **Message Metrics:**
+    - `dws_messages_sent_total`: Messages sent counter by type (ready, event, error)
+    - `dws_messages_received_total`: NATS messages received by subject
+    - `dws_websocket_messages_dropped_total`: Dropped messages by reason and session
 
-*   **Monitoring Coverage:**
-    *   The metrics system focuses on key operational aspects, but additional custom metrics might be needed for specific business insights.
+*   **Authentication Metrics:**
+    - `dws_auth_success_total`: Successful authentications by type (company, admin)
+    - `dws_auth_failure_total`: Failed authentications by type and reason
 
-*   **Configuration Management:**
-    *   The service uses a moderately complex configuration system that needs careful management across different environments.
+*   **gRPC Metrics:**
+    - `dws_grpc_messages_sent_total`: gRPC forwarding attempts by target pod
+    - `dws_grpc_forward_retry_attempts_total`: Retry attempts by pod
+    - `dws_grpc_forward_retry_success_total`: Successful retries
+    - `dws_grpc_forward_retry_failure_total`: Failed retries
+    - `dws_grpc_pool_connections_created_total`: Connection pool metrics
+    - `dws_grpc_pool_connections_closed_total`: Closed connections by reason
+    - `dws_grpc_pool_size`: Current pool size gauge
+    - `dws_grpc_circuitbreaker_tripped_total`: Circuit breaker activations
 
-## 6. Deployment and Operational Considerations
+*   **Session Lock Metrics:**
+    - `dws_session_lock_attempts_total`: Lock acquisition attempts
+    - `dws_session_lock_success_total`: Successful lock acquisitions
+    - `dws_session_conflicts_total`: Session conflicts by type
 
-*   **Kubernetes Deployment:**
-    *   The service is containerized and designed to run in Kubernetes with horizontal scaling.
-    *   Pod identity is important for the route registry system and should be consistent.
+*   **Buffer Metrics:**
+    - `dws_websocket_buffer_capacity`: Buffer capacity by session
+    - `dws_websocket_buffer_used_count`: Current buffer usage
 
-*   **Network Requirements:**
-    *   WebSocket endpoints need to be accessible to clients (potentially through a load balancer with WebSocket support).
-    *   gRPC ports need to be accessible between pods within the cluster.
-    *   NATS and Redis connections require low-latency network access.
+### Structured Logging with Context
+*   **Contextual Fields:** request_id, event_id, user_id, company_id, agent_id, admin_id
+*   **Operation Tracking:** Detailed operation logging for debugging
+*   **Error Context:** Rich error information with stack traces for panics
+*   **Performance Tracking:** Duration logging for critical operations
 
-*   **Load Balancing:**
-    *   WebSocket connections should be sticky to pods once established, but initial connection establishment can be load-balanced.
-    *   Health checks should verify the service's ability to establish new WebSocket connections.
+### Health Check Endpoints
+*   **`/health`:** Basic liveness probe
+*   **`/ready`:** Readiness probe checking NATS, Redis, and gRPC dependencies
+*   **`/metrics`:** Prometheus metrics endpoint
 
-*   **Resource Allocation:**
-    *   Memory allocation should account for WebSocket connection buffers and potential message backlogs.
-    *   CPU allocation needs to handle concurrent connections and message processing.
-    *   Network bandwidth considerations for high-volume WebSocket traffic.
+## 7. Deployment Architecture
 
-*   **Monitoring and Alerting:**
-    *   Critical metrics to monitor:
-        *   WebSocket connection count
-        *   Authentication success/failure rates
-        *   Message delivery rates and latencies
-        *   gRPC client/server errors
-        *   Redis operation latencies
-        *   Session lock conflicts
+### Kubernetes Deployment Considerations
+*   **Multi-Pod Scaling:** Horizontal scaling with session migration via kill switch
+*   **Pod Identity:** Consistent `SERVER_POD_ID` for route registry (e.g., Pod IP or name)
+*   **Service Mesh:** gRPC communication between pods within cluster
+*   **Load Balancer:** WebSocket-aware load balancer with session affinity considerations
 
-*   **Failure Recovery:**
-    *   The service should recover gracefully from Redis or NATS temporary outages.
-    *   Client applications should implement reconnection strategies with backoff.
+### Network Architecture
+```yaml
+# Service Configuration
+apiVersion: v1
+kind: Service
+metadata:
+  name: daisi-ws-service
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: grpc
+    port: 50051
+    targetPort: 50051
+  selector:
+    app: daisi-ws-service
+```
 
-*   **Security Considerations:**
-    *   WebSocket endpoints should use TLS (WSS).
-    *   Admin endpoints need proper authorization controls.
-    *   Redis and NATS connections should be secured within the cluster network.
+### Resource Requirements
+*   **Memory:** Base + (connections × buffer_size × message_size) + connection pools
+*   **CPU:** Message processing, JSON serialization, encryption operations
+*   **Network:** WebSocket traffic, gRPC forwarding, Redis/NATS communication
 
-## 7. Future Enhancements and Considerations
+## 8. Security Architecture
 
-*   **Connection Draining During Deployments:**
-    *   Implementing graceful connection draining during pod termination to minimize client disconnections.
+### Authentication Flow
+1. **API Key Validation:** Static secret token verification
+2. **Token Decryption:** AES-GCM decryption with environment-specific keys
+3. **Token Validation:** Expiration and required field checks
+4. **Context Caching:** Redis-based caching with appropriate TTL
+5. **Session Management:** Exclusive session enforcement with conflict resolution
 
-*   **Enhanced Message Prioritization:**
-    *   Adding message priority levels to ensure critical notifications are delivered ahead of lower-priority events.
+### Security Measures
+*   **Encryption:** AES-256-GCM for token encryption
+*   **Key Management:** Environment-based key configuration
+*   **Session Isolation:** Exclusive sessions with distributed locking
+*   **Admin Restrictions:** Company and agent-level access controls
+*   **Transport Security:** WSS (WebSocket Secure) for external connections
 
-*   **Client Libraries:**
-    *   Developing standardized client libraries for common platforms to handle reconnection, authentication, and message parsing.
+## 9. Performance Characteristics
 
-*   **Telemetry Tracing:**
-    *   Adding distributed tracing (e.g., OpenTelemetry) to track message flow across the entire system.
+### Scalability Targets
+*   **Concurrent Connections:** ≥ 10,000 per pod
+*   **Message Delivery Latency:** ≤ 100ms (P95)
+*   **End-to-End Latency:** ≤ 200ms (CDC → WebSocket)
+*   **Cross-Pod Forwarding:** ≤ 50ms
+*   **Availability:** ≥ 99.95% over 30 days
 
-*   **Message Persistence:**
-    *   Optionally storing messages for offline clients to receive when they reconnect.
+### Optimization Features
+*   **Asynchronous Message Sending:** Non-blocking WebSocket writes with buffering
+*   **Connection Pooling:** gRPC client connection reuse with health monitoring
+*   **Circuit Breakers:** Failure isolation and automatic recovery
+*   **Adaptive TTL:** Activity-based resource management
+*   **Token Caching:** Reduced encryption overhead for frequent authentications
 
-*   **Load Testing and Performance Tuning:**
-    *   Conducting comprehensive load tests to identify bottlenecks and tune performance parameters.
-    *   Optimizing Redis usage patterns for higher throughput.
+## 10. Failure Scenarios and Recovery
 
-*   **Enhanced Security Features:**
-    *   Support for token rotation and revocation.
-    *   Fine-grained access controls based on user roles and permissions.
+### Redis Outage
+*   **Session Management:** Graceful degradation, connections continue but no new exclusive sessions
+*   **Route Registry:** Local fallback, potential message duplication
+*   **Recovery:** Automatic reconnection with session re-establishment
 
-*   **Expanded Monitoring:**
-    *   Business-level metrics related to message types and patterns.
-    *   User experience metrics (connection quality, latency distribution). 
+### NATS Outage  
+*   **Message Flow:** Connection maintains but no new events
+*   **Recovery:** Automatic reconnection with durable consumer catch-up
+
+### Pod Failures
+*   **Session Migration:** Automatic via kill switch pub/sub
+*   **Connection Recovery:** Client-side reconnection required
+*   **State Recovery:** Stateless design enables immediate replacement
+
+### Circuit Breaker Activation
+*   **gRPC Failures:** Temporary isolation of failing pods
+*   **Automatic Recovery:** Exponential backoff with health monitoring
+*   **Fallback:** Local delivery only until recovery
+
+## 11. Monitoring and Alerting Strategy
+
+### Critical Alerts
+*   **High Authentication Failure Rate:** > 10% failure rate over 5 minutes
+*   **Session Conflict Spikes:** Unusual session migration activity
+*   **Circuit Breaker Activations:** gRPC communication failures
+*   **WebSocket Connection Health:** Connection drops or high latency
+*   **Message Delivery Failures:** NATS or Redis connectivity issues
+
+### Performance Monitoring
+*   **Connection Metrics:** Active connections, connection duration
+*   **Message Flow:** Delivery rates, latency percentiles
+*   **Resource Usage:** Memory, CPU, network bandwidth
+*   **Error Rates:** Authentication, message delivery, gRPC forwarding
+
+### Operational Dashboards
+*   **Real-time Connection Status:** Active connections by type and pod
+*   **Message Flow Visualization:** Event processing rates and latency
+*   **System Health Overview:** Dependency status and error rates
+*   **Performance Trends:** Historical metrics and capacity planning 
