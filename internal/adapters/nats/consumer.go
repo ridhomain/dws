@@ -322,7 +322,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 		queueGroup,
 		natsHandler,
 		nats.Durable(durableName+"_admin_agents"), // Make durable name distinct for this type of subscription to avoid conflicts if same base consumer name is used.
-		nats.DeliverLastPerSubject(),
+		nats.DeliverNew(), // Only deliver new messages, don't replay old ones
 		nats.ManualAck(),
 		nats.AckWait(ackWaitAdmin),
 		nats.MaxAckPending(a.natsMaxAckPending), // Reuse existing config for MaxAckPending

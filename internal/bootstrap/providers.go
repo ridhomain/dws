@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/wire"
@@ -54,12 +55,17 @@ func InitialZapLoggerProvider() (*zap.Logger, func(), error) {
 		// Syncing flushes any buffered log entries.
 		// It's good practice, especially before application exit.
 		if syncErr := logger.Sync(); syncErr != nil {
-			// Ignore "invalid argument" errors when syncing, which commonly occur in
-			// containerized environments when syncing to /dev/stderr
-			if syncErr.Error() != "sync /dev/stderr: invalid argument" {
-				// Only log non-container-specific sync errors
-				fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
+			// Ignore common containerized environment sync errors when syncing to /dev/stderr
+			// These errors occur when stderr is closed/invalid during container shutdown
+			errMsg := syncErr.Error()
+			if strings.Contains(errMsg, "sync /dev/stderr:") &&
+				(strings.Contains(errMsg, "invalid argument") || strings.Contains(errMsg, "bad file descriptor")) {
+				// These errors commonly occur in containerized environments during shutdown
+				// and can be safely ignored as they don't indicate a real problem
+				return
 			}
+			// Only log unexpected sync errors that might indicate real issues
+			fmt.Fprintf(os.Stderr, "Failed to sync initial zap logger: %v\n", syncErr)
 		}
 	}
 	return logger, cleanup, nil
@@ -131,6 +137,10 @@ func NewApp(
 		if app.connectionManager != nil {
 			app.connectionManager.StopKillSwitchListener()
 			app.connectionManager.StopResourceRenewalLoop()
+
+			// Brief pause to allow graceful shutdown - reduced since we now have proper synchronization
+			// Redis client cleanup happens after this in Wire's cleanup chain
+			time.Sleep(50 * time.Millisecond)
 		}
 		if app.grpcServer != nil {
 			app.logger.Info(context.Background(), "Stopping gRPC server during app cleanup...")

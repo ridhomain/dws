@@ -3,11 +3,11 @@ package websocket
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
+
+	"runtime/debug"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
@@ -77,7 +77,28 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger.Info(r.Context(), "Admin session lock successfully acquired", "admin_session_key", adminSessionKey)
 
-	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(r.Context())
+	// Create a new context for this specific WebSocket connection's lifecycle.
+	// This context should be independent of the HTTP request's lifecycle once the connection is established.
+	baseCtxForWs := context.Background()
+	// Propagate essential values from the request context, like request_id.
+	if reqID, ok := r.Context().Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.RequestIDKey, reqID)
+		h.logger.Debug(r.Context(), "Propagated request_id to admin WebSocket lifetime context", "request_id", reqID)
+	} else {
+		// If no request ID in r.Context(), generate a new one for the WebSocket connection itself
+		newReqID := uuid.NewString()
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.RequestIDKey, newReqID)
+		h.logger.Debug(r.Context(), "No request_id in r.Context(), generated new request_id for admin WebSocket lifetime context", "new_request_id", newReqID)
+	}
+
+	// Propagate admin context for operations throughout the connection's lifetime
+	if adminCtx != nil {
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.AdminUserContextKey, adminCtx)
+		baseCtxForWs = context.WithValue(baseCtxForWs, contextkeys.UserIDKey, adminCtx.AdminID) // Admin ID as user ID for consistency
+		h.logger.Debug(r.Context(), "Propagated AdminUserContext to WebSocket lifetime context", "admin_id", adminCtx.AdminID)
+	}
+
+	wsConnLifetimeCtx, cancelWsConnLifetimeCtx := context.WithCancel(baseCtxForWs)
 	var wrappedConn *Connection
 	startTime := time.Now() // For connection duration metric
 
@@ -135,32 +156,36 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// It will execute when the manageAdminConnection function finishes.
 	defer func() {
-		h.logger.Info(wrappedConn.Context(), "Admin connection management goroutine finished. Deregistering admin connection.", "admin_session_key", adminSessionKey)
+		h.logger.Info(wrappedConn.Context(), "Admin connection management lifecycle ending. Deregistering admin connection.", "admin_session_key", adminSessionKey)
 		duration := time.Since(startTime).Seconds()
 		metrics.ObserveConnectionDuration(duration)         // Observe for admin connections
 		h.connManager.DeregisterConnection(adminSessionKey) // Uses generic deregister for now
+		cancelWsConnLifetimeCtx()                           // Ensure context is cancelled as ServeHTTP exits.
 		// Do not attempt to release the lock here - the ConnectionManager.DeregisterConnection already does this
-		// Uncomment the below code ONLY if you remove the lock release from ConnectionManager.DeregisterConnection
-		/*
-			// Release lock on clean disconnect
-			if currentPodID != "" {
-				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer releaseCancel()
-				if released, releaseErr := h.connManager.SessionLocker().ReleaseLock(releaseCtx, adminSessionKey, currentPodID); releaseErr != nil {
-					h.logger.Error(wrappedConn.Context(), "Failed to release admin session lock on connection close", "admin_session_key", adminSessionKey, "error", releaseErr)
-				} else if released {
-					h.logger.Info(wrappedConn.Context(), "Successfully released admin session lock on connection close", "admin_session_key", adminSessionKey)
-				} else {
-					h.logger.Warn(wrappedConn.Context(), "Failed to release admin session lock on connection close (not held or value mismatch)", "admin_session_key", adminSessionKey)
-				}
-			}
-		*/
 	}()
 
-	safego.Execute(wsConnLifetimeCtx, h.logger, fmt.Sprintf("AdminWebSocketConnectionManager-%s", adminSessionKey), func() {
-		h.manageAdminConnection(wsConnLifetimeCtx, wrappedConn, adminCtx)
-	})
+	// Call manageAdminConnection directly with panic recovery.
+	// Panic recovery is integrated here, similar to what safego.Execute provided.
+	defer func() {
+		if r := recover(); r != nil {
+			logCtx := wsConnLifetimeCtx
+			if wsConnLifetimeCtx.Err() != nil {
+				logCtx = context.Background()
+			}
+			h.logger.Error(logCtx, fmt.Sprintf("Panic recovered in AdminWebSocketConnectionManager-%s", adminSessionKey),
+				"panic_info", fmt.Sprintf("%v", r),
+				"stacktrace", string(debug.Stack()),
+			)
+			// Ensure connection is closed and deregistered on panic within manageAdminConnection
+			// wrappedConn.Close() might be redundant if panic was due to conn error, but good for safety.
+			// Deregistration is handled by the outer defer.
+		}
+	}()
+
+	// When manageAdminConnection returns, the defers in ServeHTTP will be triggered.
+	h.manageAdminConnection(wsConnLifetimeCtx, wrappedConn, adminCtx)
 }
 
 // manageAdminConnection handles the lifecycle of a single admin WebSocket connection.
@@ -229,6 +254,8 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 			wsMessage := domain.NewEventMessage(eventPayload)
 			if err := conn.WriteJSON(wsMessage); err != nil {
 				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
+				// Don't ACK the message if WebSocket write failed - this allows for redelivery
+				return
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
 				h.logger.Debug(msgCtx, "Successfully delivered admin NATS message to WebSocket",
@@ -238,6 +265,7 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 					"operation", "AdminNatsMessageHandler")
 			}
 
+			// Only ACK the message after successful WebSocket delivery
 			if ackErr := msg.Ack(); ackErr != nil {
 				h.logger.Error(msgCtx, "Failed to ACK admin NATS message",
 					"subject", msg.Subject,
@@ -293,32 +321,38 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		writeTimeout = 10 * time.Second
 	}
 
+	h.logger.Info(connCtx, "Admin connection configuration",
+		"admin_id", adminInfo.AdminID,
+		"ping_interval", pingInterval.String(),
+		"pong_wait_duration", pongWaitDuration.String(),
+		"write_timeout", writeTimeout.String(),
+		"context_deadline", func() string {
+			if deadline, ok := connCtx.Deadline(); ok {
+				return deadline.String()
+			}
+			return "no deadline"
+		}())
+
 	if pingInterval > 0 {
-		pinger := time.NewTicker(pingInterval)
-		defer pinger.Stop()
-		safego.Execute(connCtx, conn.logger, fmt.Sprintf("AdminWebSocketPinger-%s", conn.RemoteAddr()), func() {
+		// Pinger goroutine
+		safego.Execute(connCtx, h.logger, fmt.Sprintf("AdminPinger-%s", conn.RemoteAddr()), func() {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+
 			for {
 				select {
-				case <-pinger.C:
-					pingWriteCtx, pingCancel := context.WithTimeout(connCtx, writeTimeout)
-					if err := conn.Ping(pingWriteCtx); err != nil {
-						h.logger.Error(connCtx, "Failed to send admin ping", "error", err.Error(), "admin_id", adminInfo.AdminID)
-						pingCancel()
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
-						conn.CloseWithError(errResp, "Admin Ping failure")
-						return
-					}
-					pingCancel()
-					h.logger.Debug(connCtx, "Sent ping to admin client", "admin_id", adminInfo.AdminID)
-					if time.Since(conn.LastPongTime()) > pongWaitDuration {
-						h.logger.Warn(connCtx, "Admin Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "admin_id", adminInfo.AdminID)
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
-						conn.CloseWithError(errResp, "Admin Pong timeout")
-						return
-					}
 				case <-connCtx.Done():
 					h.logger.Info(connCtx, "Admin connection context done in pinger, stopping pinger.", "admin_id", adminInfo.AdminID)
 					return
+				case <-ticker.C:
+					writeCtx, cancel := context.WithTimeout(connCtx, writeTimeout)
+					if err := conn.Ping(writeCtx); err != nil {
+						h.logger.Error(writeCtx, "Admin ping failed", "error", err.Error(), "admin_id", adminInfo.AdminID)
+						cancel()
+						return
+					}
+					cancel()
+					h.logger.Debug(connCtx, "Admin ping sent successfully", "admin_id", adminInfo.AdminID)
 				}
 			}
 		})
@@ -328,11 +362,11 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 	for {
 		var readCtx context.Context
 		var cancelRead context.CancelFunc
-		if pongWaitDuration > 0 {
-			readCtx, cancelRead = context.WithTimeout(connCtx, pongWaitDuration)
-		} else {
-			readCtx = connCtx
-		}
+
+		// For admin connections, don't use pong timeout for read operations
+		// since admin clients primarily receive messages and may not send any data
+		// The pong timeout is already handled in the pinger goroutine above
+		readCtx = connCtx
 
 		msgType, p, errRead := conn.ReadMessage(readCtx)
 		if cancelRead != nil {
@@ -340,34 +374,24 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 		}
 
 		if errRead != nil {
-			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
-				h.logger.Warn(connCtx, "Admin Pong timeout: No message received. Closing connection.", "admin_id", adminInfo.AdminID)
-				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within configured timeout period.")
-				conn.CloseWithError(errResp, "Admin Pong timeout")
-				return
-			}
+			// Remove the pong timeout check here since it's handled by the pinger
 			closeStatus := websocket.CloseStatus(errRead)
 			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
-				h.logger.Info(connCtx, "Admin WebSocket connection closed by peer", "status_code", closeStatus, "admin_id", adminInfo.AdminID)
-			} else if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
-				h.logger.Info(connCtx, "Admin WebSocket connection context canceled.", "admin_id", adminInfo.AdminID)
-			} else if closeStatus == -1 && (strings.Contains(strings.ToLower(errRead.Error()), "eof") || strings.Contains(strings.ToLower(errRead.Error()), "closed")) {
-				h.logger.Info(connCtx, "Admin WebSocket read EOF or closed. Peer disconnected.", "admin_id", adminInfo.AdminID, "error", errRead.Error())
+				h.logger.Info(connCtx, "Admin connection closed normally by client", "admin_id", adminInfo.AdminID, "status", closeStatus.String())
+			} else if closeStatus == websocket.StatusNoStatusRcvd {
+				h.logger.Info(connCtx, "Admin connection closed without status (likely network issue)", "admin_id", adminInfo.AdminID, "error", errRead.Error())
 			} else {
-				h.logger.Error(connCtx, "Error reading from admin WebSocket", "error", errRead.Error(), "admin_id", adminInfo.AdminID)
+				h.logger.Error(connCtx, "Admin connection read error", "error", errRead.Error(), "admin_id", adminInfo.AdminID, "close_status", closeStatus.String())
 			}
 			return
 		}
 
-		h.logger.Debug(connCtx, "Received message from admin WebSocket", "type", msgType.String(), "payload_len", len(p), "admin_id", adminInfo.AdminID)
-		// Admin interface might not expect many client-sent messages other than control messages (if any defined later).
-		// For now, increment a generic received metric if it's a text message.
 		if msgType == websocket.MessageText {
-			metrics.IncrementMessagesReceived("admin_text_message") // Generic type for admin messages
-			// Optionally unmarshal if there's a defined admin protocol, otherwise just log receipt for now.
-			h.logger.Info(connCtx, "Admin client sent a text message.", "payload", string(p))
-		} else if msgType == websocket.MessageBinary {
-			metrics.IncrementMessagesReceived("admin_binary_message")
+			h.logger.Debug(connCtx, "Admin received text message", "admin_id", adminInfo.AdminID, "message_size", len(p))
+			// Handle admin-specific messages here if needed
+			// For now, just log and continue
+		} else {
+			h.logger.Debug(connCtx, "Admin received non-text message", "admin_id", adminInfo.AdminID, "message_type", msgType.String(), "message_size", len(p))
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,15 +16,68 @@ import (
 type KillSwitchPubSubAdapter struct {
 	redisClient *redis.Client
 	logger      domain.Logger
-	sub         *redis.PubSub // Holds the active subscription
+	sub         *redis.PubSub      // Holds the active subscription
+	subMutex    sync.Mutex         // Protects access to sub field
+	wg          sync.WaitGroup     // Tracks active subscription goroutines
+	cancelCtx   context.CancelFunc // Cancels subscription goroutines
+	ctx         context.Context    // Context for subscription goroutines
 }
 
 // NewKillSwitchPubSubAdapter creates a new adapter for Redis pub/sub.
 func NewKillSwitchPubSubAdapter(redisClient *redis.Client, logger domain.Logger) *KillSwitchPubSubAdapter {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &KillSwitchPubSubAdapter{
 		redisClient: redisClient,
 		logger:      logger,
+		cancelCtx:   cancel,
+		ctx:         ctx,
 	}
+}
+
+// safeCloseSub safely closes a PubSub subscription with proper synchronization
+// Returns true if the subscription was closed, false if it was already nil
+func (a *KillSwitchPubSubAdapter) safeCloseSub(logPattern string) bool {
+	a.subMutex.Lock()
+	defer a.subMutex.Unlock()
+
+	if a.sub != nil {
+		a.logger.Info(context.Background(), "Closing PubSub subscription", "pattern", logPattern)
+
+		// Handle the case where Redis client might already be closed
+		if err := a.sub.Close(); err != nil {
+			// Only log non-client-closed errors as errors
+			errMsg := err.Error()
+			if errMsg == "redis: client is closed" {
+				a.logger.Info(context.Background(), "PubSub close: Redis client already closed", "pattern", logPattern)
+			} else {
+				a.logger.Error(context.Background(), "Error closing PubSub subscription", "pattern", logPattern, "error", err)
+			}
+		} else {
+			a.logger.Info(context.Background(), "PubSub subscription closed successfully", "pattern", logPattern)
+		}
+
+		a.sub = nil
+		return true
+	}
+	return false
+}
+
+// safeSetSub safely sets the PubSub subscription with proper synchronization
+func (a *KillSwitchPubSubAdapter) safeSetSub(newSub *redis.PubSub) {
+	a.subMutex.Lock()
+	defer a.subMutex.Unlock()
+	a.sub = newSub
+}
+
+// safeGetChannel safely gets the message channel from the current subscription
+func (a *KillSwitchPubSubAdapter) safeGetChannel() <-chan *redis.Message {
+	a.subMutex.Lock()
+	defer a.subMutex.Unlock()
+
+	if a.sub != nil {
+		return a.sub.Channel()
+	}
+	return nil
 }
 
 // PublishSessionKill publishes a message to the specified Redis channel.
@@ -113,21 +167,19 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 		// return fmt.Errorf("subscription goroutine may already be active for this adapter instance")
 	}
 
+	// Add this goroutine to the WaitGroup before starting it
+	a.wg.Add(1)
 	go func() {
 		defer func() {
+			// Mark this goroutine as done when it exits
+			a.wg.Done()
+
 			if r := recover(); r != nil {
 				a.logger.Error(context.Background(), "Panic recovered in persistent Redis PubSub routine",
 					"pattern", pattern, "panic_info", fmt.Sprintf("%v", r), "stacktrace", string(debug.Stack()))
 			}
-			// Ensure subscription is closed if this goroutine exits.
-			// Use a background context for logging here as the original ctx might be done.
-			if a.sub != nil {
-				a.logger.Info(context.Background(), "Closing PubSub subscription from defer in persistent routine", "pattern", pattern)
-				if err := a.sub.Close(); err != nil {
-					a.logger.Error(context.Background(), "Error closing Redis subscription in defer", "pattern", pattern, "error", err)
-				}
-				a.sub = nil
-			}
+			// Ensure subscription is closed if this goroutine exits using thread-safe method
+			a.safeCloseSub(pattern)
 			a.logger.Info(context.Background(), "Persistent subscription routine for Redis pattern has exited", "pattern", pattern)
 		}()
 
@@ -138,8 +190,11 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 		for {
 			// Check for context cancellation at the beginning of each attempt cycle.
 			select {
+			case <-a.ctx.Done():
+				a.logger.Info(context.Background(), "Adapter context cancelled, stopping persistent subscription attempts.", "pattern", pattern)
+				return
 			case <-ctx.Done():
-				a.logger.Info(ctx, "Context cancelled, stopping persistent subscription attempts.", "pattern", pattern)
+				a.logger.Info(ctx, "Caller context cancelled, stopping persistent subscription attempts.", "pattern", pattern)
 				return
 			default:
 				// Continue to attempt subscription
@@ -148,19 +203,33 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 			a.logger.Info(ctx, "Attempting to establish Redis PSubscribe", "pattern", pattern, "current_retry_delay_if_needed", currentRetryDelay.String())
 
 			// Create a new PubSub object for this attempt.
-			// Pass the main context 'ctx' which governs the overall lifetime.
-			psCtx := a.redisClient.PSubscribe(ctx, pattern)
+			// Use a combined context that respects both the caller's context and the adapter's internal context
+			combinedCtx, cancel := context.WithCancel(ctx)
+			go func() {
+				select {
+				case <-a.ctx.Done():
+					cancel()
+				case <-combinedCtx.Done():
+				}
+			}()
 
-			// Atomically store the pubsub object. This is important for the Close() method.
-			// However, direct assignment to a.sub here before confirmation can be tricky if Close() is called concurrently.
-			// A better approach might be to only set a.sub once confirmed, and Close() uses a channel to signal this goroutine.
-			// For now, let's keep it simpler: assign, then confirm. Close() will close whatever a.sub points to.
+			psCtx := a.redisClient.PSubscribe(combinedCtx, pattern)
 
-			_, err := psCtx.Receive(ctx) // This waits for the subscription confirmation.
+			// Wait for subscription confirmation
+			_, err := psCtx.Receive(combinedCtx)
 			if err != nil {
+				cancel()
 				a.logger.Error(ctx, "Failed to establish or confirm Redis PSubscribe", "pattern", pattern, "error", err, "next_retry_in", currentRetryDelay.String())
 				if psCtx != nil {
 					_ = psCtx.Close() // Close the PubSub object from this failed attempt.
+				}
+
+				// Check if we should stop due to adapter shutdown
+				select {
+				case <-a.ctx.Done():
+					a.logger.Info(context.Background(), "Adapter context cancelled during retry, stopping subscription attempts.", "pattern", pattern)
+					return
+				default:
 				}
 
 				// Wait for the retry delay or context cancellation.
@@ -173,18 +242,30 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 						currentRetryDelay = newDelay
 					}
 					continue // Retry PSubscribe
+				case <-a.ctx.Done():
+					a.logger.Info(context.Background(), "Adapter context cancelled during retry wait, stopping subscription attempts.", "pattern", pattern)
+					cancel()
+					return
 				case <-ctx.Done():
-					a.logger.Info(ctx, "Context cancelled during PSubscribe retry wait", "pattern", pattern)
+					a.logger.Info(ctx, "Caller context cancelled during PSubscribe retry wait", "pattern", pattern)
+					cancel()
 					return
 				}
 			}
 
 			// Subscription successful
 			a.logger.Info(ctx, "Successfully subscribed to Redis pattern, entering message processing loop", "pattern", pattern)
-			a.sub = psCtx                         // Now store the confirmed, active subscription.
+			a.safeSetSub(psCtx)                   // Use thread-safe method to store the confirmed, active subscription
 			currentRetryDelay = initialRetryDelay // Reset retry delay on successful subscription.
 
-			msgChan := a.sub.Channel()
+			msgChan := a.safeGetChannel()
+			if msgChan == nil {
+				// This shouldn't happen since we just set the subscription, but let's be safe
+				a.logger.Error(ctx, "Failed to get message channel after successful subscription", "pattern", pattern)
+				cancel()
+				continue // Retry subscription
+			}
+
 			processingMessages := true
 			for processingMessages {
 				select {
@@ -216,23 +297,35 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 							"channel", msg.Channel, "new_pod_id", killMsg.NewPodID, "error", errHandler.Error())
 					}
 
-				case <-ctx.Done():
-					a.logger.Info(ctx, "Context cancelled (during message processing). Stopping Redis message processor and subscription routine.", "pattern", pattern)
+				case <-a.ctx.Done():
+					a.logger.Info(context.Background(), "Adapter context cancelled (during message processing). Stopping Redis message processor and subscription routine.", "pattern", pattern)
 					processingMessages = false // Exit inner loop.
+					cancel()
+					// The main defer in this goroutine will handle a.sub.Close() if a.sub is not nil.
+					return // Exit the main goroutine.
+				case <-ctx.Done():
+					a.logger.Info(ctx, "Caller context cancelled (during message processing). Stopping Redis message processor and subscription routine.", "pattern", pattern)
+					processingMessages = false // Exit inner loop.
+					cancel()
 					// The main defer in this goroutine will handle a.sub.Close() if a.sub is not nil.
 					return // Exit the main goroutine.
 				}
 			} // End of message processing (inner) loop
 
-			// If we exited the inner loop because msgChan closed, a.sub might still be the old one.
-			// It's important to nil it out before the outer loop tries to PSubscribe again,
-			// and ensure it's closed.
-			if a.sub != nil {
-				a.logger.Info(ctx, "Closing current PubSub subscription object before attempting to resubscribe", "pattern", pattern)
-				if errClose := a.sub.Close(); errClose != nil {
-					a.logger.Error(ctx, "Error closing pubsub before resubscribe", "pattern", pattern, "error", errClose)
-				}
-				a.sub = nil
+			cancel() // Cancel the combined context for this iteration
+
+			// If we exited the inner loop because msgChan closed, we need to clean up
+			// the current subscription before the outer loop tries to PSubscribe again.
+			// Use thread-safe method to close and clear the subscription.
+			a.safeCloseSub(pattern)
+
+			// Check if we should stop due to adapter shutdown before attempting to resubscribe
+			select {
+			case <-a.ctx.Done():
+				a.logger.Info(context.Background(), "Adapter context cancelled, not attempting resubscription.", "pattern", pattern)
+				return
+			default:
+				// Continue to resubscription attempt
 			}
 
 			// Small pause before the outer loop retries PSubscribe, to prevent rapid spinning if Redis is down.
@@ -240,8 +333,11 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 			// This handles the case where the channel closes cleanly but we want to retry.
 			select {
 			case <-time.After(initialRetryDelay / 2): // A small, fixed delay.
+			case <-a.ctx.Done():
+				a.logger.Info(context.Background(), "Adapter context cancelled during brief pause before resubscription attempt", "pattern", pattern)
+				return
 			case <-ctx.Done():
-				a.logger.Info(ctx, "Context cancelled during brief pause before resubscription attempt", "pattern", pattern)
+				a.logger.Info(ctx, "Caller context cancelled during brief pause before resubscription attempt", "pattern", pattern)
 				return
 			}
 		} // End of main (outer) retry loop
@@ -251,28 +347,24 @@ func (a *KillSwitchPubSubAdapter) SubscribeToSessionKillPattern(ctx context.Cont
 }
 
 // Close closes the Redis PubSub subscription if one is active.
-// It signals the subscription goroutine to terminate by closing the underlying PubSub object.
+// It signals the subscription goroutine to terminate by cancelling the adapter context
+// and waits for all goroutines to complete before returning.
 func (a *KillSwitchPubSubAdapter) Close() error {
 	a.logger.Info(context.Background(), "Close called on KillSwitchPubSubAdapter")
-	if a.sub != nil {
-		// Closing a.sub will cause its message channel (a.sub.Channel()) to close.
-		// The message processing loop within SubscribeToSessionKillPattern will detect this,
-		// exit its inner loop, and then the outer loop will check ctx.Done().
-		// If the context passed to SubscribeToSessionKillPattern is also being cancelled as part of shutdown,
-		// the goroutine will terminate.
-		a.logger.Info(context.Background(), "Attempting to close active Redis pub/sub subscription object.")
-		err := a.sub.Close()
-		// Set a.sub to nil regardless of close error to prevent reuse by a new Subscribe call
-		// if the goroutine hasn't fully exited and cleaned it up itself yet.
-		// This makes Close idempotent from the perspective of a.sub.
-		a.sub = nil
-		if err != nil {
-			a.logger.Error(context.Background(), "Error closing Redis pub/sub subscription via adapter's Close method", "error", err.Error())
-			return fmt.Errorf("error closing Redis pub/sub: %w", err)
-		}
-		a.logger.Info(context.Background(), "Redis pub/sub subscription object closed via adapter's Close method.")
-		return nil
+
+	// Cancel the adapter context first to signal all goroutines to stop
+	if a.cancelCtx != nil {
+		a.logger.Info(context.Background(), "Cancelling adapter context to stop all subscription goroutines...")
+		a.cancelCtx()
 	}
-	a.logger.Info(context.Background(), "No active Redis pub/sub subscription object to close in adapter.")
-	return nil // Or fmt.Errorf("no active subscription to close") if stricter error needed
+
+	// Close any active subscription using thread-safe method
+	a.safeCloseSub("Close-method")
+
+	// Wait for all subscription goroutines to complete
+	a.logger.Info(context.Background(), "Waiting for Redis pub/sub goroutines to complete...")
+	a.wg.Wait()
+	a.logger.Info(context.Background(), "All Redis pub/sub goroutines have completed.")
+
+	return nil
 }
