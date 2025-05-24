@@ -1,0 +1,166 @@
+{
+  "uid": "cdc-consumer-overview",
+  "title": "CDC Consumer Service Overview",
+  "tags": ["cdc", "consumer"],
+  "timezone": "browser",
+  "schemaVersion": 16,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "title": "CDC Events Processed Rate",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(cdc_consumer_events_total[1m]))",
+          "legendFormat": "Events/sec"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"
+      }
+    },
+    {
+      "title": "Event Processing Results (Last 5m)",
+      "type": "piechart",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (result) (increase(cdc_consumer_events_total[5m]))",
+          "legendFormat": "{{result}}",
+          "instant": true
+        }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 6, "y": 0 },
+      "options": { "reduceOptions": { "calcs": ["sum"], "fields": "", "values": true }, "displayLabels": ["name", "percent"], "pieType": "pie" }
+    },
+    {
+      "title": "Events Processed by Table (/sec)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (table) (rate(cdc_consumer_events_total[1m]))",
+          "legendFormat": "{{table}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 }
+    },
+    {
+      "title": "Publish Errors Rate",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(cdc_consumer_publish_errors_total[1m])",
+          "legendFormat": "Errors/sec"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal", "textMode": "auto", "colorMode": "value", "graphMode": "area", "justifyMode": "auto"
+      }
+    },
+    {
+      "title": "Events Published by Subject & Status (/sec)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (subject, status) (rate(cdc_consumer_events_published_total[1m]))",
+          "legendFormat": "{{subject}} - {{status}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "title": "Redis Deduplication Hits/Misses (/sec)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(cdc_consumer_redis_hit_total[1m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "title": "Event Processing Time (p95 by Table)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(cdc_consumer_processing_seconds_bucket[5m])) by (le, table))",
+          "legendFormat": "p95 {{table}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Event Processing Time (p99 by Table)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(cdc_consumer_processing_seconds_bucket[5m])) by (le, table))",
+          "legendFormat": "p99 {{table}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+     {
+      "title": "Event Processing Time Heatmap (by Table)",
+      "type": "heatmap",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (le, table) (increase(cdc_consumer_processing_seconds_bucket[5m]))",
+          "legendFormat": "{{table}} - {{le}}"
+        }
+      ],
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 24 },
+      "options": {
+        "calculate": false,
+        "showValue": "auto"
+      },
+      "dataFormat": "tsbuckets"
+    },
+    {
+      "title": "Consumer Lag",
+      "type": "gauge",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "cdc_consumer_lag_seconds",
+          "legendFormat": "Lag (s)"
+        }
+      ],
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 24 },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"],"fields": "","values": false},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Deduplication Checks Rate (by Table & Result)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (table, result) (rate(daisi_cdc_consumer_deduplication_checks_total[1m]))",
+          "legendFormat": "{{table}} - {{result}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 }
+    }
+  ]
+} 

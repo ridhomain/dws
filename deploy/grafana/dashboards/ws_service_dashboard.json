@@ -1,0 +1,150 @@
+{
+  "uid": "ws-service-overview",
+  "title": "WebSocket Service Overview",
+  "tags": [
+    "websocket",
+    "dws"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 16,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "title": "Active WebSocket Connections",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "dws_active_connections",
+          "legendFormat": "Active"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "title": "Connection Rate (Total)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(rate(dws_connections_total[1m]))",
+          "legendFormat": "Connections/sec"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "title": "Connection Duration (p95 & p99)",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(dws_connection_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 Duration"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(dws_connection_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99 Duration"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "gRPC Client Pool Size",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "dws_grpc_pool_size",
+          "legendFormat": "Pool Size"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "title": "gRPC Pool Connections Created Rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(dws_grpc_pool_connections_created_total[1m])",
+          "legendFormat": "Created/sec"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      }
+    }
+  ]
+} 

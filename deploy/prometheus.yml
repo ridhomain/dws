@@ -1,0 +1,45 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    # Metrics endpoint for Prometheus itself
+    static_configs:
+      - targets: ['localhost:9090'] # Or use 'prometheus:9090' if preferred when running in Docker
+
+  - job_name: 'message-event-service'
+    # Metrics endpoint for daisi-message-event-service
+    # As per docker-compose.yaml, service name is 'message-event-service', metrics port is 8081
+    static_configs:
+      - targets: ['message-event-service:8081']
+
+  - job_name: 'ws-service-1'
+    # Metrics endpoint for daisi-ws-service
+    # Assuming metrics are exposed on the HTTP port 8080
+    static_configs:
+      - targets: ['ws-service-1:8080']
+  
+  - job_name: 'ws-service-2'
+    # Metrics endpoint for daisi-ws-service
+    # Assuming metrics are exposed on the HTTP port 8080
+    static_configs:
+      - targets: ['ws-service-2:8080']
+
+  - job_name: 'cdc-consumer-service'
+    # Metrics endpoint for daisi-cdc-consumer-service
+    # As per docker-compose.yaml, service name is 'cdc-consumer-service', internal metrics port is 8080
+    static_configs:
+      - targets: ['cdc-consumer-service:8080']
+
+  - job_name: 'nats-exporter'
+    # Metrics endpoint for nats-exporter
+    # As per docker-compose.yaml, service name is 'nats-exporter', metrics port is 7777
+    static_configs:
+      - targets: ['nats-exporter:7777']
+
+  - job_name: 'sequin'
+    # Metrics endpoint for Sequin service
+    # As per sequin-docker-compose/prometheus.yml
+    static_configs:
+      - targets: ['sequin:8376']

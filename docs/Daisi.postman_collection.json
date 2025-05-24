@@ -1,0 +1,404 @@
+{
+	"info": {
+		"_postman_id": "670c063a-877f-4a65-93c1-3f868b07c720",
+		"name": "Daisi",
+		"description": "Postman collection for end-to-end integration testing of the Daisi WebSocket Service HTTP and WebSocket endpoints. Generated on May 2025.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "33602254"
+	},
+	"item": [
+		{
+			"name": "HTTP Endpoints",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/health",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"health"
+							]
+						},
+						"description": "Checks the health of the service."
+					},
+					"response": []
+				},
+				{
+					"name": "Readiness Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/ready",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"ready"
+							]
+						},
+						"description": "Checks if the service is ready to accept traffic (dependencies are up)."
+					},
+					"response": []
+				},
+				{
+					"name": "Metrics",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/metrics",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"metrics"
+							]
+						},
+						"description": "Prometheus metrics endpoint."
+					},
+					"response": []
+				},
+				{
+					"name": "Generate User Token",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"user_id\": \"testuser123\",\n    \"company_id\": \"{{companyId}}\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/generate-token",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"generate-token"
+							]
+						},
+						"description": "Generates an authentication token for a regular user."
+					},
+					"response": []
+				},
+				{
+					"name": "Generate Admin Token",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}",
+								"type": "text"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"admin_user_id\": \"admin007\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/admin/generate-token",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"admin",
+								"generate-token"
+							]
+						},
+						"description": "Generates an authentication token for an admin user."
+					},
+					"response": []
+				}
+			],
+			"description": "Standard HTTP endpoints for service health, metrics, and token generation."
+		},
+		{
+			"name": "WebSocket Endpoints",
+			"item": [
+				{
+					"name": "Admin WebSocket",
+					"event": [
+						{
+							"listen": "prerequest",
+							"script": {
+								"exec": [
+									"// Pre-request Script for \"Admin WebSocket\"",
+									"// Fetches an admin token and sets it to the 'adminToken' collection variable.",
+									"",
+									"const baseUrl = pm.collectionVariables.get(\"baseUrl\");",
+									"const apiKey = \"SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX\"",
+									"const agentId = pm.collectionVariables.get(\"agentId\");",
+									"const adminUserId = \"admin_for_ws_connection\"; // Example admin_user_id",
+									"",
+									"const tokenGenerationRequest = {",
+									"    url: baseUrl + '/admin/generate-token',",
+									"    method: 'POST',",
+									"    header: {",
+									"        'X-API-Key': apiKey,",
+									"        'Content-Type': 'application/json'",
+									"    },",
+									"    body: {",
+									"        mode: 'raw',",
+									"        raw: JSON.stringify({",
+									"            admin_user_id: adminUserId,",
+									"            expires_in_seconds: 1200",
+									"        })",
+									"    }",
+									"};",
+									"",
+									"console.log(\"Pre-request: Attempting to fetch admin token for WebSocket...\");",
+									"",
+									"pm.sendRequest(tokenGenerationRequest, (err, response) => {",
+									"    if (err) {",
+									"        console.error(\"Pre-request: Error fetching admin token:\", err);",
+									"    } else {",
+									"        if (response.code === 200) {",
+									"            try {",
+									"                const responseJson = response.json();",
+									"                if (responseJson && responseJson.token) {",
+									"                    pm.collectionVariables.set(\"adminToken\", responseJson.token);",
+									"                    console.log(\"Pre-request: Admin token fetched and set to 'adminToken':\", responseJson.token);",
+									"                } else {",
+									"                    console.error(\"Pre-request: Admin token not found in response or response format is unexpected.\", response.text());",
+									"                }",
+									"            } catch (e) {",
+									"                console.error(\"Pre-request: Failed to parse admin token response as JSON.\", e, response.text());",
+									"            }",
+									"        } else {",
+									"            console.error(\"Pre-request: Failed to fetch admin token. Status: \" + response.code, response.text());",
+									"        }",
+									"    }",
+									"});"
+								],
+								"type": "text/javascript",
+								"packages": {}
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "ws://{{baseWsUrlWithoutProtocol}}/ws/admin?token={{adminToken}}",
+							"protocol": "ws",
+							"host": [
+								"{{baseWsUrlWithoutProtocol}}"
+							],
+							"path": [
+								"ws",
+								"admin"
+							],
+							"query": [
+								{
+									"key": "token",
+									"value": "{{adminToken}}"
+								}
+							]
+						},
+						"description": "Connects to the admin WebSocket endpoint. Requires API Key in header and admin token in query param."
+					},
+					"response": []
+				},
+				{
+					"name": "Main User WebSocket",
+					"event": [
+						{
+							"listen": "prerequest",
+							"script": {
+								"exec": [
+									"// Pre-request Script for \"Main User WebSocket\"",
+									"// Fetches a user token and sets it to the 'userToken' collection variable.",
+									"",
+									"const baseUrl = pm.collectionVariables.get(\"baseUrl\");",
+									"const apiKey = \"SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX\";",
+									"const agentId = pm.collectionVariables.get(\"agentId\");",
+									"const companyId = pm.collectionVariables.get(\"companyId\"); // Assuming companyId is available",
+									"const userId = \"user_for_ws_connection\"; // Example user_id, consider making this a variable",
+									"",
+									"const tokenGenerationRequest = {",
+									"    url: baseUrl + '/generate-token',",
+									"    method: 'POST',",
+									"    header: {",
+									"        'X-API-Key': apiKey,",
+									"        'Content-Type': 'application/json'",
+									"    },",
+									"    body: {",
+									"        mode: 'raw',",
+									"        raw: JSON.stringify({",
+									"            user_id: userId, ",
+									"            company_id: companyId,",
+									"            agent_id: agentId,",
+									"            expires_in_seconds: 3600",
+									"        })",
+									"    }",
+									"};",
+									"",
+									"console.log(\"Pre-request: Attempting to fetch user token for WebSocket...\");",
+									"",
+									"// pm.sendRequest is asynchronous. The WebSocket connection might initiate",
+									"// before this callback runs and sets the token.",
+									"pm.sendRequest(tokenGenerationRequest, (err, response) => {",
+									"    if (err) {",
+									"        console.error(\"Pre-request: Error fetching user token:\", err);",
+									"        // You might want to stop the request if token fetching fails, but Postman doesn't have a direct way",
+									"        // to halt the parent request from an async callback in pre-request scripts easily.",
+									"    } else {",
+									"        if (response.code === 200) {",
+									"            try {",
+									"                const responseJson = response.json();",
+									"                if (responseJson && responseJson.token) {",
+									"                    pm.collectionVariables.set(\"userToken\", responseJson.token);",
+									"                    console.log(\"Pre-request: User token fetched and set to 'userToken':\", responseJson.token);",
+									"                } else {",
+									"                    console.error(\"Pre-request: User token not found in response or response format is unexpected.\", response.text());",
+									"                }",
+									"            } catch (e) {",
+									"                console.error(\"Pre-request: Failed to parse user token response as JSON.\", e, response.text());",
+									"            }",
+									"        } else {",
+									"            console.error(\"Pre-request: Failed to fetch user token. Status: \" + response.code, response.text());",
+									"        }",
+									"    }",
+									"});"
+								],
+								"type": "text/javascript",
+								"packages": {}
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "X-API-Key",
+								"value": "{{apiKey}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "ws://{{baseWsUrlWithoutProtocol}}/ws/{{companyId}}/{{agentId}}?token={{userToken}}",
+							"protocol": "ws",
+							"host": [
+								"{{baseWsUrlWithoutProtocol}}"
+							],
+							"path": [
+								"ws",
+								"{{companyId}}",
+								"{{agentId}}"
+							],
+							"query": [
+								{
+									"key": "token",
+									"value": "{{userToken}}"
+								}
+							]
+						},
+						"description": "Connects to the main user WebSocket endpoint. Requires API Key in header and user token in query param. Company and Agent IDs are part of the path."
+					},
+					"response": []
+				}
+			],
+			"description": "WebSocket connection endpoints."
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://0.0.0.0:8084",
+			"type": "string"
+		},
+		{
+			"key": "baseWsUrl",
+			"value": "http://0.0.0.0:8084",
+			"type": "string"
+		},
+		{
+			"key": "baseWsUrlWithoutProtocol",
+			"value": "0.0.0.0:8084",
+			"type": "string"
+		},
+		{
+			"key": "apiKey",
+			"value": "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv",
+			"type": "string"
+		},
+		{
+			"key": "userToken",
+			"value": "GENERATED_USER_TOKEN",
+			"type": "string"
+		},
+		{
+			"key": "adminToken",
+			"value": "GENERATED_ADMIN_TOKEN",
+			"type": "string"
+		},
+		{
+			"key": "companyId",
+			"value": "CompanyGLOBAL00",
+			"type": "string"
+		},
+		{
+			"key": "agentId",
+			"value": "ac69abef-a118-4d59-aea3-d98537e5bc7e",
+			"type": "string"
+		}
+	]
+}

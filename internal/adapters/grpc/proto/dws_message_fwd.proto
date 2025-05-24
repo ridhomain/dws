@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package dws_message_fwd;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc/proto;dws_message_fwd";
+
+service MessageForwardingService {
+  rpc PushEvent(PushEventRequest) returns (PushEventResponse);
+}
+
+message EnrichedEventPayloadMessage {
+  string event_id = 1;
+  string company_id = 2;
+  string agent_id = 3;    // Optional in source JSON, but always string if present
+  string message_id = 4;  // Optional in source JSON
+  string chat_id = 5;     // Optional in source JSON
+  google.protobuf.Struct row_data = 6; // Contains the actual table row data
+  string event_time = 7;
+}
+
+message PushEventRequest {
+  EnrichedEventPayloadMessage payload = 1;
+  string target_company_id = 2; // For routing/logging on recipient
+  string target_agent_id = 3;
+  string target_chat_id = 4;
+  string source_pod_id = 5; // Added to track source for metrics
+}
+
+message PushEventResponse {
+  bool success = 1;
+  string message = 2; // Optional: error message or status
+} 

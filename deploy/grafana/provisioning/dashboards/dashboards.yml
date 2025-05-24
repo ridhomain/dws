@@ -1,0 +1,17 @@
+apiVersion: 1
+
+providers:
+  # The default provider
+  - name: 'default'
+    orgId: 1
+    folder: '' # Dashboards will appear in the 'General' folder
+    type: file
+    disableDeletion: false # Allow deleting dashboards via UI
+    editable: true         # Allow editing dashboards via UI
+    updateIntervalSeconds: 30 # Check for changes every 30 seconds
+    allowUiUpdates: true      # Allow updates from the UI to be saved back (if permissions allow)
+    options:
+      path: /var/lib/grafana/dashboards # Path Grafana scans for JSON files
+      # Optional: If you want dashboards loaded from this provider to be placed
+      # into a specific folder in the Grafana UI, uncomment and set the folder name:
+      # folder: 'Load Test Dashboards' 
