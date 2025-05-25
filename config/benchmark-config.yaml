@@ -1,0 +1,107 @@
+# Benchmark Test Configuration - Optimized for in-process testing
+server:
+  http_port: 0  # Use random available port for tests
+  grpc_port: 0  # Use random available port for tests
+  pod_id: "benchmark-test-pod"
+  enable_reflection: false
+
+# NATS Configuration - will be mocked
+nats:
+  url: "nats://mock-nats:4222"  # Will be mocked
+  stream_name: "wa_stream"
+  consumer_name: "ws_fanout"
+  connect_timeout_seconds: 1
+  reconnect_wait_seconds: 1
+  max_reconnects: 1
+  ping_interval_seconds: 10
+  max_pings_out: 1
+  retry_on_failed_connect: false
+
+# Redis Configuration - will be mocked
+redis:
+  address: "mock-redis:6379"  # Will be mocked
+  password: ""
+  db: 0
+  max_retries: 1
+  dial_timeout_seconds: 1
+  read_timeout_seconds: 1
+  write_timeout_seconds: 1
+
+# Logging Configuration - minimal for benchmarks
+log:
+  level: "error"  # Minimize I/O overhead during benchmarks
+  format: "json"
+  output: "stdout"
+
+# Authentication Configuration
+auth:
+  secret_token: "benchmark-secret-token-32chars123"
+  token_aes_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  admin_secret_token: "benchmark-admin-secret-32chars"
+  admin_token_aes_key: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+  token_cache_ttl_seconds: 30
+  admin_token_cache_ttl_seconds: 60
+
+# Application Specific - optimized for testing
+app:
+  service_name: "daisi-ws-service-benchmark"
+  version: "test"
+  ping_interval_seconds: 5
+  shutdown_timeout_seconds: 1
+  pong_wait_seconds: 10
+  write_timeout_seconds: 5
+  max_missed_pongs: 1
+  session_ttl_seconds: 30
+  route_ttl_seconds: 300
+  ttl_refresh_interval_seconds: 10
+  nats_max_ack_pending: 1000
+  session_lock_retry_delay_ms: 10
+  nats_ack_wait_seconds: 1
+  grpc_client_forward_timeout_seconds: 1
+  read_timeout_seconds: 1
+  idle_timeout_seconds: 5
+  websocket_compression_mode: "disabled"
+  websocket_compression_threshold: 1024
+  websocket_development_insecure_skip_verify: false
+  grpc_pool_idle_timeout_seconds: 30
+  grpc_pool_health_check_interval_seconds: 10
+  grpc_circuit_breaker_fail_threshold: 5
+  grpc_circuit_breaker_open_duration_seconds: 30
+  websocket_message_buffer_size: 100
+  websocket_backpressure_drop_policy: "drop_oldest"
+  websocket_slow_client_latency_ms: 1000
+  websocket_slow_client_disconnect_threshold_ms: 5000
+  adaptive_ttl_enabled: false  # Disable for consistent test behavior
+
+# Adaptive TTL Configuration - disabled for simpler testing
+adaptive_ttl:
+  session_lock:
+    enabled: false
+    min_ttl_seconds: 15
+    max_ttl_seconds: 30
+    activity_threshold_seconds: 60
+    active_ttl_seconds: 30
+    inactive_ttl_seconds: 15
+  message_route:
+    enabled: false  # Disabled for benchmark simplicity
+    min_ttl_seconds: 300
+    max_ttl_seconds: 900
+    activity_threshold_seconds: 300
+    active_ttl_seconds: 900
+    inactive_ttl_seconds: 300
+  chat_route:
+    enabled: false
+    min_ttl_seconds: 300
+    max_ttl_seconds: 600
+    activity_threshold_seconds: 300
+    active_ttl_seconds: 600
+    inactive_ttl_seconds: 300
+
+grpc:
+  timeout_seconds: 1
+  max_recv_msg_size: 1048576  # 1MB
+  max_send_msg_size: 1048576  # 1MB
+
+metrics:
+  enabled: false  # Disable metrics collection during benchmarks
+  port: 0 
