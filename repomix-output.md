@@ -233,330 +233,6 @@ sinks:
       - agent_id
 ```
 
-## File: deploy/docker-compose.yaml
-```yaml
-version: '3.8'
-networks:
-  daisi_network:
-    driver: bridge
-services:
-  message-event-service:
-    image: daisi/daisi-message-event-service:latest
-    container_name: daisi-message-event-service
-    environment:
-      POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/message_service_db
-      NATS_URL: nats://nats:4222
-      COMPANY_ID: CompanyGLOBAL00
-      LOG_LEVEL: info
-      MES_SERVER_PORT: 8081
-      MES_METRICS_ENABLED: "true"
-    ports:
-      - "8081:8081"
-    networks:
-      - daisi_network
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-    depends_on:
-      nats:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    labels:
-      logging: promtail
-      service_name: message-event-service
-  ws-service-2:
-    image: daisi/daisi-ws-service:latest
-    ports:
-      - "8083:8080"
-      - "50051:50051"
-    volumes:
-      - ../daisi-ws-service/config:/app/config:ro
-    environment:
-      DAISI_WS_SERVER_HTTP_PORT: 8080
-      DAISI_WS_SERVER_GRPC_PORT: 50051
-      DAISI_WS_SERVER_POD_ID: ws-service-2
-      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
-      DAISI_WS_NATS_URL: nats://nats:4222
-      DAISI_WS_NATS_STREAM_NAME: wa_stream
-      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
-      DAISI_WS_REDIS_ADDRESS: redis:6379
-      DAISI_WS_LOG_LEVEL: debug
-      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-2
-      DAISI_WS_APP_VERSION: unified-local
-      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
-      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
-      DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
-      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
-    depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - daisi_network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
-      interval: 15s
-      timeout: 10s
-      retries: 3
-      start_period: 25s
-    labels:
-      logging: promtail
-      service_name: ws-service-2
-  ws-service-1:
-    image: daisi/daisi-ws-service:latest
-    ports:
-      - "8084:8080"
-      - "50052:50051"
-    volumes:
-      - ../daisi-ws-service/config:/app/config:ro
-    environment:
-      DAISI_WS_SERVER_HTTP_PORT: 8080
-      DAISI_WS_SERVER_GRPC_PORT: 50051
-      DAISI_WS_SERVER_POD_ID: ws-service-1
-      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
-      DAISI_WS_NATS_URL: nats://nats:4222
-      DAISI_WS_NATS_STREAM_NAME: wa_stream
-      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
-      DAISI_WS_REDIS_ADDRESS: redis:6379
-      DAISI_WS_LOG_LEVEL: debug
-      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-1
-      DAISI_WS_APP_VERSION: unified-local
-      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
-      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
-      DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
-      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
-    depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - daisi_network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
-      interval: 15s
-      timeout: 10s
-      retries: 3
-      start_period: 25s
-    labels:
-      logging: promtail
-      service_name: ws-service-1
-  cdc-consumer-service:
-    image: daisi/daisi-cdc-consumer-service:latest
-    container_name: daisi-cdc-consumer-service
-    ports:
-      - "8082:8080"
-    environment:
-      DAISI_CDC_NATS_URL: "nats://nats:4222"
-      DAISI_CDC_REDIS_ADDR: "redis://redis:6379"
-      DAISI_CDC_LOG_LEVEL: "debug"
-    depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - daisi_network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-    labels:
-      logging: promtail
-      service_name: cdc-consumer-service
-  sequin:
-    image: sequin/sequin:latest
-    container_name: sequin
-    ports:
-      - "7376:7376"
-    environment:
-      PG_HOSTNAME: postgres
-      PG_DATABASE: sequin_db
-      PG_PORT: 5432
-      PG_USERNAME: postgres
-      PG_PASSWORD: postgres
-      PG_POOL_SIZE: 20
-      SECRET_KEY_BASE: "wDPLYus0pvD6qJhKJICO4dauYPXfO/Yl782Zjtpew5qRBDp7CZvbWtQmY0eB13If"
-      VAULT_KEY: "2Sig69bIpuSm2kv0VQfDekET2qy8qUZGI8v3/h3ASiY="
-      REDIS_URL: redis://redis:6379
-      CONFIG_FILE_PATH: /config/daisi-sequin.yml
-    volumes:
-      - ./daisi-sequin.yml:/config/daisi-sequin.yml:ro
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    networks:
-      - daisi_network
-    restart: unless-stopped
-  postgres:
-    image: postgres:17-bookworm
-    container_name: postgres-db
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: message_service_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-      - ./postgres-init:/docker-entrypoint-initdb.d
-    networks:
-      - daisi_network
-    command: ["postgres", "-c", "wal_level=logical"]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d message_service_db"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-  nats:
-    image: nats:2.11-alpine
-    container_name: nats-server
-    command: "--name unified-nats-server --http_port 8222 --jetstream --store_dir /data"
-    ports:
-      - "4222:4222"
-      - "6222:6222"
-      - "8222:8222"
-    volumes:
-      - ./data/nats:/data
-    networks:
-      - daisi_network
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-  redis:
-    image: redis:7-alpine
-    container_name: redis-cache
-    ports:
-      - "6379:6379"
-    volumes:
-      - ./data/redis:/data
-    networks:
-      - daisi_network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-  loki:
-    image: grafana/loki:3.0.0
-    container_name: loki
-    ports:
-      - "3100:3100"
-    volumes:
-      - ./data/loki:/loki
-      - ./loki-config.yml:/etc/loki/local-config.yaml:ro
-    command: -config.file=/etc/loki/local-config.yaml
-    networks:
-      - daisi_network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-  promtail:
-    image: grafana/promtail:2.9.2
-    container_name: promtail
-    volumes:
-      - ./promtail-config.yml:/etc/promtail/config.yml:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: -config.file=/etc/promtail/config.yml
-    networks:
-      - daisi_network
-    depends_on:
-      - loki
-    restart: unless-stopped
-  nats-exporter:
-    image: natsio/prometheus-nats-exporter:latest
-    container_name: nats-exporter
-    command: "-connz -routez -subz -varz http://nats:8222"
-    ports:
-      - "7777:7777"
-    networks:
-      - daisi_network
-    depends_on:
-      nats:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7777/metrics"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./data/prometheus:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-    ports:
-      - "9090:9090"
-    networks:
-      - daisi_network
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    depends_on:
-      - nats-exporter
-      - message-event-service
-      - ws-service-1
-      - ws-service-2
-      - cdc-consumer-service
-      - loki
-    restart: unless-stopped
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - ./data/grafana:/var/lib/grafana
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: "admin"
-      GF_PROVISIONING_PATH: "/etc/grafana/provisioning"
-      GF_DATASOURCES_DEFAULT_DATASOURCE_URL: http://prometheus:9090
-      GF_INSTALL_PLUGINS: "https://storage.googleapis.com/integration-artifacts/grafana-lokiexplore-app/grafana-lokiexplore-app-latest.zip;grafana-lokiexplore-app"
-    networks:
-      - daisi_network
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    depends_on:
-      - prometheus
-      - loki
-    restart: unless-stopped
-```
-
 ## File: deploy/loki-config.yml
 ```yaml
 auth_enabled: false
@@ -1096,39 +772,6 @@ tasks.json
 tasks/
 ```
 
-## File: env.example
-```
-# Daisi WebSocket Service Environment Variables
-# Copy this file to .env and modify as needed for your environment
-
-# Server Configuration
-DAISI_WS_SERVER_HTTP_PORT=8080
-DAISI_WS_SERVER_GRPC_PORT=50051
-DAISI_WS_SERVER_POD_ID=ws-service-1
-DAISI_WS_SERVER_ENABLE_REFLECTION=true
-
-# NATS Configuration
-DAISI_WS_NATS_URL=nats://localhost:4222
-DAISI_WS_NATS_STREAM_NAME=wa_stream
-DAISI_WS_NATS_CONSUMER_NAME=ws_fanout
-
-# Redis Configuration
-DAISI_WS_REDIS_ADDRESS=localhost:6379
-
-# Logging Configuration
-DAISI_WS_LOG_LEVEL=debug
-
-# Application Configuration
-DAISI_WS_APP_SERVICE_NAME=daisi-ws-service-replica-1
-DAISI_WS_APP_VERSION=unified-local
-
-# Authentication Configuration
-DAISI_WS_AUTH_SECRET_TOKEN=n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv
-DAISI_WS_AUTH_TOKEN_AES_KEY=270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6
-DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY=SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX
-DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY=97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b
-```
-
 ## File: cmd/daisi-ws-service/main.go
 ```go
 package main
@@ -1154,6 +797,330 @@ func main() {
 	}
 	fmt.Println("Application exited gracefully.")
 }
+```
+
+## File: deploy/docker-compose.yaml
+```yaml
+version: '3.8'
+networks:
+  daisi_network:
+    driver: bridge
+services:
+  message-event-service:
+    image: daisi/daisi-message-event-service:latest
+    container_name: daisi-message-event-service
+    environment:
+      POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/message_service_db
+      NATS_URL: nats://nats:4222
+      COMPANY_ID: CompanyGLOBAL00
+      LOG_LEVEL: info
+      MES_SERVER_PORT: 8081
+      MES_METRICS_ENABLED: "true"
+    ports:
+      - "8081:8081"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    labels:
+      logging: promtail
+      service_name: message-event-service
+  ws-service-2:
+    image: daisi/daisi-ws-service:latest
+    ports:
+      - "8083:8080"
+      - "50051:50051"
+    volumes:
+      - ../daisi-ws-service/config:/app/config:ro
+    environment:
+      DAISI_WS_SERVER_HTTP_PORT: 8080
+      DAISI_WS_SERVER_GRPC_PORT: 50051
+      DAISI_WS_SERVER_POD_ID: ws-service-2
+      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
+      DAISI_WS_NATS_URL: nats://nats:4222
+      DAISI_WS_NATS_STREAM_NAME: wa_stream
+      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
+      DAISI_WS_REDIS_ADDRESS: redis:6379
+      DAISI_WS_LOG_LEVEL: debug
+      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-2
+      DAISI_WS_APP_VERSION: unified-local
+      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
+      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
+      DAISI_WS_AUTH_ADMIN_SECRET_TOKEN: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
+      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+    labels:
+      logging: promtail
+      service_name: ws-service-2
+  ws-service-1:
+    image: daisi/daisi-ws-service:latest
+    ports:
+      - "8084:8080"
+      - "50052:50051"
+    volumes:
+      - ../daisi-ws-service/config:/app/config:ro
+    environment:
+      DAISI_WS_SERVER_HTTP_PORT: 8080
+      DAISI_WS_SERVER_GRPC_PORT: 50051
+      DAISI_WS_SERVER_POD_ID: ws-service-1
+      DAISI_WS_SERVER_ENABLE_REFLECTION: "true"
+      DAISI_WS_NATS_URL: nats://nats:4222
+      DAISI_WS_NATS_STREAM_NAME: wa_stream
+      DAISI_WS_NATS_CONSUMER_NAME: ws_fanout
+      DAISI_WS_REDIS_ADDRESS: redis:6379
+      DAISI_WS_LOG_LEVEL: debug
+      DAISI_WS_APP_SERVICE_NAME: daisi-ws-service-replica-1
+      DAISI_WS_APP_VERSION: unified-local
+      DAISI_WS_AUTH_SECRET_TOKEN: "n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv"
+      DAISI_WS_AUTH_TOKEN_AES_KEY: "270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6"
+      DAISI_WS_AUTH_ADMIN_SECRET_TOKEN: "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX"
+      DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY: "97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
+    labels:
+      logging: promtail
+      service_name: ws-service-1
+  cdc-consumer-service:
+    image: daisi/daisi-cdc-consumer-service:latest
+    container_name: daisi-cdc-consumer-service
+    ports:
+      - "8082:8080"
+    environment:
+      DAISI_CDC_NATS_URL: "nats://nats:4222"
+      DAISI_CDC_REDIS_ADDR: "redis://redis:6379"
+      DAISI_CDC_LOG_LEVEL: "debug"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    labels:
+      logging: promtail
+      service_name: cdc-consumer-service
+  sequin:
+    image: sequin/sequin:latest
+    container_name: sequin
+    ports:
+      - "7376:7376"
+    environment:
+      PG_HOSTNAME: postgres
+      PG_DATABASE: sequin_db
+      PG_PORT: 5432
+      PG_USERNAME: postgres
+      PG_PASSWORD: postgres
+      PG_POOL_SIZE: 20
+      SECRET_KEY_BASE: "wDPLYus0pvD6qJhKJICO4dauYPXfO/Yl782Zjtpew5qRBDp7CZvbWtQmY0eB13If"
+      VAULT_KEY: "2Sig69bIpuSm2kv0VQfDekET2qy8qUZGI8v3/h3ASiY="
+      REDIS_URL: redis://redis:6379
+      CONFIG_FILE_PATH: /config/daisi-sequin.yml
+    volumes:
+      - ./daisi-sequin.yml:/config/daisi-sequin.yml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - daisi_network
+    restart: unless-stopped
+  postgres:
+    image: postgres:17-bookworm
+    container_name: postgres-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: message_service_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d
+    networks:
+      - daisi_network
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d message_service_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  nats:
+    image: nats:2.11-alpine
+    container_name: nats-server
+    command: "--name unified-nats-server --http_port 8222 --jetstream --store_dir /data"
+    ports:
+      - "4222:4222"
+      - "6222:6222"
+      - "8222:8222"
+    volumes:
+      - ./data/nats:/data
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./data/loki:/loki
+      - ./loki-config.yml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - daisi_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: promtail
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - daisi_network
+    depends_on:
+      - loki
+    restart: unless-stopped
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest
+    container_name: nats-exporter
+    command: "-connz -routez -subz -varz http://nats:8222"
+    ports:
+      - "7777:7777"
+    networks:
+      - daisi_network
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7777/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      - nats-exporter
+      - message-event-service
+      - ws-service-1
+      - ws-service-2
+      - cdc-consumer-service
+      - loki
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./data/grafana:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_PROVISIONING_PATH: "/etc/grafana/provisioning"
+      GF_DATASOURCES_DEFAULT_DATASOURCE_URL: http://prometheus:9090
+      GF_INSTALL_PLUGINS: "https://storage.googleapis.com/integration-artifacts/grafana-lokiexplore-app/grafana-lokiexplore-app-latest.zip;grafana-lokiexplore-app"
+    networks:
+      - daisi_network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
 ```
 
 ## File: internal/adapters/grpc/proto/dws_message_fwd.proto
@@ -1722,6 +1689,39 @@ func AdminSessionKillChannelKey(adminID string) string {
 }
 ```
 
+## File: env.example
+```
+# Daisi WebSocket Service Environment Variables
+# Copy this file to .env and modify as needed for your environment
+
+# Server Configuration
+DAISI_WS_SERVER_HTTP_PORT=8080
+DAISI_WS_SERVER_GRPC_PORT=50051
+DAISI_WS_SERVER_POD_ID=ws-service-1
+DAISI_WS_SERVER_ENABLE_REFLECTION=true
+
+# NATS Configuration
+DAISI_WS_NATS_URL=nats://localhost:4222
+DAISI_WS_NATS_STREAM_NAME=wa_stream
+DAISI_WS_NATS_CONSUMER_NAME=ws_fanout
+
+# Redis Configuration
+DAISI_WS_REDIS_ADDRESS=localhost:6379
+
+# Logging Configuration
+DAISI_WS_LOG_LEVEL=debug
+
+# Application Configuration
+DAISI_WS_APP_SERVICE_NAME=daisi-ws-service-replica-1
+DAISI_WS_APP_VERSION=unified-local
+
+# Authentication Configuration
+DAISI_WS_AUTH_SECRET_TOKEN=n7f2GTfsHqNNNaDWaPeV9I4teCGqnmtv
+DAISI_WS_AUTH_TOKEN_AES_KEY=270cec3a9081be630f5350bc42b244156615e55a2153e2652dc4f460673350c6
+DAISI_WS_AUTH_ADMIN_SECRET_TOKEN=SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX
+DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY=97c2f43def2596ff2d635e924f6de7918b2eb1b79b761974c2493afb597c9e1b
+```
+
 ## File: internal/adapters/grpc/forwarder_adapter.go
 ```go
 package grpc
@@ -2135,115 +2135,6 @@ func (s *Server) Start() error {
 func (s *Server) GracefulStop() {
 	s.logger.Info(s.appCtx, "GracefulStop called for gRPC server. Cancelling its lifecycle context to trigger stop.")
 	s.cancelCtx()
-}
-```
-
-## File: internal/adapters/middleware/admin_auth.go
-```go
-package middleware
-import (
-	"context"
-	"errors"
-	"net/http"
-	"strings"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
-	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
-)
-func AdminAPIKeyAuthMiddleware(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			adminApiKey := r.Header.Get(apiKeyHeaderName)
-			cfg := cfgProvider.Get()
-			if cfg == nil || cfg.Auth.AdminSecretToken == "" {
-				logger.Error(r.Context(), "Token generation auth failed: AdminSecretToken not configured", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token generation auth cannot be performed.")
-				errResp.WriteJSON(w, http.StatusInternalServerError)
-				return
-			}
-			if adminApiKey == "" {
-				logger.Warn(r.Context(), "Token generation auth failed: Admin key missing", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrUnauthorized, "Admin API key is required", "Provide admin API key in X-API-Key header.")
-				errResp.WriteJSON(w, http.StatusUnauthorized)
-				return
-			}
-			if adminApiKey != cfg.Auth.AdminSecretToken {
-				logger.Warn(r.Context(), "Token generation auth failed: Invalid admin key", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.")
-				errResp.WriteJSON(w, http.StatusForbidden)
-				return
-			}
-			logger.Debug(r.Context(), "Token generation admin key authentication successful", "path", r.URL.Path)
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-const (
-	adminTokenQueryParam = "token"
-)
-func AdminAuthMiddleware(authService *application.AuthService, logger domain.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tokenValue := r.URL.Query().Get(adminTokenQueryParam)
-			if tokenValue == "" {
-				logger.Warn(r.Context(), "Admin token authentication failed: 'token' query parameter missing", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrInvalidToken, "Admin token is required", "Provide 'token' in query parameter.")
-				errResp.WriteJSON(w, http.StatusForbidden)
-				return
-			}
-			adminCtx, err := authService.ProcessAdminToken(r.Context(), tokenValue)
-			if err != nil {
-				logger.Warn(r.Context(), "Admin token processing failed", "path", r.URL.Path, "error", err.Error())
-				var errCode domain.ErrorCode
-				var errMsg string
-				var errDetails string = err.Error()
-				httpStatus := http.StatusForbidden
-				var reasonForMetric string = "unknown_error"
-				switch {
-				case errors.Is(err, application.ErrTokenExpired):
-					errCode = domain.ErrInvalidToken
-					errMsg = "Admin token has expired."
-					reasonForMetric = "expired"
-				case errors.Is(err, crypto.ErrTokenDecryptionFailed),
-					errors.Is(err, application.ErrTokenPayloadInvalid),
-					errors.Is(err, crypto.ErrInvalidTokenFormat),
-					errors.Is(err, crypto.ErrCiphertextTooShort):
-					errCode = domain.ErrInvalidToken
-					errMsg = "Admin token is invalid or malformed."
-					errDetails = "Token format or content error."
-					reasonForMetric = "invalid_format_or_content"
-				case errors.Is(err, crypto.ErrInvalidAESKeySize),
-					strings.Contains(err.Error(), "application not configured for admin token decryption"):
-					errCode = domain.ErrInternal
-					errMsg = "Server configuration error processing admin token."
-					httpStatus = http.StatusInternalServerError
-					errDetails = "Internal server error."
-					reasonForMetric = "config_error_aes_key"
-				default:
-					logger.Error(r.Context(), "Unexpected internal error during admin token processing", "path", r.URL.Path, "detailed_error", err.Error())
-					errCode = domain.ErrInternal
-					errMsg = "An unexpected error occurred while processing admin token."
-					httpStatus = http.StatusInternalServerError
-					errDetails = "Internal server error."
-					reasonForMetric = "internal_server_error"
-				}
-				metrics.IncrementAuthFailure("admin", reasonForMetric)
-				domain.NewErrorResponse(errCode, errMsg, errDetails).WriteJSON(w, httpStatus)
-				return
-			}
-			metrics.IncrementAuthSuccess("admin")
-			newReqCtx := context.WithValue(r.Context(), contextkeys.AdminUserContextKey, adminCtx)
-			newReqCtx = context.WithValue(newReqCtx, contextkeys.UserIDKey, adminCtx.AdminID)
-			logger.Debug(r.Context(), "Admin token authentication successful",
-				"path", r.URL.Path,
-				"admin_id", adminCtx.AdminID,
-				"company_restriction", adminCtx.CompanyIDRestriction)
-			next.ServeHTTP(w, r.WithContext(newReqCtx))
-		})
-	}
 }
 ```
 
@@ -2986,6 +2877,115 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250512202823-5a2f75b736a9 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+```
+
+## File: internal/adapters/middleware/admin_auth.go
+```go
+package middleware
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
+	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
+)
+func AdminAPIKeyAuthMiddleware(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			adminApiKey := r.Header.Get(apiKeyHeaderName)
+			cfg := cfgProvider.Get()
+			if cfg == nil || cfg.Auth.AdminSecretToken == "" {
+				logger.Error(r.Context(), "Token generation auth failed: AdminSecretToken not configured", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token generation auth cannot be performed.")
+				errResp.WriteJSON(w, http.StatusInternalServerError)
+				return
+			}
+			if adminApiKey == "" {
+				logger.Warn(r.Context(), "Token generation auth failed: Admin key missing", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrUnauthorized, "Admin API key is required", "Provide admin API key in X-API-Key header.")
+				errResp.WriteJSON(w, http.StatusUnauthorized)
+				return
+			}
+			if adminApiKey != cfg.Auth.AdminSecretToken {
+				logger.Warn(r.Context(), "Token generation auth failed: Invalid admin key", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.")
+				errResp.WriteJSON(w, http.StatusForbidden)
+				return
+			}
+			logger.Debug(r.Context(), "Token generation admin key authentication successful", "path", r.URL.Path)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+const (
+	adminTokenQueryParam = "token"
+)
+func AdminAuthMiddleware(authService *application.AuthService, logger domain.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tokenValue := r.URL.Query().Get(adminTokenQueryParam)
+			if tokenValue == "" {
+				logger.Warn(r.Context(), "Admin token authentication failed: 'token' query parameter missing", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrInvalidToken, "Admin token is required", "Provide 'token' in query parameter.")
+				errResp.WriteJSON(w, http.StatusForbidden)
+				return
+			}
+			adminCtx, err := authService.ProcessAdminToken(r.Context(), tokenValue)
+			if err != nil {
+				logger.Warn(r.Context(), "Admin token processing failed", "path", r.URL.Path, "error", err.Error())
+				var errCode domain.ErrorCode
+				var errMsg string
+				var errDetails string = err.Error()
+				httpStatus := http.StatusForbidden
+				var reasonForMetric string = "unknown_error"
+				switch {
+				case errors.Is(err, application.ErrTokenExpired):
+					errCode = domain.ErrInvalidToken
+					errMsg = "Admin token has expired."
+					reasonForMetric = "expired"
+				case errors.Is(err, crypto.ErrTokenDecryptionFailed),
+					errors.Is(err, application.ErrTokenPayloadInvalid),
+					errors.Is(err, crypto.ErrInvalidTokenFormat),
+					errors.Is(err, crypto.ErrCiphertextTooShort):
+					errCode = domain.ErrInvalidToken
+					errMsg = "Admin token is invalid or malformed."
+					errDetails = "Token format or content error."
+					reasonForMetric = "invalid_format_or_content"
+				case errors.Is(err, crypto.ErrInvalidAESKeySize),
+					strings.Contains(err.Error(), "application not configured for admin token decryption"):
+					errCode = domain.ErrInternal
+					errMsg = "Server configuration error processing admin token."
+					httpStatus = http.StatusInternalServerError
+					errDetails = "Internal server error."
+					reasonForMetric = "config_error_aes_key"
+				default:
+					logger.Error(r.Context(), "Unexpected internal error during admin token processing", "path", r.URL.Path, "detailed_error", err.Error())
+					errCode = domain.ErrInternal
+					errMsg = "An unexpected error occurred while processing admin token."
+					httpStatus = http.StatusInternalServerError
+					errDetails = "Internal server error."
+					reasonForMetric = "internal_server_error"
+				}
+				metrics.IncrementAuthFailure("admin", reasonForMetric)
+				domain.NewErrorResponse(errCode, errMsg, errDetails).WriteJSON(w, httpStatus)
+				return
+			}
+			metrics.IncrementAuthSuccess("admin")
+			newReqCtx := context.WithValue(r.Context(), contextkeys.AdminUserContextKey, adminCtx)
+			newReqCtx = context.WithValue(newReqCtx, contextkeys.UserIDKey, adminCtx.AdminID)
+			logger.Debug(r.Context(), "Admin token authentication successful",
+				"path", r.URL.Path,
+				"admin_id", adminCtx.AdminID,
+				"company_restriction", adminCtx.CompanyIDRestriction)
+			next.ServeHTTP(w, r.WithContext(newReqCtx))
+		})
+	}
+}
 ```
 
 ## File: internal/adapters/redis/kill_switch_pubsub.go
@@ -5469,90 +5469,6 @@ func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.S
 }
 ```
 
-## File: config/config.yaml
-```yaml
-server:
-  http_port: 8080
-  grpc_port: 50051
-  pod_id: "" # This should be set via ENV (e.g., POD_IP via Downward API)
-  enable_reflection: false # Default to false for production
-# NATS Configuration
-nats:
-  url: "nats://nats:4222"
-  stream_name: "wa_stream"
-  consumer_name: "ws_fanout"
-  connect_timeout_seconds: 5
-  reconnect_wait_seconds: 2
-  max_reconnects: 5
-  ping_interval_seconds: 120
-  max_pings_out: 2
-  retry_on_failed_connect: true
-redis:
-  address: "redis:6379"
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5
-log:
-  level: "info"
-auth:
-  secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE"
-  token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE"
-  token_generation_admin_key: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE"
-  token_cache_ttl_seconds: 30
-  admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
-  admin_token_cache_ttl_seconds: 60
-app:
-  service_name: "daisi-ws-service"
-  version: "1.0.0"
-  ping_interval_seconds: 20
-  shutdown_timeout_seconds: 30
-  pong_wait_seconds: 60
-  write_timeout_seconds: 30
-  max_missed_pongs: 2
-  session_ttl_seconds: 30
-  route_ttl_seconds: 300
-  ttl_refresh_interval_seconds: 10
-  nats_max_ack_pending: 5000
-  session_lock_retry_delay_ms: 250
-  nats_ack_wait_seconds: 30
-  grpc_client_forward_timeout_seconds: 5
-  read_timeout_seconds: 10
-  idle_timeout_seconds: 60
-  websocket_compression_mode: "disabled"
-  websocket_compression_threshold: 1024
-  websocket_development_insecure_skip_verify: false
-  grpc_pool_idle_timeout_seconds: 300
-  grpc_pool_health_check_interval_seconds: 60
-  grpc_circuitbreaker_fail_threshold: 5
-  grpc_circuitbreaker_open_duration_seconds: 30
-  websocket_message_buffer_size: 100
-  websocket_backpressure_drop_policy: "drop_oldest"
-  websocket_slow_client_latency_ms: 5000
-  websocket_slow_client_disconnect_threshold_ms: 30000
-adaptive_ttl:
-  session_lock:
-    enabled: false
-    min_ttl_seconds: 15
-    max_ttl_seconds: 30
-    activity_threshold_seconds: 120
-    active_ttl_seconds: 30
-    inactive_ttl_seconds: 15
-  message_route:
-    enabled: true
-    min_ttl_seconds: 300
-    max_ttl_seconds: 900
-    activity_threshold_seconds: 600
-    active_ttl_seconds: 900
-    inactive_ttl_seconds: 300
-  chat_route:
-    enabled: false
-    min_ttl_seconds: 1800
-    max_ttl_seconds: 7200
-    activity_threshold_seconds: 3600
-    active_ttl_seconds: 3600
-    inactive_ttl_seconds: 1800
-```
-
 ## File: internal/adapters/websocket/admin_handler.go
 ```go
 package websocket
@@ -5883,6 +5799,90 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 }
 ```
 
+## File: config/config.yaml
+```yaml
+server:
+  http_port: 8080
+  grpc_port: 50051
+  pod_id: "" # This should be set via ENV (e.g., POD_IP via Downward API)
+  enable_reflection: false # Default to false for production
+# NATS Configuration
+nats:
+  url: "nats://nats:4222"
+  stream_name: "wa_stream"
+  consumer_name: "ws_fanout"
+  connect_timeout_seconds: 5
+  reconnect_wait_seconds: 2
+  max_reconnects: 5
+  ping_interval_seconds: 120
+  max_pings_out: 2
+  retry_on_failed_connect: true
+redis:
+  address: "redis:6379"
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5
+log:
+  level: "info"
+auth:
+  secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE"
+  token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE"
+  admin_secret_token: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE"
+  token_cache_ttl_seconds: 30
+  admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
+  admin_token_cache_ttl_seconds: 60
+app:
+  service_name: "daisi-ws-service"
+  version: "1.0.0"
+  ping_interval_seconds: 20
+  shutdown_timeout_seconds: 30
+  pong_wait_seconds: 60
+  write_timeout_seconds: 30
+  max_missed_pongs: 2
+  session_ttl_seconds: 30
+  route_ttl_seconds: 300
+  ttl_refresh_interval_seconds: 10
+  nats_max_ack_pending: 5000
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5
+  read_timeout_seconds: 10
+  idle_timeout_seconds: 60
+  websocket_compression_mode: "disabled"
+  websocket_compression_threshold: 1024
+  websocket_development_insecure_skip_verify: false
+  grpc_pool_idle_timeout_seconds: 300
+  grpc_pool_health_check_interval_seconds: 60
+  grpc_circuitbreaker_fail_threshold: 5
+  grpc_circuitbreaker_open_duration_seconds: 30
+  websocket_message_buffer_size: 100
+  websocket_backpressure_drop_policy: "drop_oldest"
+  websocket_slow_client_latency_ms: 5000
+  websocket_slow_client_disconnect_threshold_ms: 30000
+adaptive_ttl:
+  session_lock:
+    enabled: false
+    min_ttl_seconds: 15
+    max_ttl_seconds: 30
+    activity_threshold_seconds: 120
+    active_ttl_seconds: 30
+    inactive_ttl_seconds: 15
+  message_route:
+    enabled: true
+    min_ttl_seconds: 300
+    max_ttl_seconds: 900
+    activity_threshold_seconds: 600
+    active_ttl_seconds: 900
+    inactive_ttl_seconds: 300
+  chat_route:
+    enabled: false
+    min_ttl_seconds: 1800
+    max_ttl_seconds: 7200
+    activity_threshold_seconds: 3600
+    active_ttl_seconds: 3600
+    inactive_ttl_seconds: 1800
+```
+
 ## File: internal/bootstrap/wire_gen.go
 ```go
 package bootstrap
@@ -5924,7 +5924,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	companyUserTokenGenerateHandler := GenerateTokenHandlerProvider(provider, domainLogger)
 	adminUserTokenGenerateHandler := GenerateAdminTokenHandlerProvider(provider, domainLogger)
-	tokenGenerationMiddleware := AdminAPIKeyAuthMiddlewareProvider(provider, domainLogger)
+	adminAPIKeyMiddleware := AdminAPIKeyAuthMiddlewareProvider(provider, domainLogger)
+	clientAPIKeyMiddleware := ClientAPIKeyAuthMiddlewareProvider(provider, domainLogger)
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
@@ -5940,7 +5941,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
 	conn := NatsConnectionProvider(natsConsumer)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, adminAPIKeyMiddleware, clientAPIKeyMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()
@@ -6003,7 +6004,7 @@ type LogConfig struct {
 type AuthConfig struct {
 	SecretToken               string `mapstructure:"secret_token"`
 	TokenAESKey               string `mapstructure:"token_aes_key"`
-	AdminSecretToken   string `mapstructure:"token_generation_admin_key"`
+	AdminSecretToken          string `mapstructure:"admin_secret_token"`
 	TokenCacheTTLSeconds      int    `mapstructure:"token_cache_ttl_seconds"`
 	AdminTokenAESKey          string `mapstructure:"admin_token_aes_key"`
 	AdminTokenCacheTTLSeconds int    `mapstructure:"admin_token_cache_ttl_seconds"`
@@ -6298,21 +6299,21 @@ func (a *App) Run(ctx context.Context) error {
 	} else {
 		a.logger.Warn(ctx, "WebSocket router is not initialized. WebSocket routes will not be available.")
 	}
-	if a.generateTokenHandler != nil && a.tokenGenerationMiddleware != nil {
+	if a.generateTokenHandler != nil && a.clientApiKeyMiddleware != nil {
 		handlerToWrap := http.HandlerFunc(a.generateTokenHandler)
-		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(handlerToWrap))
+		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.clientApiKeyMiddleware(handlerToWrap))
 		a.httpServeMux.Handle("POST /generate-token", finalGenerateTokenHandler)
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {
-		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
+		a.logger.Error(ctx, "GenerateTokenHandler or clientApiKeyMiddleware not initialized. /generate-token endpoint will not be available.")
 	}
-	if a.generateAdminTokenHandler != nil && a.tokenGenerationMiddleware != nil {
+	if a.generateAdminTokenHandler != nil && a.adminAPIKeyMiddleware != nil {
 		adminHandlerToWrap := http.HandlerFunc(a.generateAdminTokenHandler)
-		finalAdminGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(adminHandlerToWrap))
+		finalAdminGenerateTokenHandler := middleware.RequestIDMiddleware(a.adminAPIKeyMiddleware(adminHandlerToWrap))
 		a.httpServeMux.Handle("POST /admin/generate-token", finalAdminGenerateTokenHandler)
 		a.logger.Info(ctx, "/admin/generate-token endpoint registered")
 	} else {
-		a.logger.Error(ctx, "GenerateAdminTokenHandler or TokenGenerationMiddleware not initialized. /admin/generate-token endpoint will not be available.")
+		a.logger.Error(ctx, "GenerateAdminTokenHandler or adminAPIKeyMiddleware not initialized. /admin/generate-token endpoint will not be available.")
 	}
 	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil {
 		apiKeyAuth := middleware.APIKeyAuthMiddleware(a.configProvider, a.logger)
@@ -6411,7 +6412,8 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 )
-type TokenGenerationMiddleware func(http.Handler) http.Handler
+type AdminAPIKeyMiddleware func(http.Handler) http.Handler
+type ClientAPIKeyMiddleware func(http.Handler) http.Handler
 type AdminAuthMiddleware func(http.Handler) http.Handler
 type CompanyUserTokenGenerateHandler http.HandlerFunc
 type AdminUserTokenGenerateHandler http.HandlerFunc
@@ -6444,7 +6446,8 @@ type App struct {
 	grpcServer                *appgrpc.Server
 	generateTokenHandler      CompanyUserTokenGenerateHandler
 	generateAdminTokenHandler AdminUserTokenGenerateHandler
-	tokenGenerationMiddleware TokenGenerationMiddleware
+	adminAPIKeyMiddleware     AdminAPIKeyMiddleware
+	clientApiKeyMiddleware    ClientAPIKeyMiddleware
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
 	natsConsumerAdapter       domain.NatsConsumer
@@ -6461,7 +6464,8 @@ func NewApp(
 	grpcSrv *appgrpc.Server,
 	genTokenHandler CompanyUserTokenGenerateHandler,
 	genAdminTokenHandler AdminUserTokenGenerateHandler,
-	tokenGenMiddleware TokenGenerationMiddleware,
+	adminAPIKeyMiddleware AdminAPIKeyMiddleware,
+	clientApiKeyMiddleware ClientAPIKeyMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
 	natsAdapter domain.NatsConsumer,
@@ -6478,7 +6482,8 @@ func NewApp(
 		grpcServer:                grpcSrv,
 		generateTokenHandler:      genTokenHandler,
 		generateAdminTokenHandler: genAdminTokenHandler,
-		tokenGenerationMiddleware: tokenGenMiddleware,
+		adminAPIKeyMiddleware:     adminAPIKeyMiddleware,
+		clientApiKeyMiddleware:    clientApiKeyMiddleware,
 		wsRouter:                  wsRouter,
 		connectionManager:         connManager,
 		natsConsumerAdapter:       natsAdapter,
@@ -6540,8 +6545,11 @@ func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Log
 func GenerateAdminTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) AdminUserTokenGenerateHandler {
 	return AdminUserTokenGenerateHandler(apphttp.GenerateAdminTokenHandler(cfgProvider, logger))
 }
-func AdminAPIKeyAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) TokenGenerationMiddleware {
+func AdminAPIKeyAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) AdminAPIKeyMiddleware {
 	return middleware.AdminAPIKeyAuthMiddleware(cfgProvider, logger)
+}
+func ClientAPIKeyAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) ClientAPIKeyMiddleware {
+	return middleware.APIKeyAuthMiddleware(cfgProvider, logger)
 }
 func AdminAuthMiddlewareProvider(authService *application.AuthService, logger domain.Logger) AdminAuthMiddleware {
 	return middleware.AdminAuthMiddleware(authService, logger)
@@ -6634,6 +6642,7 @@ var ProviderSet = wire.NewSet(
 	GenerateTokenHandlerProvider,
 	GenerateAdminTokenHandlerProvider,
 	AdminAPIKeyAuthMiddlewareProvider,
+	ClientAPIKeyAuthMiddlewareProvider,
 	WebsocketHandlerProvider,
 	WebsocketRouterProvider,
 	RedisClientProvider,

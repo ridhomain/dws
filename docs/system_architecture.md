@@ -112,6 +112,10 @@ graph TD
 
 *   **`internal/adapters/websocket/Router`:** WebSocket route registration with middleware chains
 
+#### HTTP Middleware
+*   **`internal/adapters/middleware/AdminAPIKeyAuthMiddleware`:** Admin API key validation middleware for `/admin/generate-token` endpoint
+*   **`internal/adapters/middleware/APIKeyAuthMiddleware`:** General API key validation middleware for `/generate-token` endpoint
+
 #### Core Business Logic
 *   **`internal/application/ConnectionManager`:** Central orchestrator managing:
     - Active connections registry (`sync.Map`)
@@ -194,7 +198,7 @@ sequenceDiagram
     participant KillSwitch as Kill Switch Publisher
 
     Client->>Router: WebSocket Connect (/ws/company123/agent456?token=...&x-api-key=...)
-    Router->>Auth: Validate API key middleware
+    Router->>Auth: Validate general API key middleware
     Router->>Auth: Validate user token middleware
     Auth->>Redis: GET token_cache:sha256(token)
     
@@ -308,7 +312,7 @@ sequenceDiagram
     participant Redis
 
     AdminClient->>AdminHandler: WebSocket Connect (/ws/admin?token=...&x-api-key=...)
-    AdminHandler->>Auth: Validate API key middleware
+    AdminHandler->>Auth: Validate admin API key middleware
     AdminHandler->>Auth: ProcessAdminToken(tokenB64)
     
     Auth->>Redis: GET token_cache:admin_sha256(token)
@@ -345,6 +349,53 @@ sequenceDiagram
     else Admin lock failed (admin already connected)
         Redis-->>ConnMgr: 0 (failed)
         AdminHandler->>AdminClient: Close with SessionConflict error
+    end
+```
+
+### 3.4 Token Generation Endpoints with Dual Authentication
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant UserTokenEndpoint as /generate-token
+    participant AdminTokenEndpoint as /admin/generate-token
+    participant GeneralAPIKeyMiddleware as General API Key Middleware
+    participant AdminAPIKeyMiddleware as Admin API Key Middleware
+    participant AuthService as Auth Service
+    participant Config as Config Provider
+
+    Note over Client, Config: User Token Generation Flow
+    Client->>UserTokenEndpoint: POST /generate-token (X-API-Key: general_secret)
+    UserTokenEndpoint->>GeneralAPIKeyMiddleware: Validate API Key
+    GeneralAPIKeyMiddleware->>Config: Get auth.secret_token
+    Config-->>GeneralAPIKeyMiddleware: Return secret_token
+    
+    alt Valid general API key
+        GeneralAPIKeyMiddleware-->>UserTokenEndpoint: API key valid
+        UserTokenEndpoint->>AuthService: GenerateUserToken(company_id, agent_id, user_id)
+        AuthService->>Config: Get auth.token_aes_key
+        AuthService->>AuthService: Encrypt token with AES-GCM
+        AuthService-->>UserTokenEndpoint: Return encrypted token
+        UserTokenEndpoint-->>Client: {token: "encrypted_user_token"}
+    else Invalid general API key
+        GeneralAPIKeyMiddleware-->>Client: 403 Forbidden
+    end
+    
+    Note over Client, Config: Admin Token Generation Flow
+    Client->>AdminTokenEndpoint: POST /admin/generate-token (X-API-Key: admin_secret)
+    AdminTokenEndpoint->>AdminAPIKeyMiddleware: Validate Admin API Key
+    AdminAPIKeyMiddleware->>Config: Get auth.admin_secret_token
+    Config-->>AdminAPIKeyMiddleware: Return admin_secret_token
+    
+    alt Valid admin API key
+        AdminAPIKeyMiddleware-->>AdminTokenEndpoint: Admin API key valid
+        AdminTokenEndpoint->>AuthService: GenerateAdminToken(admin_id, restrictions)
+        AuthService->>Config: Get auth.admin_token_aes_key
+        AuthService->>AuthService: Encrypt admin token with AES-GCM
+        AuthService-->>AdminTokenEndpoint: Return encrypted admin token
+        AdminTokenEndpoint-->>Client: {token: "encrypted_admin_token"}
+    else Invalid admin API key
+        AdminAPIKeyMiddleware-->>Client: 403 Forbidden
     end
 ```
 
@@ -473,7 +524,7 @@ auth:
   secret_token: ""  # Set via DAISI_WS_AUTH_SECRET_TOKEN
   token_aes_key: ""  # Set via DAISI_WS_AUTH_TOKEN_AES_KEY (64-char hex)
   admin_token_aes_key: ""  # Set via DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY
-  token_generation_admin_key: ""  # Set via DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY
+  admin_secret_token: ""  # Set via DAISI_WS_AUTH_ADMIN_SECRET_TOKEN
   token_cache_ttl_seconds: 30
   admin_token_cache_ttl_seconds: 60
 
@@ -502,6 +553,7 @@ DAISI_WS_NATS_URL=nats://localhost:4222
 DAISI_WS_REDIS_ADDRESS=localhost:6379
 DAISI_WS_AUTH_SECRET_TOKEN=your-secret-token
 DAISI_WS_AUTH_TOKEN_AES_KEY=your-64-char-hex-key
+DAISI_WS_AUTH_ADMIN_SECRET_TOKEN=your-admin-secret-token
 ```
 
 ## 6. Observability and Monitoring
@@ -585,12 +637,24 @@ spec:
 
 ## 8. Security Architecture
 
-### Authentication Flow
-1. **API Key Validation:** Static secret token verification
-2. **Token Decryption:** AES-GCM decryption with environment-specific keys
+### Dual Authentication System
+The service implements separate authentication flows for user and admin operations:
+
+#### User Authentication Flow
+1. **General API Key Validation:** Using `secret_token` for user operations
+2. **User Token Decryption:** AES-GCM decryption with `token_aes_key`
 3. **Token Validation:** Expiration and required field checks
-4. **Context Caching:** Redis-based caching with appropriate TTL
+4. **Context Caching:** Redis-based caching with 30s TTL
 5. **Session Management:** Exclusive session enforcement with conflict resolution
+
+#### Admin Authentication Flow
+1. **Admin API Key Validation:** Using `admin_secret_token` for admin operations
+2. **Admin Token Decryption:** AES-GCM decryption with `admin_token_aes_key`
+3. **Token Validation:** Expiration and admin-specific field checks
+4. **Context Caching:** Redis-based caching with 60s TTL
+5. **Session Management:** Exclusive admin session enforcement
+
+This dual system provides security isolation between user and administrative operations.
 
 ### Security Measures
 *   **Encryption:** AES-256-GCM for token encryption

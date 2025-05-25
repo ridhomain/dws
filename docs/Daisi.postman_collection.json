@@ -66,6 +66,28 @@
 				},
 				{
 					"name": "Generate User Token",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"// Parse the response body",
+									"var jsonData = pm.response.json();",
+									"",
+									"// Extract the token",
+									"var token = jsonData.token;",
+									"",
+									"// Set the token as a collection variable",
+									"pm.collectionVariables.set(\"userToken\", token);",
+									"",
+									"// Optional: Log to the Postman console for verification",
+									"console.log(\"userToken token set to: \" + token);"
+								],
+								"type": "text/javascript",
+								"packages": {}
+							}
+						}
+					],
 					"request": {
 						"method": "POST",
 						"header": [
@@ -82,7 +104,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n    \"user_id\": \"testuser123\",\n    \"company_id\": \"{{companyId}}\"\n}",
+							"raw": "{\n    \"user_id\": \"testuser123\",\n    \"agent_id\": \"{{agentId}}\",\n    \"company_id\": \"{{companyId}}\",\n    \"expires_in_seconds\": 3600\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -104,12 +126,34 @@
 				},
 				{
 					"name": "Generate Admin Token",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"// Parse the response body",
+									"var jsonData = pm.response.json();",
+									"",
+									"// Extract the token",
+									"var token = jsonData.token;",
+									"",
+									"// Set the token as a collection variable",
+									"pm.collectionVariables.set(\"adminToken\", token);",
+									"",
+									"// Optional: Log to the Postman console for verification",
+									"console.log(\"Admin token set to: \" + token);"
+								],
+								"type": "text/javascript",
+								"packages": {}
+							}
+						}
+					],
 					"request": {
 						"method": "POST",
 						"header": [
 							{
 								"key": "X-API-Key",
-								"value": "{{apiKey}}",
+								"value": "{{adminApiKey}}",
 								"type": "text"
 							},
 							{
@@ -120,7 +164,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n    \"admin_user_id\": \"admin007\"\n}",
+							"raw": "{\n    \"admin_id\": \"admin007\",\n    \"expires_in_seconds\": 3600\n}",
 							"options": {
 								"raw": {
 									"language": "json"
@@ -212,7 +256,7 @@
 						"header": [
 							{
 								"key": "X-API-Key",
-								"value": "{{apiKey}}",
+								"value": "{{adminApiKey}}",
 								"type": "text"
 							}
 						],
@@ -398,6 +442,11 @@
 		{
 			"key": "agentId",
 			"value": "ac69abef-a118-4d59-aea3-d98537e5bc7e",
+			"type": "string"
+		},
+		{
+			"key": "adminApiKey",
+			"value": "SDzNfhTMqhnEGSp8mze4YpXt5RYXTidX",
 			"type": "string"
 		}
 	]

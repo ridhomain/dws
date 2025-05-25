@@ -79,18 +79,18 @@ The application uses `config/config.yaml` for its configuration. You'll need to 
     Generate secure random strings for the API tokens:
     
     ```bash
-    # Generate a 32-character random string for the secret token
+    # Generate a 32-character random string for the general secret token
     openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32
     
-    # Generate another 32-character string for the token generation admin key
+    # Generate another 32-character string for the admin secret token
     openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32
     ```
     
     Update `config.yaml` with these generated values:
     ```yaml
     auth:
-      secret_token: "generated_secret_token_here"
-      token_generation_admin_key: "generated_admin_key_here"
+      secret_token: "generated_general_secret_token_here"
+      admin_secret_token: "generated_admin_secret_token_here"
     ```
 
 3.  **Pod Identity:**
