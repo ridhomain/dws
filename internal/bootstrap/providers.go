@@ -26,7 +26,8 @@ import (
 )
 
 // Define distinct types for middlewares to help Wire differentiate them
-type TokenGenerationMiddleware func(http.Handler) http.Handler
+type AdminAPIKeyMiddleware func(http.Handler) http.Handler
+type ClientAPIKeyMiddleware func(http.Handler) http.Handler
 type AdminAuthMiddleware func(http.Handler) http.Handler // New type for AdminAuthMiddleware
 
 // Define distinct types for specific http.HandlerFunc roles
@@ -81,7 +82,8 @@ type App struct {
 	grpcServer                *appgrpc.Server                 // Added gRPC Server
 	generateTokenHandler      CompanyUserTokenGenerateHandler // Updated type
 	generateAdminTokenHandler AdminUserTokenGenerateHandler   // Updated type
-	tokenGenerationMiddleware TokenGenerationMiddleware       // This is a type alias already func(http.Handler) http.Handler
+	adminAPIKeyMiddleware     AdminAPIKeyMiddleware           // This is a type alias already func(http.Handler) http.Handler
+	clientApiKeyMiddleware    ClientAPIKeyMiddleware          // This is a type alias already func(http.Handler) http.Handler
 	wsRouter                  *wsadapter.Router
 	connectionManager         *application.ConnectionManager
 	natsConsumerAdapter       domain.NatsConsumer     // Changed from *appnats.ConsumerAdapter
@@ -102,7 +104,8 @@ func NewApp(
 	grpcSrv *appgrpc.Server, // Added gRPC Server
 	genTokenHandler CompanyUserTokenGenerateHandler, // Updated type
 	genAdminTokenHandler AdminUserTokenGenerateHandler, // Updated type
-	tokenGenMiddleware TokenGenerationMiddleware,
+	adminAPIKeyMiddleware AdminAPIKeyMiddleware,
+	clientApiKeyMiddleware ClientAPIKeyMiddleware,
 	wsRouter *wsadapter.Router,
 	connManager *application.ConnectionManager,
 	natsAdapter domain.NatsConsumer, // Changed from *appnats.ConsumerAdapter
@@ -119,7 +122,8 @@ func NewApp(
 		grpcServer:                grpcSrv,              // Added gRPC Server
 		generateTokenHandler:      genTokenHandler,      // Use updated type
 		generateAdminTokenHandler: genAdminTokenHandler, // Use updated type
-		tokenGenerationMiddleware: tokenGenMiddleware,
+		adminAPIKeyMiddleware:     adminAPIKeyMiddleware,
+		clientApiKeyMiddleware:    clientApiKeyMiddleware,
 		wsRouter:                  wsRouter,
 		connectionManager:         connManager,
 		natsConsumerAdapter:       natsAdapter,
@@ -206,10 +210,16 @@ func GenerateAdminTokenHandlerProvider(cfgProvider config.Provider, logger domai
 	return AdminUserTokenGenerateHandler(apphttp.GenerateAdminTokenHandler(cfgProvider, logger))
 }
 
-// TokenGenerationAuthMiddlewareProvider Provider
-func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) TokenGenerationMiddleware {
+// AdminAPIKeyAuthMiddlewareProvider Provider
+func AdminAPIKeyAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) AdminAPIKeyMiddleware {
 	// Corrected: Pass the cfgProvider directly, the middleware will extract the key.
-	return middleware.TokenGenerationAuthMiddleware(cfgProvider, logger)
+	return middleware.AdminAPIKeyAuthMiddleware(cfgProvider, logger)
+}
+
+// ClientAPIKeyAuthMiddlewareProvider Provider
+func ClientAPIKeyAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) ClientAPIKeyMiddleware {
+	// Corrected: Pass the cfgProvider directly, the middleware will extract the key.
+	return middleware.APIKeyAuthMiddleware(cfgProvider, logger)
 }
 
 // AdminAuthMiddlewareProvider provides the middleware for admin WebSocket authentication.
@@ -340,7 +350,8 @@ var ProviderSet = wire.NewSet(
 	// HTTP Handlers and Middleware
 	GenerateTokenHandlerProvider,
 	GenerateAdminTokenHandlerProvider,
-	TokenGenerationAuthMiddlewareProvider,
+	AdminAPIKeyAuthMiddlewareProvider,
+	ClientAPIKeyAuthMiddlewareProvider,
 
 	// WebSocket Components
 	WebsocketHandlerProvider,

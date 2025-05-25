@@ -50,7 +50,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	companyUserTokenGenerateHandler := GenerateTokenHandlerProvider(provider, domainLogger)
 	adminUserTokenGenerateHandler := GenerateAdminTokenHandlerProvider(provider, domainLogger)
-	tokenGenerationMiddleware := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
+	adminAPIKeyMiddleware := AdminAPIKeyAuthMiddlewareProvider(provider, domainLogger)
+	clientAPIKeyMiddleware := ClientAPIKeyAuthMiddlewareProvider(provider, domainLogger)
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
@@ -66,7 +67,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
 	conn := NatsConnectionProvider(natsConsumer)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, tokenGenerationMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, adminAPIKeyMiddleware, clientAPIKeyMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()

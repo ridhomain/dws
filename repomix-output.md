@@ -2153,13 +2153,13 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
 )
-func TokenGenerationAuthMiddleware(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
+func AdminAPIKeyAuthMiddleware(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			adminApiKey := r.Header.Get(apiKeyHeaderName)
 			cfg := cfgProvider.Get()
-			if cfg == nil || cfg.Auth.TokenGenerationAdminKey == "" {
-				logger.Error(r.Context(), "Token generation auth failed: TokenGenerationAdminKey not configured", "path", r.URL.Path)
+			if cfg == nil || cfg.Auth.AdminSecretToken == "" {
+				logger.Error(r.Context(), "Token generation auth failed: AdminSecretToken not configured", "path", r.URL.Path)
 				errResp := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token generation auth cannot be performed.")
 				errResp.WriteJSON(w, http.StatusInternalServerError)
 				return
@@ -2170,7 +2170,7 @@ func TokenGenerationAuthMiddleware(cfgProvider config.Provider, logger domain.Lo
 				errResp.WriteJSON(w, http.StatusUnauthorized)
 				return
 			}
-			if adminApiKey != cfg.Auth.TokenGenerationAdminKey {
+			if adminApiKey != cfg.Auth.AdminSecretToken {
 				logger.Warn(r.Context(), "Token generation auth failed: Invalid admin key", "path", r.URL.Path)
 				errResp := domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.")
 				errResp.WriteJSON(w, http.StatusForbidden)
@@ -5924,7 +5924,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	companyUserTokenGenerateHandler := GenerateTokenHandlerProvider(provider, domainLogger)
 	adminUserTokenGenerateHandler := GenerateAdminTokenHandlerProvider(provider, domainLogger)
-	tokenGenerationMiddleware := TokenGenerationAuthMiddlewareProvider(provider, domainLogger)
+	tokenGenerationMiddleware := AdminAPIKeyAuthMiddlewareProvider(provider, domainLogger)
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
@@ -6003,7 +6003,7 @@ type LogConfig struct {
 type AuthConfig struct {
 	SecretToken               string `mapstructure:"secret_token"`
 	TokenAESKey               string `mapstructure:"token_aes_key"`
-	TokenGenerationAdminKey   string `mapstructure:"token_generation_admin_key"`
+	AdminSecretToken   string `mapstructure:"token_generation_admin_key"`
 	TokenCacheTTLSeconds      int    `mapstructure:"token_cache_ttl_seconds"`
 	AdminTokenAESKey          string `mapstructure:"admin_token_aes_key"`
 	AdminTokenCacheTTLSeconds int    `mapstructure:"admin_token_cache_ttl_seconds"`
@@ -6540,8 +6540,8 @@ func GenerateTokenHandlerProvider(cfgProvider config.Provider, logger domain.Log
 func GenerateAdminTokenHandlerProvider(cfgProvider config.Provider, logger domain.Logger) AdminUserTokenGenerateHandler {
 	return AdminUserTokenGenerateHandler(apphttp.GenerateAdminTokenHandler(cfgProvider, logger))
 }
-func TokenGenerationAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) TokenGenerationMiddleware {
-	return middleware.TokenGenerationAuthMiddleware(cfgProvider, logger)
+func AdminAPIKeyAuthMiddlewareProvider(cfgProvider config.Provider, logger domain.Logger) TokenGenerationMiddleware {
+	return middleware.AdminAPIKeyAuthMiddleware(cfgProvider, logger)
 }
 func AdminAuthMiddlewareProvider(authService *application.AuthService, logger domain.Logger) AdminAuthMiddleware {
 	return middleware.AdminAuthMiddleware(authService, logger)
@@ -6633,7 +6633,7 @@ var ProviderSet = wire.NewSet(
 	InitialZapLoggerProvider,
 	GenerateTokenHandlerProvider,
 	GenerateAdminTokenHandlerProvider,
-	TokenGenerationAuthMiddlewareProvider,
+	AdminAPIKeyAuthMiddlewareProvider,
 	WebsocketHandlerProvider,
 	WebsocketRouterProvider,
 	RedisClientProvider,
