@@ -81,7 +81,7 @@ The service follows clean architecture principles with distinct layers:
    
    # Generate API secret tokens (32-character random strings)
    openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32  # For SECRET_TOKEN
-   openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32  # For TOKEN_GENERATION_ADMIN_KEY
+   openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32  # For ADMIN_SECRET_TOKEN
    ```
 
 4. **Set environment variables** (or add to your .env file):
@@ -89,7 +89,7 @@ The service follows clean architecture principles with distinct layers:
    export DAISI_WS_AUTH_SECRET_TOKEN=<generated_secret_token>
    export DAISI_WS_AUTH_TOKEN_AES_KEY=<generated_token_aes_key>
    export DAISI_WS_AUTH_ADMIN_TOKEN_AES_KEY=<generated_admin_token_aes_key>
-   export DAISI_WS_AUTH_TOKEN_GENERATION_ADMIN_KEY=<generated_token_generation_admin_key>
+   export DAISI_WS_AUTH_ADMIN_SECRET_TOKEN=<generated_admin_secret_token>
    ```
 
 ### Running with Docker Compose
@@ -145,13 +145,22 @@ make wire
 | `/ws/{company}/{agent}` | User WebSocket connection | API Key + User Token | `token`, `x-api-key` (header or query) |
 | `/ws/admin` | Admin WebSocket connection | API Key + Admin Token | `token`, `x-api-key` (header or query) |
 
+## Authentication System
+
+The service implements a dual authentication system with separate API keys for different purposes:
+
+- **General API Key (`secret_token`)**: Used for generating user tokens and general WebSocket connections
+- **Admin API Key (`admin_secret_token`)**: Used exclusively for generating admin tokens and administrative operations
+
+This separation ensures better security isolation between user and admin operations.
+
 ## Token Generation
 
 ### User Token Generation
 
 ```bash
 curl -X POST http://localhost:8080/generate-token \
-  -H "X-API-Key: your-admin-key" \
+  -H "X-API-Key: your-general-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "company_id": "company123",
@@ -165,7 +174,7 @@ curl -X POST http://localhost:8080/generate-token \
 
 ```bash
 curl -X POST http://localhost:8080/admin/generate-token \
-  -H "X-API-Key: your-admin-key" \
+  -H "X-API-Key: your-admin-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "admin_id": "admin123",
@@ -301,6 +310,7 @@ redis:
 auth:
   secret_token: ""  # Set via environment
   token_aes_key: ""  # Set via environment
+  admin_secret_token: ""  # Set via environment
   admin_token_aes_key: ""  # Set via environment
   token_cache_ttl_seconds: 30
 
@@ -338,6 +348,7 @@ DAISI_WS_NATS_URL=nats://localhost:4222
 DAISI_WS_REDIS_ADDRESS=localhost:6379
 DAISI_WS_AUTH_SECRET_TOKEN=your-secret-token
 DAISI_WS_AUTH_TOKEN_AES_KEY=your-64-char-hex-key
+DAISI_WS_AUTH_ADMIN_SECRET_TOKEN=your-admin-secret-token
 ```
 
 ## NATS Integration

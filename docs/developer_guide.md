@@ -8,7 +8,8 @@ This guide provides instructions and information for developers working on the D
 2.  [Project Structure Overview](#2-project-structure-overview)
 3.  [Development Workflow](#3-development-workflow)
 4.  [Testing Approach](#4-testing-approach)
-5.  [Common Troubleshooting Steps](#5-common-troubleshooting-steps)
+5.  [Benchmark Testing](#5-benchmark-testing)
+6.  [Common Troubleshooting Steps](#6-common-troubleshooting-steps)
 
 ## 1. Setup Instructions
 
@@ -79,18 +80,18 @@ The application uses `config/config.yaml` for its configuration. You'll need to 
     Generate secure random strings for the API tokens:
     
     ```bash
-    # Generate a 32-character random string for the secret token
+    # Generate a 32-character random string for the general secret token
     openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32
     
-    # Generate another 32-character string for the token generation admin key
+    # Generate another 32-character string for the admin secret token
     openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 32
     ```
     
     Update `config.yaml` with these generated values:
     ```yaml
     auth:
-      secret_token: "generated_secret_token_here"
-      token_generation_admin_key: "generated_admin_key_here"
+      secret_token: "generated_general_secret_token_here"
+      admin_secret_token: "generated_admin_secret_token_here"
     ```
 
 3.  **Pod Identity:**
@@ -155,10 +156,28 @@ If the project includes a Makefile, here are common commands that might be avail
 *   `make generate`: Runs `go generate ./...` (useful for tools like Wire).
 *   `make clean`: Cleans up build artifacts.
 
+#### Benchmark Commands
+
+*   `make benchmark`: Runs all benchmark tests with profiling.
+*   `make benchmark-auth`: Runs authentication benchmark tests only.
+*   `make benchmark-conn`: Runs connection management benchmark tests only.
+*   `make benchmark-msg`: Runs message processing benchmark tests only.
+*   `make benchmark-integration`: Runs integration benchmark tests only.
+*   `make benchmark-compare`: Compares current benchmark results with baseline.
+*   `make benchmark-clean`: Cleans benchmark results and profiles.
+
 ## 2. Project Structure Overview
 
 ```
 daisi-ws-service/
+├── benchmarks/                        # Performance benchmark tests
+│   ├── mocks/                         # Mock implementations for benchmarking
+│   ├── utils/                         # Benchmark utilities and helpers
+│   ├── auth_bench_test.go             # Authentication benchmarks
+│   ├── connection_bench_test.go       # Connection management benchmarks
+│   ├── integration_bench_test.go      # Integration scenario benchmarks
+│   ├── message_bench_test.go          # Message processing benchmarks
+│   └── session_bench_test.go          # Session management benchmarks
 ├── cmd/                               # Main application entrypoints
 │   └── daisi-ws-service/
 │       └── main.go                    # Application bootstrap and startup
@@ -211,6 +230,9 @@ daisi-ws-service/
 │   ├── crypto/                        # Cryptography utilities
 │   ├── rediskeys/                     # Redis key generation utilities
 │   └── safego/                        # Safe goroutine execution
+├── scripts/                           # Development and automation scripts
+│   ├── run-benchmarks.sh              # Comprehensive benchmark runner
+│   └── benchmark-compare.sh           # Benchmark comparison utility
 ├── docker-compose.yml                 # Docker Compose configuration
 ├── Dockerfile                         # Dockerfile for building the application image
 ├── go.mod                             # Go module definition
@@ -236,6 +258,8 @@ The typical development workflow involves:
     *   Write unit tests for new logic (place `_test.go` files alongside the code being tested).
     *   Ensure tests cover both happy paths and error conditions.
     *   Run tests using `go test ./...`.
+    *   For performance-critical changes, run relevant benchmarks: `make benchmark-auth`, `make benchmark-conn`, etc.
+    *   If adding new components, consider adding corresponding benchmarks in the `benchmarks/` directory.
 6.  **Protocol Buffers:** If modifying gRPC interfaces:
     *   Update the `.proto` files in `internal/adapters/grpc/proto/`.
     *   Run the protobuf compiler to generate updated Go code.
@@ -326,7 +350,285 @@ The project employs a combination of unit and integration tests.
     go tool cover -html=coverage.out -o coverage.html
     ```
 
-## 5. Common Troubleshooting Steps
+## 5. Benchmark Testing
+
+The service includes a comprehensive benchmark suite that measures performance across all major components. This section covers how to run, interpret, and troubleshoot benchmark tests.
+
+### Benchmark Overview
+
+The benchmark suite provides performance testing for:
+
+- **Authentication**: Token validation, cache performance, concurrent access
+- **Connection Management**: Registration, deregistration, lifecycle, memory usage
+- **Message Processing**: NATS processing, WebSocket broadcasting, client routing
+- **Session Management**: Locks, route registry, kill switch, conflict resolution
+- **Integration Scenarios**: End-to-end flows, high-load testing, memory pressure
+
+### Running Benchmarks
+
+#### Using Makefile (Recommended)
+
+The project includes convenient Makefile targets for running benchmarks:
+
+```bash
+# Run all benchmarks with profiling
+make benchmark
+
+# Run specific benchmark categories
+make benchmark-auth          # Authentication benchmarks only
+make benchmark-conn          # Connection management benchmarks only  
+make benchmark-msg           # Message processing benchmarks only
+make benchmark-integration   # Integration benchmarks only
+
+# Compare with baseline results
+make benchmark-compare
+
+# Clean benchmark results
+make benchmark-clean
+```
+
+#### Manual Execution
+
+For more control over benchmark execution:
+
+```bash
+# Run all benchmarks
+go test -bench=. ./benchmarks/
+
+# Run specific benchmarks with custom settings
+go test -bench=BenchmarkUserTokenValidation -benchtime=10s -count=3 ./benchmarks/
+
+# Run with profiling
+go test -bench=. -cpuprofile=cpu.prof -memprofile=mem.prof ./benchmarks/
+
+# Run integration benchmarks only
+go test -bench="BenchmarkFullUserFlow|BenchmarkMessageFlow" ./benchmarks/
+
+# Run with short benchmark time for quick testing
+go test -bench=. -benchtime=1s ./benchmarks/
+```
+
+#### Benchmark Parameters
+
+Common benchmark flags:
+
+- `-bench=<pattern>`: Run benchmarks matching the pattern
+- `-benchtime=<duration>`: Run each benchmark for specified duration (e.g., `5s`, `10s`)
+- `-count=<n>`: Run each benchmark n times for statistical reliability
+- `-cpuprofile=<file>`: Generate CPU profiling data
+- `-memprofile=<file>`: Generate memory profiling data
+- `-benchmem`: Include memory allocation statistics
+
+### Interpreting Results
+
+#### Sample Output
+
+```
+BenchmarkUserTokenValidation/ValidToken-10                491000               701.3 ns/op
+BenchmarkFullUserFlow/SingleUserFlow-10                    68467             16549 ns/op
+BenchmarkMessageFlow/SingleMessageFlow-10                 108180              4662 ns/op
+BenchmarkHighLoadScenario/HighConcurrencyLoad-10              43          10452520 ns/op
+```
+
+#### Understanding Metrics
+
+- **First number** (e.g., `491000`): Number of iterations run
+- **Second number** (e.g., `701.3 ns/op`): Nanoseconds per operation
+- **-10**: Number of CPU cores used (GOMAXPROCS)
+
+#### Performance Baselines
+
+Expected performance ranges based on benchmark results:
+
+```yaml
+Authentication:
+  token_validation: "500-1000 ns/op"    # 1M+ ops/sec
+  cache_hit_ratio: "86-93%"             # High cache efficiency
+
+Message Processing:
+  single_message: "4000-7000 ns/op"     # 145-250K messages/sec
+  bulk_processing: "2500-6000 ns/op"    # 167-400K messages/sec
+
+Connection Management:
+  registration: "3000-6000 ns/op"       # 167-333K registrations/sec
+  full_lifecycle: "5000-7000 ns/op"     # 143-200K lifecycles/sec
+
+Integration Flows:
+  user_flow: "15000-35000 ns/op"        # 29-67K flows/sec
+  session_conflict: "20000-30000 ns/op" # 33-50K conflicts/sec
+
+High Load:
+  concurrent_1000_users: "~10ms/op"     # 100 full flows/sec
+  memory_5000_conns: "~11ms/op"         # Memory pressure test
+```
+
+### Profiling and Analysis
+
+#### Generating Profiles
+
+```bash
+# Generate CPU and memory profiles
+go test -bench=BenchmarkFullUserFlow -cpuprofile=cpu.prof -memprofile=mem.prof ./benchmarks/
+
+# Analyze CPU profile
+go tool pprof cpu.prof
+# Interactive commands in pprof:
+# top10          - Show top 10 functions by CPU usage
+# list <func>    - Show source code for function
+# web           - Generate SVG call graph (requires graphviz)
+
+# Analyze memory profile
+go tool pprof mem.prof
+# Common commands:
+# top10 -cum     - Show top 10 by cumulative allocation
+# list <func>    - Show memory allocations in function
+```
+
+#### Profile Analysis Tips
+
+1. **CPU Hotspots**: Look for functions consuming >5% of CPU time
+2. **Memory Leaks**: Check for unexpectedly high allocations
+3. **Goroutine Bottlenecks**: Use `-blockprofile` to find blocking operations
+4. **Comparison**: Compare profiles before/after optimization changes
+
+### Performance Regression Testing
+
+#### Establishing Baselines
+
+```bash
+# Run benchmarks and save baseline
+make benchmark > baseline.txt
+
+# Compare current performance against baseline
+make benchmark > current.txt
+./scripts/benchmark-compare.sh baseline.txt current.txt
+```
+
+#### Regression Thresholds
+
+Watch for performance degradation:
+
+- **>20% slower**: Investigate immediately
+- **>10% slower**: Review and monitor
+- **>5% slower**: Acceptable for most changes
+- **Faster**: Potential improvement (verify correctness)
+
+### Benchmark Development
+
+#### Adding New Benchmarks
+
+1. **Create benchmark function**:
+```go
+func BenchmarkNewFeature(b *testing.B) {
+    // Setup
+    service := setupTestService()
+    
+    b.ResetTimer()
+    for i := 0; i < b.N; i++ {
+        // Code to benchmark
+        result := service.ProcessSomething()
+        if result == nil {
+            b.Fatal("unexpected nil result")
+        }
+    }
+}
+```
+
+2. **Follow naming conventions**:
+   - Use `Benchmark` prefix
+   - Group related benchmarks with sub-tests
+   - Include scale information in names (e.g., `Scale_100`)
+
+3. **Best practices**:
+   - Use `b.ResetTimer()` after setup
+   - Avoid allocations in benchmark loop when measuring specific operations
+   - Use `b.StopTimer()` and `b.StartTimer()` to exclude cleanup
+   - Store results to prevent compiler optimization
+
+### Continuous Integration
+
+#### Automated Benchmarking
+
+Example CI configuration for benchmark regression testing:
+
+```yaml
+benchmark:
+  stage: test
+  script:
+    - make benchmark > current_benchmark.txt
+    - ./scripts/benchmark-compare.sh baseline_benchmark.txt current_benchmark.txt
+  artifacts:
+    reports:
+      performance: current_benchmark.txt
+  only:
+    - merge_requests
+    - main
+```
+
+#### Performance Monitoring
+
+Set up alerts for benchmark regressions:
+
+```yaml
+alerts:
+  - name: "benchmark_regression"
+    condition: "performance_degradation > 10%"
+    action: "notify_team"
+  - name: "benchmark_failure"
+    condition: "benchmark_execution_failed"
+    action: "block_deployment"
+```
+
+### Troubleshooting Benchmarks
+
+#### Common Issues
+
+1. **Inconsistent Results**:
+   - Increase `-benchtime` for more stable results
+   - Use `-count=5` to run multiple times
+   - Close other applications that might affect CPU/memory
+
+2. **Benchmark Failures**:
+   - Check if dependencies (Redis, NATS) are running
+   - Verify configuration keys are properly set
+   - Ensure sufficient system resources
+
+3. **Memory Issues**:
+   - Monitor system memory usage during benchmarks
+   - Check for goroutine leaks with `runtime.NumGoroutine()`
+   - Use memory profiling to identify allocation hotspots
+
+4. **Slow Execution**:
+   - High load benchmarks can take several minutes
+   - Use shorter `-benchtime` for development
+   - Consider running subsets with specific `-bench` patterns
+
+#### Debug Commands
+
+```bash
+# Check benchmark compilation
+go test -c ./benchmarks/
+
+# Run with verbose output
+go test -bench=. -v ./benchmarks/
+
+# Run single benchmark for debugging
+go test -bench=BenchmarkUserTokenValidation/ValidToken -count=1 ./benchmarks/
+
+# Check system resources during benchmark
+htop  # Monitor CPU/memory usage
+```
+
+### Performance Optimization Workflow
+
+1. **Identify Bottlenecks**: Run profiling to find performance hotspots
+2. **Create Focused Benchmarks**: Write specific benchmarks for the slow components
+3. **Optimize Implementation**: Make targeted improvements
+4. **Validate Changes**: Re-run benchmarks to measure improvement
+5. **Regression Test**: Ensure other components aren't negatively affected
+6. **Document Results**: Update performance baselines and documentation
+
+## 6. Common Troubleshooting Steps
 
 *   **WebSocket Connection Issues:**
     *   **Check Client-Side:** Ensure the client is using the correct WebSocket URL, token format, and protocol.

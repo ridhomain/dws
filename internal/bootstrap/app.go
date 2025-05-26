@@ -152,24 +152,23 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Warn(ctx, "WebSocket router is not initialized. WebSocket routes will not be available.")
 	}
 
-	if a.generateTokenHandler != nil && a.tokenGenerationMiddleware != nil {
-		// Cast the specific handler type to http.HandlerFunc, which implements http.Handler
+	if a.generateTokenHandler != nil && a.clientApiKeyMiddleware != nil {
 		handlerToWrap := http.HandlerFunc(a.generateTokenHandler)
-		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(handlerToWrap))
+		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.clientApiKeyMiddleware(handlerToWrap))
 		a.httpServeMux.Handle("POST /generate-token", finalGenerateTokenHandler)
 		a.logger.Info(ctx, "/generate-token endpoint registered")
 	} else {
-		a.logger.Error(ctx, "GenerateTokenHandler or TokenGenerationMiddleware not initialized. /generate-token endpoint will not be available.")
+		a.logger.Error(ctx, "GenerateTokenHandler or clientApiKeyMiddleware not initialized. /generate-token endpoint will not be available.")
 	}
 
 	// Register new /admin/generate-token endpoint
-	if a.generateAdminTokenHandler != nil && a.tokenGenerationMiddleware != nil { // Assuming same middleware for now
+	if a.generateAdminTokenHandler != nil && a.adminAPIKeyMiddleware != nil { // Assuming same middleware for now
 		adminHandlerToWrap := http.HandlerFunc(a.generateAdminTokenHandler)
-		finalAdminGenerateTokenHandler := middleware.RequestIDMiddleware(a.tokenGenerationMiddleware(adminHandlerToWrap))
+		finalAdminGenerateTokenHandler := middleware.RequestIDMiddleware(a.adminAPIKeyMiddleware(adminHandlerToWrap))
 		a.httpServeMux.Handle("POST /admin/generate-token", finalAdminGenerateTokenHandler)
 		a.logger.Info(ctx, "/admin/generate-token endpoint registered")
 	} else {
-		a.logger.Error(ctx, "GenerateAdminTokenHandler or TokenGenerationMiddleware not initialized. /admin/generate-token endpoint will not be available.")
+		a.logger.Error(ctx, "GenerateAdminTokenHandler or adminAPIKeyMiddleware not initialized. /admin/generate-token endpoint will not be available.")
 	}
 
 	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil { // Check configProvider for APIKeyAuth

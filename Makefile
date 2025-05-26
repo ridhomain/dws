@@ -27,6 +27,12 @@ help:
 	@echo "  make wire           Run Wire to generate dependency injection code."
 	@echo "  make tidy           Run go mod tidy."
 	@echo "  make format         Run go fmt on all Go files."
+	@echo "  make benchmark      Run all benchmark tests with profiling."
+	@echo "  make benchmark-auth Run authentication benchmark tests only."
+	@echo "  make benchmark-conn Run connection management benchmark tests only."
+	@echo "  make benchmark-msg  Run message processing benchmark tests only."
+	@echo "  make benchmark-integration Run integration benchmark tests only."
+	@echo "  make benchmark-compare Compare current benchmark results with baseline."
 	@echo ""
 
 .PHONY: build
@@ -134,4 +140,56 @@ tidy:
 .PHONY: format
 format:
 	@echo "Formatting Go files..."
-	go fmt $(GO_FILES) 
+	go fmt $(GO_FILES)
+
+# Benchmark targets
+.PHONY: benchmark
+benchmark:
+	@echo "Running all benchmark tests with profiling..."
+	@./scripts/run-benchmarks.sh
+
+.PHONY: benchmark-auth
+benchmark-auth:
+	@echo "Running authentication benchmark tests..."
+	@mkdir -p benchmark-results/profiles
+	go test -bench=BenchmarkUserTokenValidation -benchtime=10s -count=3 \
+		-cpuprofile=benchmark-results/profiles/auth-cpu.prof \
+		-memprofile=benchmark-results/profiles/auth-mem.prof \
+		./benchmarks/auth_bench_test.go
+
+.PHONY: benchmark-conn
+benchmark-conn:
+	@echo "Running connection management benchmark tests..."
+	@mkdir -p benchmark-results/profiles
+	go test -bench=BenchmarkConnection -benchtime=10s -count=3 \
+		-cpuprofile=benchmark-results/profiles/conn-cpu.prof \
+		-memprofile=benchmark-results/profiles/conn-mem.prof \
+		./benchmarks/connection_bench_test.go
+
+.PHONY: benchmark-msg
+benchmark-msg:
+	@echo "Running message processing benchmark tests..."
+	@mkdir -p benchmark-results/profiles
+	go test -bench=BenchmarkMessage -benchtime=10s -count=3 \
+		-cpuprofile=benchmark-results/profiles/msg-cpu.prof \
+		-memprofile=benchmark-results/profiles/msg-mem.prof \
+		./benchmarks/message_bench_test.go
+
+.PHONY: benchmark-integration
+benchmark-integration:
+	@echo "Running integration benchmark tests..."
+	@mkdir -p benchmark-results/profiles
+	go test -bench="BenchmarkFullUserFlow|BenchmarkMessageFlow|BenchmarkSessionManagementFlow|BenchmarkHighLoadScenario" -benchtime=5s -count=2 \
+		-cpuprofile=benchmark-results/profiles/integration-cpu.prof \
+		-memprofile=benchmark-results/profiles/integration-mem.prof \
+		./benchmarks/
+
+.PHONY: benchmark-compare
+benchmark-compare:
+	@echo "Comparing benchmark results with baseline..."
+	@./scripts/benchmark-compare.sh
+
+.PHONY: benchmark-clean
+benchmark-clean:
+	@echo "Cleaning benchmark results..."
+	@rm -rf benchmark-results/ 

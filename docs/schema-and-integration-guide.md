@@ -67,8 +67,8 @@ interface ErrorResponse {
 | `/health` | GET | Health check endpoint | None |
 | `/ready` | GET | Readiness check endpoint | None |
 | `/metrics` | GET | Prometheus metrics endpoint | None |
-| `/generate-token` | POST | Generate user token | API Key |
-| `/admin/generate-token` | POST | Generate admin token | API Key |
+| `/generate-token` | POST | Generate user token | General API Key |
+| `/admin/generate-token` | POST | Generate admin token | Admin API Key |
 
 ### WebSocket Endpoints
 
@@ -77,16 +77,25 @@ interface ErrorResponse {
 | `/ws/{companyId}/{agentId}` | User WebSocket connection | API Key + User Token | `token` (query param), `x-api-key` (header or query param) |
 | `/ws/admin` | Admin WebSocket connection | API Key + Admin Token | `token` (query param), `x-api-key` (header or query param) |
 
-## 4. Authentication Flow
+## 4. Authentication System
+
+The service implements a dual authentication system with separate API keys for different purposes:
+
+- **General API Key (`secret_token`)**: Used for generating user tokens and general WebSocket connections
+- **Admin API Key (`admin_secret_token`)**: Used exclusively for generating admin tokens and administrative operations
+
+This separation ensures better security isolation between user and admin operations.
+
+## 5. Authentication Flow
 
 1. **User Authentication**:
    ```javascript
-   // Request a user token
+   // Request a user token (using general API key)
    const response = await fetch('https://api.example.com/generate-token', {
      method: 'POST',
      headers: {
        'Content-Type': 'application/json',
-       'X-API-Key': 'YOUR_API_KEY'
+       'X-API-Key': 'YOUR_GENERAL_API_KEY'
      },
      body: JSON.stringify({
        user_id: 'user123',
@@ -102,12 +111,12 @@ interface ErrorResponse {
 
 2. **Admin Authentication**:
    ```javascript
-   // Request an admin token
+   // Request an admin token (using admin API key)
    const response = await fetch('https://api.example.com/admin/generate-token', {
      method: 'POST',
      headers: {
        'Content-Type': 'application/json',
-       'X-API-Key': 'YOUR_API_KEY'
+       'X-API-Key': 'YOUR_ADMIN_API_KEY'
      },
      body: JSON.stringify({
        admin_user_id: 'admin123',
@@ -119,7 +128,7 @@ interface ErrorResponse {
    const adminToken = data.token;
    ```
 
-## 5. WebSocket Communication Protocol
+## 6. WebSocket Communication Protocol
 
 ### Connection Establishment
 
@@ -215,7 +224,7 @@ The service enforces single-tab sessions, meaning only one active WebSocket conn
 | `BadRequest` | Bad request format | 400 | 4400 |
 | `InternalServerError` | Internal server error | 500 | 1011 |
 
-## 6. Frontend Integration Guide
+## 7. Frontend Integration Guide
 
 ### Setting Up the Connection
 
@@ -617,7 +626,7 @@ function AdminDashboard() {
 }
 ```
 
-## 7. Event Handling Best Practices
+## 8. Event Handling Best Practices
 
 1. **Reconnection Strategy**:
    - Implement an exponential backoff strategy to handle reconnections
@@ -644,7 +653,7 @@ function AdminDashboard() {
    - Include API key authentication in all requests
    - Handle session conflicts gracefully
 
-## 8. Advanced Integration Features
+## 9. Advanced Integration Features
 
 ### Real-time Notifications
 

@@ -15,16 +15,16 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
 )
 
-// TokenGenerationAuthMiddleware creates a middleware for the /generate-token endpoint.
-// It checks for the dedicated TokenGenerationAdminKey in the X-API-Key header.
-func TokenGenerationAuthMiddleware(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
+// AdminAPIKeyAuthMiddleware creates a middleware for admin API key authentication.
+// It checks for the dedicated AdminSecretToken in the X-API-Key header.
+func AdminAPIKeyAuthMiddleware(cfgProvider config.Provider, logger domain.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			adminApiKey := r.Header.Get(apiKeyHeaderName) // Re-use constant from auth.go
 
 			cfg := cfgProvider.Get()
-			if cfg == nil || cfg.Auth.TokenGenerationAdminKey == "" {
-				logger.Error(r.Context(), "Token generation auth failed: TokenGenerationAdminKey not configured", "path", r.URL.Path)
+			if cfg == nil || cfg.Auth.AdminSecretToken == "" {
+				logger.Error(r.Context(), "Token generation auth failed: AdminSecretToken not configured", "path", r.URL.Path)
 				errResp := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token generation auth cannot be performed.")
 				errResp.WriteJSON(w, http.StatusInternalServerError)
 				return
@@ -37,7 +37,7 @@ func TokenGenerationAuthMiddleware(cfgProvider config.Provider, logger domain.Lo
 				return
 			}
 
-			if adminApiKey != cfg.Auth.TokenGenerationAdminKey {
+			if adminApiKey != cfg.Auth.AdminSecretToken {
 				logger.Warn(r.Context(), "Token generation auth failed: Invalid admin key", "path", r.URL.Path)
 				errResp := domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.") // Assuming ErrForbidden exists for this
 				errResp.WriteJSON(w, http.StatusForbidden)
