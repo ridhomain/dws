@@ -1,0 +1,7 @@
+variables:
+  SERVICE_NAME: daisi-ws-service
+
+include:
+  - project: "timkado/infrastructure/microservices-ci-cd"
+    ref: dev
+    file: ".gitlab-ci.yml"
