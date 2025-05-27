@@ -159,13 +159,17 @@ func NewViperProvider(appCtx context.Context, logger *zap.Logger) (Provider, err
 	v.SetDefault("adaptive_ttl.session_lock.inactive_ttl_seconds", 15)        // Example
 
 	// Configure Viper to read from YAML file
-	v.SetConfigName(getEnv("DAISI_WS_CONFIG_NAME", "config"))
+	// v.SetConfigName(getEnv("DAISI_WS_CONFIG_NAME", "config"))
+	// v.SetConfigType("yaml")
+	// v.AddConfigPath(getEnv("DAISI_WS_CONFIG_PATH", "./config"))
+	// v.AddConfigPath(".") // Also look in current directory for local dev
+	v.SetConfigName("config")
 	v.SetConfigType("yaml")
-	v.AddConfigPath(getEnv("DAISI_WS_CONFIG_PATH", "./config"))
-	v.AddConfigPath(".") // Also look in current directory for local dev
+	v.AddConfigPath("./config")
+	v.AddConfigPath(".") // For local dev
 
 	// Configure Viper to read from environment variables
-	v.SetEnvPrefix(envPrefix)
+	// v.SetEnvPrefix(envPrefix)
 	v.AutomaticEnv()
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_")) // e.g., server.http_port becomes SERVER_HTTP_PORT
 
