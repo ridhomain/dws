@@ -159,10 +159,10 @@ func NewViperProvider(appCtx context.Context, logger *zap.Logger) (Provider, err
 	v.SetDefault("adaptive_ttl.session_lock.inactive_ttl_seconds", 15)        // Example
 
 	// Configure Viper to read from YAML file
-	// v.SetConfigName(getEnv("DAISI_WS_CONFIG_NAME", "config"))
-	// v.SetConfigType("yaml")
-	// v.AddConfigPath(getEnv("DAISI_WS_CONFIG_PATH", "./config"))
-	// v.AddConfigPath(".") // Also look in current directory for local dev
+	v.SetConfigName("config")
+	v.SetConfigType("yaml")
+	v.AddConfigPath("./config")
+	v.AddConfigPath(".") // Also look in current directory for local dev
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 	v.AddConfigPath("./config")
@@ -264,9 +264,9 @@ func (p *viperProvider) Get() *Config {
 }
 
 // Helper function to get Viper env vars correctly for bootstrap if needed
-func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return fallback
-}
+// func getEnv(key, fallback string) string {
+// 	if value, exists := os.LookupEnv(key); exists {
+// 		return value
+// 	}
+// 	return fallback
+// }

@@ -59,7 +59,7 @@ app:
   idle_timeout_seconds: 60    # Added for HTTP server
   websocket_compression_mode: "disabled"  # Options: disabled, context_takeover, no_context_takeover
   websocket_compression_threshold: 1024   # Bytes, applies if mode is not disabled. 0 means no threshold.
-  websocket_development_insecure_skip_verify: false # Set to true for local dev with self-signed certs ONLY
+  websocket_development_insecure_skip_verify: true # Set to true for local dev with self-signed certs ONLY
   # New gRPC Client Pool and Circuit Breaker settings
   grpc_pool_idle_timeout_seconds: 300             # 5 minutes
   grpc_pool_health_check_interval_seconds: 60   # 1 minute (for proactive checks, if implemented)
