@@ -334,16 +334,17 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		h.logger.Debug(connCtx, "DIAGNOSTIC: Context OK after sleep, proceeding to NATS.")
 	}
 
-	var generalNatsSubscription domain.NatsMessageSubscription  // Changed type
-	var specificNatsSubscription domain.NatsMessageSubscription // Changed type
+	var generalSubscriptions []domain.NatsMessageSubscription   // For chat + agent events (always active)
+	var specificNatsSubscription domain.NatsMessageSubscription // For message events
 	var currentSpecificChatID string
 
-	// Handler for general chat events (e.g., chat list updates)
-	generalChatEventsNatsHandler := func(msg *nats.Msg) {
+	// Combined handler for general events (chat + agent events)
+	// Initial subscription to general wa.C.A.chats topic
+	generalEventsNatsHandler := func(msg *nats.Msg) {
 		metrics.IncrementNatsMessagesReceived(msg.Subject)
 		defer func() {
 			if err := msg.Ack(); err != nil {
-				h.logger.Error(context.TODO(), "Failed to ACK general chat event NATS message", "subject", msg.Subject, "error", err)
+				h.logger.Error(context.TODO(), "Failed to ACK general event NATS message", "subject", msg.Subject, "error", err)
 			}
 		}()
 
@@ -353,20 +354,36 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		}
 		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
 
-		h.logger.Info(msgCtx, "Received general chat event from NATS", "subject", msg.Subject, "data_len", len(msg.Data))
+		h.logger.Info(msgCtx, "Received general event from NATS", "subject", msg.Subject, "data_len", len(msg.Data))
+
 		var eventPayload domain.EnrichedEventPayload
 		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
-			h.logger.Error(msgCtx, "Failed to unmarshal general chat event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
-			return // Ack will be handled by defer
+			h.logger.Error(msgCtx, "Failed to unmarshal general event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
+			return
 		}
+
+		// Set event type based on NATS subject pattern
+		if strings.Contains(msg.Subject, ".chats") {
+			eventPayload.EventType = "chat"
+		} else if strings.Contains(msg.Subject, ".agents") {
+			eventPayload.EventType = "agent"
+		} else {
+			eventPayload.EventType = "unknown"
+			h.logger.Warn(msgCtx, "Unknown general event subject pattern", "subject", msg.Subject)
+		}
+
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
-			h.logger.Error(msgCtx, "Failed to forward general chat event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
-			return // Ack will be handled by defer
+			h.logger.Error(msgCtx, "Failed to forward general event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
+			return
 		}
 
 		metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-		// Record session activity after successful write
+		// metrics.IncrementEventTypesSent(eventPayload.EventType)
+		h.logger.Debug(msgCtx, "Successfully delivered general NATS event to WebSocket client",
+			"subject", msg.Subject, "event_id", eventPayload.EventID, "event_type", eventPayload.EventType)
+
+		// Record session activity
 		if h.connManager != nil && h.connManager.SessionLocker() != nil {
 			sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
 			adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
@@ -380,24 +397,34 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		}
 	}
 
-	// Initial subscription to general wa.C.A.chats topic
+	// Subscribe to general events (chat + agent) - always active
 	if h.natsAdapter != nil {
-		var subErr error
-		generalNatsSubscription, subErr = h.natsAdapter.SubscribeToChats(connCtx, companyID, agentID, generalChatEventsNatsHandler)
-		if subErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to general NATS chats topic", "companyID", companyID, "agentID", agentID, "error", subErr.Error())
-			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to chat updates", subErr.Error())
+		// Subscribe to chat events
+		chatSub, chatSubErr := h.natsAdapter.SubscribeToChats(connCtx, companyID, agentID, generalEventsNatsHandler)
+		if chatSubErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to NATS chats topic", "companyID", companyID, "agentID", agentID, "error", chatSubErr.Error())
+			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to chat updates", chatSubErr.Error())
 			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
-				h.logger.Error(connCtx, "Failed to send NATS subscription error to client for general chats", "error", sendErr.Error())
+				h.logger.Error(connCtx, "Failed to send NATS subscription error to client", "error", sendErr.Error())
 			} else {
 				metrics.IncrementMessagesSent(domain.MessageTypeError)
 			}
-			// Depending on policy, might close connection if initial subscription fails
 		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to general NATS chats topic", "subject", generalNatsSubscription.Subject())
+			h.logger.Info(connCtx, "Successfully subscribed to NATS chats topic", "subject", chatSub.Subject())
+			generalSubscriptions = append(generalSubscriptions, chatSub)
+		}
+
+		// Subscribe to agent events
+		agentSub, agentSubErr := h.natsAdapter.SubscribeToAgentEvents(connCtx, companyID, agentID, generalEventsNatsHandler)
+		if agentSubErr != nil {
+			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events", "companyID", companyID, "agentID", agentID, "error", agentSubErr.Error())
+			h.logger.Warn(connCtx, "Continuing without agent events subscription")
+		} else {
+			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events", "subject", agentSub.Subject())
+			generalSubscriptions = append(generalSubscriptions, agentSub)
 		}
 	} else {
-		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general chat events.")
+		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general events.")
 	}
 
 	// Renamed specificChatNatsMessageHandler from natsMessageHandler for clarity
@@ -537,6 +564,9 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			return
 		}
 
+		eventPayload.EventType = "message"
+		// metrics.IncrementEventTypesSent(eventPayload.EventType)
+
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
 			h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
@@ -601,18 +631,31 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	// currentSpecificChatID remains "" initially.
 	// specificNatsSubscription remains nil initially.
 
-	// Defer cleanup for all subscriptions
+	// Cleanup all subscriptions
 	defer func() {
-		if generalNatsSubscription != nil && generalNatsSubscription.IsValid() { // Added IsValid check
-			h.logger.Info(connCtx, "Draining general NATS subscription on connection close", "subject", generalNatsSubscription.Subject())
-			if unsubErr := generalNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining general NATS subscription on close", "subject", generalNatsSubscription.Subject(), "error", unsubErr.Error())
+		// Cleanup all general subscriptions (chat + agent)
+		for i, sub := range generalSubscriptions {
+			if sub != nil && sub.IsValid() {
+				subType := "chat"
+				if i == 1 {
+					subType = "agent"
+				}
+				h.logger.Info(connCtx, "Draining general NATS subscription on connection close",
+					"subject", sub.Subject(), "type", subType)
+				if unsubErr := sub.Drain(); unsubErr != nil {
+					h.logger.Error(connCtx, "Error draining general NATS subscription on close",
+						"subject", sub.Subject(), "type", subType, "error", unsubErr.Error())
+				}
 			}
 		}
-		if specificNatsSubscription != nil && specificNatsSubscription.IsValid() { // Added IsValid check
-			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close", "subject", specificNatsSubscription.Subject(), "chatID", currentSpecificChatID)
+
+		// Cleanup specific subscription
+		if specificNatsSubscription != nil && specificNatsSubscription.IsValid() {
+			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close",
+				"subject", specificNatsSubscription.Subject(), "chatID", currentSpecificChatID)
 			if unsubErr := specificNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining specific NATS subscription on close", "subject", specificNatsSubscription.Subject(), "error", unsubErr.Error())
+				h.logger.Error(connCtx, "Error draining specific NATS subscription on close",
+					"subject", specificNatsSubscription.Subject(), "error", unsubErr.Error())
 			}
 		}
 	}()
@@ -739,7 +782,7 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			case domain.MessageTypeSelectChat:
 				h.logger.Info(connCtx, "Handling select_chat message type")
 				// Pass the natsMessageHandler and a way to update currentNatsSubscription
-				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, generalNatsSubscription, specificNatsSubscription, currentSpecificChatID)
+				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, specificNatsSubscription, currentSpecificChatID)
 				if err != nil {
 					h.logger.Error(connCtx, "Error handling select_chat message", "error", err.Error())
 					errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to process chat selection", err.Error())
@@ -749,7 +792,6 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 						metrics.IncrementMessagesSent(domain.MessageTypeError)
 					}
 				} else {
-					generalNatsSubscription = nil // This was incorrectly outside the successful case before
 					specificNatsSubscription = newSub
 					currentSpecificChatID = newChatID
 					// Record session activity after successful chat selection
@@ -795,11 +837,10 @@ func (h *Handler) handleSelectChatMessage(
 	conn *Connection,
 	companyID, agentID, userID string,
 	payloadData interface{},
-	specificChatNatsMsgHandler domain.NatsMessageHandler, // Changed type
-	currentGeneralSub domain.NatsMessageSubscription, // Changed type
-	currentSpecificSub domain.NatsMessageSubscription, // Changed type
+	specificChatNatsMsgHandler domain.NatsMessageHandler,
+	currentSpecificSub domain.NatsMessageSubscription,
 	currentSpecificSubChatID string,
-) (domain.NatsMessageSubscription, string, error) { // Changed return type
+) (domain.NatsMessageSubscription, string, error) {
 
 	payloadMap, ok := payloadData.(map[string]interface{})
 	if !ok {
@@ -909,17 +950,8 @@ func (h *Handler) handleSelectChatMessage(
 	h.logger.Info(connCtx, "Successfully registered new message route", "newChatID", chatID)
 
 	// Manage NATS Subscription
-	// 1. Drain general subscription if it exists
-	if currentGeneralSub != nil && currentGeneralSub.IsValid() { // Added IsValid check
-		h.logger.Info(connCtx, "Draining general NATS chats subscription as a specific chat is being selected.", "subject", currentGeneralSub.Subject())
-		if err := currentGeneralSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain general NATS chats subscription", "subject", currentGeneralSub.Subject(), "error", err.Error())
-			// Log and continue, attempt to subscribe to new one
-		}
-		// currentGeneralSub = nil // It will be nil-ed out by the caller if this function succeeds
-	}
 
-	// 2. Drain old specific subscription if it exists and is for a different chat
+	// 1. Drain old specific subscription if it exists and is for a different chat
 	if currentSpecificSub != nil && currentSpecificSub.IsValid() && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID { // Added IsValid check
 		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject())
 		if err := currentSpecificSub.Drain(); err != nil {
@@ -928,7 +960,7 @@ func (h *Handler) handleSelectChatMessage(
 		}
 	}
 
-	// 3. Subscribe to new chat message subject
+	// 2. Subscribe to new chat message subject
 	var newSpecificSubscription domain.NatsMessageSubscription // Changed type
 	var newSubErr error
 	if h.natsAdapter != nil {

@@ -227,6 +227,7 @@ func (fa *ForwarderAdapter) ForwardEvent(ctx context.Context, targetPodAddress s
 			ChatId:    event.ChatID,
 			RowData:   protoRowData,
 			EventTime: event.EventTime, // Assuming event.EventTime is now string
+			EventType: event.EventType,
 		},
 		TargetCompanyId: targetCompanyID,
 		TargetAgentId:   targetAgentID,
