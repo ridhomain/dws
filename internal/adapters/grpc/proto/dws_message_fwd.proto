@@ -13,12 +13,14 @@ service MessageForwardingService {
 message EnrichedEventPayloadMessage {
   string event_id = 1;
   string company_id = 2;
-  string agent_id = 3;    // Optional in source JSON, but always string if present
-  string message_id = 4;  // Optional in source JSON
-  string chat_id = 5;     // Optional in source JSON
-  google.protobuf.Struct row_data = 6; // Contains the actual table row data
+  string agent_id = 3;
+  string message_id = 4;
+  string chat_id = 5;
+  google.protobuf.Struct row_data = 6;
   string event_time = 7;
+  string event_type = 8;
 }
+
 
 message PushEventRequest {
   EnrichedEventPayloadMessage payload = 1;
