@@ -100,6 +100,7 @@ func (h *GRPCMessageHandler) PushEvent(ctx context.Context, req *pb.PushEventReq
 		ChatID:    req.Payload.ChatId,
 		EventTime: req.Payload.EventTime,
 		RowData:   rowDataMap,
+		EventType: req.Payload.EventType,
 	}
 
 	wsMessage := domain.NewEventMessage(domainPayload)

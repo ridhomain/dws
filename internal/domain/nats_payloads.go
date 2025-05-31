@@ -10,4 +10,5 @@ type EnrichedEventPayload struct {
 	MessageID string      `json:"message_id,omitempty"` // omitempty as it's specific to 'messages' table
 	ChatID    string      `json:"chat_id,omitempty"`    // omitempty as it's relevant for 'messages' and 'chats'
 	RowData   interface{} `json:"row_data"`             // Contains the actual table row data
+	EventType string      `json:"event_type,omitempty"` // "chat", "agent", "message", etc.
 }
