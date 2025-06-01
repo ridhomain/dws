@@ -31,7 +31,7 @@ The service owns the browser-facing slice of the end-to-end latency budget (≤ 
 | F-3       | **Company token auth**                | Ensures caller belongs to `<company>` (or is admin, if token structure allows)    | AES-GCM decrypt & compare; result cached in Redis 30 s                                                                                      |
 | F-4       | **Single-tab session enforcement**    | Guarantees at most one socket per `(company, agent, user)`                        | `SETNX session:<C>:<A>:<U> <pod_id> EX 30s` + pub-sub `session_kill:<C>:<A>:<U>`                                                            |
 | F-5       | **Dynamic route registry**            | Tracks which pod owns which chat/message route                                    | `SADD route:<C>:<A>:<logical>[:<chat>] <pod_id> EX 30s`                                                                                       |
-| F-6       | **Automatic chat subscription**       | On connect subscribes operator to `wa.<C>.<A>.chats`                              | JetStream `QueueSubscribe("", "ws_fanout")` bound to `wa_stream`                                                                            |
+| F-6       | **Automatic chat subscription**       | On connect subscribes operator to `websocket.<C>.<A>.chats`                              | JetStream `QueueSubscribe("", "ws_fanout")` bound to `wa_stream`                                                                            |
 | F-7       | **Per-thread message fan-out**        | After `select_chat`, pushes only thread messages                                  | Redis route lookup; if event lands on wrong pod → gRPC hop to owner                                                                         |
 | F-8       | **TTL refresh loop**                  | Keeps session & route keys alive (for both user and admin sessions)               | Every 10 s extend expiry to 30 s for `session:<C>:<A>:<U>`, `session:admin:<AdminUserID>`, and `route:*` keys.                               |
 | F-9       | **Structured observability**          | Prometheus metrics, Zap JSON logs, connection-duration histogram                  | `/metrics` endpoint; Grafana dashboard later                                                                                                |
@@ -46,9 +46,9 @@ The service owns the browser-facing slice of the end-to-end latency budget (≤ 
 
 | Stream                        | Subscribed subject pattern                | Notes                                          |
 | ----------------------------- | ----------------------------------------- | ---------------------------------------------- |
-| **Chat list**                 | `wa.<company>.<agent>.chats`              | One subject per agent                          |
-| **Message thread**            | `wa.<company>.<agent>.messages.<chat_id>` | `<chat_id>` enables selective delivery         |
-| **Agent profile**             | `wa.<company>.<agent>.agents` (future)    | Not auto-subscribed                            |
+| **Chat list**                 | `websocket.<company>.<agent>.chats`              | One subject per agent                          |
+| **Message thread**            | `websocket.<company>.<agent>.messages.<chat_id>` | `<chat_id>` enables selective delivery         |
+| **Agent profile**             | `websocket.<company>.<agent>.agents` (future)    | Not auto-subscribed                            |
 | **Agent Table Events (Admin)**| `dsys.events.agent_table`                 | For admin UI to stream agent changes (Payload: `AgentTableEventPayload`) |
 
 > **Why** – exact 1-for-1 alignment with subjects produced by `daisi-cdc-consumer-service v3` for operator events. New `dsys.events.agent_table` for admin-specific data.
@@ -98,7 +98,7 @@ sequenceDiagram
 
     %% STEP 6 — JetStream queue fan-out
     note over WS_A,WS_B: QueueSubscribe("", "ws_fanout")
-    JS_WA -->> WS_B   : wa.<C>.<A>.messages.123
+    JS_WA -->> WS_B   : websocket.<C>.<A>.messages.123
 
     alt WS_B owns socket
         WS_B -->> Browser : JSON frame
@@ -286,7 +286,7 @@ sequenceDiagram
         CDC -->> JS_CDC: ACK (skip)
     else first-seen
         RED -->> CDC   : 1
-        CDC -->> JS_WA : Publish wa.Co1.Ag7.messages.123 {payload}
+        CDC -->> JS_WA : Publish websocket.Co1.Ag7.messages.123 {payload}
         alt publish error
             CDC -->> JS_CDC: NACK (publish failed)
             JS_CDC -->> CDC : redeliver after AckWait
@@ -332,7 +332,7 @@ sequenceDiagram
 
             %% STEP 6 — JetStream queue fan-out
             note over WS_A,WS_B: QueueSubscribe("", "ws_fanout", bind wa_stream)
-            JS_WA -->> WS_B   : wa.Co1.Ag7.messages.123
+            JS_WA -->> WS_B   : websocket.Co1.Ag7.messages.123
 
             alt WS_B owns socket
                 WS_B -->> Browser : JSON frame

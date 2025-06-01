@@ -1,19 +1,17 @@
 package application
 
 import (
+	"context"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
+	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
-	// Imports like "context", "fmt", "time", "strings", "github.com/coder/websocket", "gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
-	// will likely be needed by the methods now in separate files, but not directly by this core file anymore unless NewConnectionManager needs them.
-	// The Go compiler will tell us if any are missing in the other files.
 )
 
 // ConnectionManager manages active WebSocket connections, session locking, and route registration.
-// It ensures that only one session per user is active and handles the lifecycle of connections.
-// It also uses a RouteRegistry to track which pod is responsible for which chat/message routes.
+// Updated to work with global NATS consumer instead of per-connection subscriptions.
 type ConnectionManager struct {
 	logger                 domain.Logger
 	configProvider         config.Provider
@@ -24,15 +22,18 @@ type ConnectionManager struct {
 	activeConnections      sync.Map // Stores [sessionKey string] -> domain.ManagedConnection
 	activeAdminConnections sync.Map // Stores [adminSessionKey string] -> domain.ManagedConnection for admin connections
 
+	// Global NATS consumer replaces per-connection subscriptions
+	globalConsumer *appnats.GlobalConsumerHandler
+
 	// For session renewal goroutine
 	renewalStopChan  chan struct{}
 	renewalWg        sync.WaitGroup
-	renewalStopMutex sync.Mutex // Protects renewalStopChan from multiple closes
-	renewalStopped   bool       // Flag to track if the renewal loop has been stopped
+	renewalStopMutex sync.Mutex
+	renewalStopped   bool
 	redisClient      *redis.Client
 }
 
-// NewConnectionManager creates a new ConnectionManager.
+// NewConnectionManager creates a new ConnectionManager with global consumer support
 func NewConnectionManager(
 	logger domain.Logger,
 	configProvider config.Provider,
@@ -41,6 +42,7 @@ func NewConnectionManager(
 	killSwitchSubscriber domain.KillSwitchSubscriber,
 	routeRegistry domain.RouteRegistry,
 	redisClient *redis.Client,
+	globalConsumer *appnats.GlobalConsumerHandler, // Add global consumer
 ) *ConnectionManager {
 	return &ConnectionManager{
 		logger:                 logger,
@@ -51,6 +53,7 @@ func NewConnectionManager(
 		routeRegistry:          routeRegistry,
 		activeConnections:      sync.Map{},
 		activeAdminConnections: sync.Map{},
+		globalConsumer:         globalConsumer,
 		renewalStopChan:        make(chan struct{}),
 		renewalWg:              sync.WaitGroup{},
 		renewalStopMutex:       sync.Mutex{},
@@ -59,6 +62,31 @@ func NewConnectionManager(
 	}
 }
 
+// RouteRegistrar returns the underlying route registry (keeping for compatibility)
 func (cm *ConnectionManager) RouteRegistrar() domain.RouteRegistry {
 	return cm.routeRegistry
+}
+
+// GlobalConsumer returns the global NATS consumer handler
+func (cm *ConnectionManager) GlobalConsumer() *appnats.GlobalConsumerHandler {
+	return cm.globalConsumer
+}
+
+// StartGlobalConsumer starts the global NATS consumer
+func (cm *ConnectionManager) StartGlobalConsumer(ctx context.Context) error {
+	if cm.globalConsumer == nil {
+		cm.logger.Error(ctx, "Global consumer not initialized")
+		return nil
+	}
+
+	return cm.globalConsumer.Start(ctx)
+}
+
+// StopGlobalConsumer stops the global NATS consumer
+func (cm *ConnectionManager) StopGlobalConsumer() error {
+	if cm.globalConsumer == nil {
+		return nil
+	}
+
+	return cm.globalConsumer.Stop()
 }

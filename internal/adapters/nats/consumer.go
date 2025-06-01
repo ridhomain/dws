@@ -162,7 +162,7 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
 
-	subject := fmt.Sprintf("wa.%s.%s.chats", companyID, agentID)
+	subject := fmt.Sprintf("websocket.%s.%s.chats", companyID, agentID)
 	queueGroup := "ws_fanout"
 
 	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
@@ -216,14 +216,14 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	return &natsSubscriptionWrapper{Subscription: sub}, nil
 }
 
-// SubscribeToChatMessages subscribes to specific chat message subjects (e.g., wa.<company>.<agent>.messages.<chat_id>).
+// SubscribeToChatMessages subscribes to specific chat message subjects (e.g., websocket.<company>.<agent>.messages.<chat_id>).
 // The provided handler is responsible for processing messages, including ownership checks.
 func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID, agentID, chatID string, handler domain.NatsMessageHandler) (domain.NatsMessageSubscription, error) {
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
 
-	subject := fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
+	subject := fmt.Sprintf("websocket.%s.%s.messages.%s", companyID, agentID, chatID)
 
 	// Use a distinct queue group for specific chat messages
 	queueGroup := "ws_fanout_messages_q"
@@ -272,7 +272,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 }
 
 // Helper function to parse NATS subject for message streams
-// Example subject: wa.comp1.agentA.messages.chatXYZ
+// Example subject: websocket.comp1.agentA.messages.chatXYZ
 func ParseNATSMessageSubject(subject string) (companyID, agentID, chatID string, err error) {
 	parts := strings.Split(subject, ".")
 	// Expected: "wa", "<companyID>", "<agentID>", "messages", "<chatID>"
@@ -297,8 +297,8 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
-	// Subject pattern: wa.<companyIDPattern>.<agentIDPattern>.agents
-	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
+	// Subject pattern: websocket.<companyIDPattern>.<agentIDPattern>.agents
+	subject := fmt.Sprintf("websocket.%s.%s.agents", companyIDPattern, agentIDPattern)
 	queueGroup := "ws_fanout_admin_events"
 
 	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",

@@ -357,9 +357,9 @@ DAISI_WS_AUTH_ADMIN_SECRET_TOKEN=your-admin-secret-token
 
 The service subscribes to hierarchical NATS subjects:
 
-- **General Chat Events**: `wa.{company}.{agent}.chats`
-- **Specific Chat Messages**: `wa.{company}.{agent}.messages.{chat_id}`
-- **Admin Events**: `wa.{company}.{agent}.agents`
+- **General Chat Events**: `websocket.{company}.{agent}.chats`
+- **Specific Chat Messages**: `websocket.{company}.{agent}.messages.{chat_id}`
+- **Admin Events**: `websocket.{company}.{agent}.agents`
 
 ### JetStream Configuration
 

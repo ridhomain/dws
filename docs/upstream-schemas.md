@@ -119,16 +119,16 @@ The service publishes enriched events to a NATS JetStream currently named **`wa_
 The subject patterns depend on the source table of the CDC event:
 
 *   **For `messages` table events:**
-    *   Pattern: `wa.<company_id>.<agent_id>.messages.<chat_id>`
-    *   Example: `wa.company_xyz.agent_123.messages.chat_abc`
+    *   Pattern: `websocket.<company_id>.<agent_id>.messages.<chat_id>`
+    *   Example: `websocket.company_xyz.agent_123.messages.chat_abc`
 
 *   **For `chats` table events:**
-    *   Pattern: `wa.<company_id>.<agent_id>.chats`
-    *   Example: `wa.company_xyz.agent_123.chats`
+    *   Pattern: `websocket.<company_id>.<agent_id>.chats`
+    *   Example: `websocket.company_xyz.agent_123.chats`
 
 *   **For `agents` table events:**
-    *   Pattern: `wa.<company_id>.<agent_id>.agents`
-    *   Example: `wa.company_xyz.agent_123.agents`
+    *   Pattern: `websocket.<company_id>.<agent_id>.agents`
+    *   Example: `websocket.company_xyz.agent_123.agents`
 
 Where:
 *   `<company_id>`: The ID of the company associated with the event.

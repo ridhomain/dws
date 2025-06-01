@@ -148,7 +148,7 @@ graph TD
 #### Messaging Infrastructure
 *   **`internal/adapters/nats/ConsumerAdapter`:** NATS JetStream integration:
     - Durable consumer `ws_fanout` with queue groups
-    - Subject subscriptions: `wa.{company}.{agent}.chats`, `wa.{company}.{agent}.messages.{chat_id}`, `wa.{company}.{agent}.agents`
+    - Subject subscriptions: `websocket.{company}.{agent}.chats`, `websocket.{company}.{agent}.messages.{chat_id}`, `websocket.{company}.{agent}.agents`
     - Manual acknowledgment for reliability
     - Connection resilience with retry logic
 
@@ -265,10 +265,10 @@ sequenceDiagram
     RouteReg->>Redis: EXPIRE route:company123:agent456:messages:chat123 300
     
     ConnMgr->>NATS: SubscribeToChatMessages(company123, agent456, chat123, messageHandler)
-    NATS-->>ConnMgr: Subscription to wa.company123.agent456.messages.chat123
+    NATS-->>ConnMgr: Subscription to websocket.company123.agent456.messages.chat123
     
     Note over NATS: External event arrives
-    NATS->>ConnMgr: Message on wa.company123.agent456.messages.chat123
+    NATS->>ConnMgr: Message on websocket.company123.agent456.messages.chat123
     ConnMgr->>ConnMgr: Parse EnrichedEventPayload from NATS message
     
     ConnMgr->>RouteReg: GetOwningPodForMessageRoute(company123, agent456, chat123)
@@ -337,7 +337,7 @@ sequenceDiagram
         
         Note over AdminHandler: Setup NATS subscription for system-wide events
         AdminHandler->>NATS: SubscribeToAgentEvents(companyPattern="*", agentPattern="*", handler)
-        NATS-->>AdminHandler: Subscription to wa.*.*.agents with queue group
+        NATS-->>AdminHandler: Subscription to websocket.*.*.agents with queue group
         
         loop System Events
             NATS->>AdminHandler: Agent events from all companies/agents
@@ -438,9 +438,9 @@ message EnrichedEventPayloadMessage {
 ```
 
 ### NATS Subject Patterns
-*   **General Chat Events:** `wa.{company}.{agent}.chats`
-*   **Specific Chat Messages:** `wa.{company}.{agent}.messages.{chat_id}`
-*   **Admin Agent Events:** `wa.{company}.{agent}.agents`
+*   **General Chat Events:** `websocket.{company}.{agent}.chats`
+*   **Specific Chat Messages:** `websocket.{company}.{agent}.messages.{chat_id}`
+*   **Admin Agent Events:** `websocket.{company}.{agent}.agents`
 *   **JetStream Configuration:** Durable consumer `ws_fanout`, manual acknowledgment, queue groups for load balancing
 
 ### Authentication Token Structure
