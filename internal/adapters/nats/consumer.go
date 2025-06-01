@@ -162,8 +162,11 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
 
+	// Ephemeral subscriptions
+	// Use a queue group that is unique per company and agent to avoid conflicts
+	baseConsumerName := a.cfgProvider.Get().NATS.ConsumerName
+	queueGroup := fmt.Sprintf("%s_%s_%s", baseConsumerName, companyID, agentID) // Unique per company and agent
 	subject := fmt.Sprintf("websocket.%s.%s.chats", companyID, agentID)
-	queueGroup := "ws_fanout"
 
 	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
 		"subject", subject,
@@ -171,14 +174,6 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		"stream_name", a.cfgProvider.Get().NATS.StreamName,
 		"consumer_name", a.cfgProvider.Get().NATS.ConsumerName,
 	)
-
-	// Durable name for the consumer, incorporating company and agent to make it unique per subscription instance if needed,
-	// or rely on NATS ephemeral consumer if durable name is complex to manage per websocket connection.
-	// For a queue group, multiple subscribers can share a durable name, but often each subscriber instance
-	// might want its own consumer state if not purely for load balancing. Given the task description suggests
-	// "ws_fanout" as the group, it implies load balancing or shared consumption. Let's use a durable name based on group.
-	// The PRD (FR-5) specifies a consumer `ws_fanout` for stream `wa_stream`.
-	durableName := a.cfgProvider.Get().NATS.ConsumerName // From config, e.g., "ws_fanout_consumer"
 	ackWait := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
 	if ackWait <= 0 {
 		ackWait = 30 * time.Second // Fallback default
@@ -190,9 +185,8 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		subject,
 		queueGroup,
 		natsHandler, // The message handler function passed in
-		nats.Durable(durableName),
-		nats.DeliverAll(), // DeliverPolicy=All
-		nats.ManualAck(),  // We will manually ack messages
+		nats.DeliverNew(),
+		nats.ManualAck(), // We will manually ack messages
 		nats.AckWait(ackWait),
 		nats.MaxAckPending(a.natsMaxAckPending), // Use the stored value
 	)
@@ -201,7 +195,6 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 		a.logger.Error(ctx, "Failed to subscribe to NATS subject",
 			"subject", subject,
 			"queue_group", queueGroup,
-			"durable_name", durableName,
 			"error", err.Error(),
 		)
 		return nil, fmt.Errorf("failed to subscribe to NATS subject %s: %w", subject, err)
@@ -210,7 +203,6 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	a.logger.Info(ctx, "Successfully subscribed to NATS subject with queue group",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"durable_name", durableName,
 	)
 
 	return &natsSubscriptionWrapper{Subscription: sub}, nil
@@ -225,10 +217,11 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 
 	subject := fmt.Sprintf("websocket.%s.%s.messages.%s", companyID, agentID, chatID)
 
+	// Ephemeral subscriptions
 	// Use a distinct queue group for specific chat messages
-	queueGroup := "ws_fanout_messages_q"
-	durableNameBase := a.cfgProvider.Get().NATS.ConsumerName  // ws_fanout_consumer or similar
-	durableNameForMessages := durableNameBase + "_messages_q" // This becomes 'ws_fanout_messages'
+	baseConsumerName := a.cfgProvider.Get().NATS.ConsumerName
+	queueGroup := fmt.Sprintf("%s_%s_%s_%s_messages_q", baseConsumerName, companyID, agentID, chatID)
+
 	ackWaitMessages := time.Duration(a.cfgProvider.Get().App.NatsAckWaitSeconds) * time.Second
 	if ackWaitMessages <= 0 {
 		ackWaitMessages = 30 * time.Second // Fallback default
@@ -237,7 +230,6 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 	a.logger.Info(ctx, "Attempting to subscribe to NATS chat messages subject",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"durable_name", durableNameForMessages, // Use the derived durable name
 	)
 
 	natsHandler := nats.MsgHandler(handler) // Convert domain.NatsMessageHandler to nats.MsgHandler
@@ -246,8 +238,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		subject,
 		queueGroup,
 		natsHandler,
-		nats.Durable(durableNameForMessages), // Use the derived durable name
-		nats.DeliverLastPerSubject(),
+		nats.DeliverNew(),
 		nats.ManualAck(),
 		nats.AckWait(ackWaitMessages),
 		nats.MaxAckPending(a.natsMaxAckPending),
@@ -257,7 +248,6 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 		a.logger.Error(ctx, "Failed to subscribe to NATS chat messages subject",
 			"subject", subject,
 			"queue_group", queueGroup,
-			"durable_name", durableNameForMessages, // Use the derived durable name
 			"error", err.Error(),
 		)
 		return nil, fmt.Errorf("failed to subscribe to NATS chat messages subject %s: %w", subject, err)
@@ -266,7 +256,6 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 	a.logger.Info(ctx, "Successfully subscribed to NATS chat messages subject",
 		"subject", subject,
 		"queue_group", queueGroup,
-		"durable_name", durableNameForMessages, // Use the derived durable name
 	)
 	return &natsSubscriptionWrapper{Subscription: sub}, nil
 }
