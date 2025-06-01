@@ -40,10 +40,18 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
 	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
 	routeRegistry := RouteRegistryProvider(client, domainLogger)
-	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter, routeRegistry, client)
+	natsConsumer, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger)
+	if err != nil {
+		cleanup2()
+		cleanup()
+		return nil, nil, err
+	}
+	globalConsumerHandler := GlobalConsumerProvider(domainLogger, provider, natsConsumer)
+	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter, routeRegistry, client, globalConsumerHandler)
 	grpcMessageHandler := GRPCMessageHandlerProvider(domainLogger, connectionManager, provider)
 	grpcServer, err := GRPCServerProvider(ctx, domainLogger, provider, grpcMessageHandler)
 	if err != nil {
+		cleanup3()
 		cleanup2()
 		cleanup()
 		return nil, nil, err
@@ -55,14 +63,8 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
-	natsConsumer, cleanup3, err := NatsConsumerAdapterProvider(ctx, provider, domainLogger)
-	if err != nil {
-		cleanup2()
-		cleanup()
-		return nil, nil, err
-	}
 	messageForwarder := MessageForwarderProvider(ctx, domainLogger, provider)
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, routeRegistry, messageForwarder)
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, routeRegistry, messageForwarder)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)

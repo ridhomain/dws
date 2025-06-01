@@ -234,8 +234,16 @@ func AdminWebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Prov
 
 // WebsocketHandlerProvider provides the websocket handler.
 // Now also takes NatsConsumerAdapter as a dependency.
-func WebsocketHandlerProvider(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *wsadapter.Handler {
-	return wsadapter.NewHandler(logger, cfgProvider, connManager, natsAdapter, routeRegistry, messageForwarder)
+// Update WebsocketHandlerProvider to remove NATS adapter dependency
+func WebsocketHandlerProvider(
+	logger domain.Logger,
+	cfgProvider config.Provider,
+	connManager *application.ConnectionManager,
+	// Remove natsAdapter parameter - no longer needed
+	routeRegistry domain.RouteRegistry,
+	messageForwarder domain.MessageForwarder,
+) *wsadapter.Handler {
+	return wsadapter.NewHandler(logger, cfgProvider, connManager, nil, routeRegistry, messageForwarder)
 }
 
 // WebsocketRouterProvider provides the websocket router.
@@ -289,8 +297,9 @@ func ConnectionManagerProvider(
 	killSwitchSub domain.KillSwitchSubscriber,
 	routeRegistry domain.RouteRegistry,
 	redisClient *redis.Client,
+	globalConsumer *appnats.GlobalConsumerHandler, // Add this parameter
 ) *application.ConnectionManager {
-	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub, routeRegistry, redisClient)
+	return application.NewConnectionManager(logger, cfgProvider, sessionLocker, killSwitchPub, killSwitchSub, routeRegistry, redisClient, globalConsumer)
 }
 
 // TokenCacheStoreProvider provides a TokenCacheStore.
@@ -301,6 +310,14 @@ func TokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) do
 // AdminTokenCacheStoreProvider provides an AdminTokenCacheStore.
 func AdminTokenCacheStoreProvider(redisClient *redis.Client, logger domain.Logger) domain.AdminTokenCacheStore {
 	return appredis.NewAdminTokenCacheAdapter(redisClient, logger)
+}
+
+func GlobalConsumerProvider(logger domain.Logger, cfgProvider config.Provider, natsAdapter domain.NatsConsumer) *appnats.GlobalConsumerHandler {
+	// Get JetStream context from the NATS adapter
+	// We'll need to add a method to expose the JetStream context
+	js := natsAdapter.(*appnats.ConsumerAdapter).JetStreamContext()
+
+	return appnats.NewGlobalConsumerHandler(logger, cfgProvider, js)
 }
 
 // NatsConsumerAdapterProvider provides the NATS ConsumerAdapter.
@@ -385,6 +402,7 @@ var ProviderSet = wire.NewSet(
 	RouteRegistryProvider,         // Added RouteRegistryProvider
 	MessageForwarderProvider,      // Added MessageForwarderProvider
 	NewApp,
+	GlobalConsumerProvider,
 	NatsConsumerAdapterProvider,
 	NatsConnectionProvider, // Added NatsConnectionProvider
 )
