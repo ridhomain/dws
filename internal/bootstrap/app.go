@@ -177,7 +177,7 @@ func (a *App) Run(ctx context.Context) error {
 		chainedAdminHandler := apiKeyAuth(adminAuthedHandler)
 		finalAdminWsHandler := middleware.RequestIDMiddleware(chainedAdminHandler)
 		a.httpServeMux.Handle("GET /ws/admin", finalAdminWsHandler)
-		a.logger.Info(ctx, "Admin WebSocket endpoint /ws/admin registered")
+		a.logger.Info(ctx, "/ws/admin endpoint registered")
 	} else {
 		a.logger.Error(ctx, "AdminWsHandler, AdminAuthMiddleware, or ConfigProvider not initialized. /ws/admin endpoint will not be available.")
 	}
@@ -198,6 +198,16 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	if a.connectionManager != nil {
+		// Start global NATS consumer BEFORE other background services
+		if err := a.connectionManager.StartGlobalConsumer(ctx); err != nil {
+			a.logger.Error(ctx, "Failed to start global NATS consumer", "error", err.Error())
+			// Decide if this is fatal or if the service can run without it
+			// For now, we'll treat it as non-fatal but log the error
+			// return fmt.Errorf("failed to start global NATS consumer: %w", err)
+		} else {
+			a.logger.Info(ctx, "Global NATS consumer started successfully")
+		}
+
 		safego.Execute(ctx, a.logger, "ConnectionManagerKillSwitchListener", func() {
 			a.connectionManager.StartKillSwitchListener(ctx)
 		})
@@ -232,6 +242,12 @@ func (a *App) Run(ctx context.Context) error {
 		defer cancel()
 
 		if a.connectionManager != nil {
+			// Stop global consumer FIRST during shutdown
+			a.logger.Info(context.Background(), "Stopping global NATS consumer...")
+			if err := a.connectionManager.StopGlobalConsumer(); err != nil {
+				a.logger.Error(context.Background(), "Error stopping global NATS consumer", "error", err.Error())
+			}
+
 			a.logger.Info(context.Background(), "Closing all WebSocket connections gracefully...")
 			a.connectionManager.GracefullyCloseAllConnections(domain.StatusGoingAway, "Server is shutting down")
 			time.Sleep(1 * time.Second)

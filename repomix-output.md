@@ -5203,7 +5203,7 @@ func (a *ConsumerAdapter) SubscribeToChats(ctx context.Context, companyID, agent
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
-	subject := fmt.Sprintf("wa.%s.%s.chats", companyID, agentID)
+	subject := fmt.Sprintf("websocket.%s.%s.chats", companyID, agentID)
 	queueGroup := "ws_fanout"
 	a.logger.Info(ctx, "Attempting to subscribe to NATS subject with queue group",
 		"subject", subject,
@@ -5247,7 +5247,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
-	subject := fmt.Sprintf("wa.%s.%s.messages.%s", companyID, agentID, chatID)
+	subject := fmt.Sprintf("websocket.%s.%s.messages.%s", companyID, agentID, chatID)
 	queueGroup := "ws_fanout_messages_q"
 	durableNameBase := a.cfgProvider.Get().NATS.ConsumerName
 	durableNameForMessages := durableNameBase + "_messages_q"
@@ -5306,7 +5306,7 @@ func (a *ConsumerAdapter) SubscribeToAgentEvents(ctx context.Context, companyIDP
 	if a.js == nil {
 		return nil, fmt.Errorf("JetStream context is not initialized")
 	}
-	subject := fmt.Sprintf("wa.%s.%s.agents", companyIDPattern, agentIDPattern)
+	subject := fmt.Sprintf("websocket.%s.%s.agents", companyIDPattern, agentIDPattern)
 	queueGroup := "ws_fanout_admin_events"
 	a.logger.Info(ctx, "Attempting to subscribe to NATS agent events subject with queue group",
 		"subject", subject,

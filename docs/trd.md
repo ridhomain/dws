@@ -31,14 +31,14 @@ This section outlines the functional requirements, ordered by a suggested sequen
 | ------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | **FR-9A** | Basic Observability Setup          | Initial structured Zap JSON logging configured. Basic `/metrics` endpoint exposed (Prometheus client library integrated). Further metric definitions in FR-9B. |
 | **FR-4**  | Single-tab session enforcement     | Ensure one active socket per `(company, agent, user)` via Redis `SETNX session:<C>:<A>:<U> <pod_id> EX 30s` and `session_kill:<C>:<A>:<U>` pub/sub. `<pod_id>` is the unique, routable identifier of the pod (e.g., Pod IP). |
-| **FR-6**  | Automatic chat subscription        | On connect, subscribe to NATS subject `wa.<C>.<A>.chats` using JetStream `QueueSubscribe("", "ws_fanout")` on `wa_stream`. Payload is `EnrichedEventPayload` (see Section 6). Basic handling to forward these to connected clients. |
+| **FR-6**  | Automatic chat subscription        | On connect, subscribe to NATS subject `websocket.<C>.<A>.chats` using JetStream `QueueSubscribe("", "ws_fanout")` on `wa_stream`. Payload is `EnrichedEventPayload` (see Section 6). Basic handling to forward these to connected clients. |
 
 ### Phase 3: Message Routing, Fan-out & Advanced Observability
 
 | Ref     | Requirement                         | Acceptance Criteria                                                                                           |
 | ------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | **FR-5**  | Dynamic route registry             | Track pod ownership of chat/message routes via Redis. On connect, pod registers `SADD route:<C>:<A>:chats <pod_id> EX 30s`. On `select_chat(X)` (from FR-12), pod registers `SADD route:<C>:<A>:messages:<X> <pod_id> EX 30s` and clears previous specific message routes it owned for that session. The `<logical>` part of a route can be `chats` or `messages`. |
-| **FR-7**  | Per-thread message fan-out         | After `select_chat(X)`, client receives messages from `wa.<C>.<A>.messages.<X>`. If message delivered to non-owner pod, forward via gRPC `Push(EnrichedEventPayload)` to owner pod. gRPC failures (timeout, target unavailable) should be logged with `request_id`; message may be dropped after retries (e.g., 1 retry). |
+| **FR-7**  | Per-thread message fan-out         | After `select_chat(X)`, client receives messages from `websocket.<C>.<A>.messages.<X>`. If message delivered to non-owner pod, forward via gRPC `Push(EnrichedEventPayload)` to owner pod. gRPC failures (timeout, target unavailable) should be logged with `request_id`; message may be dropped after retries (e.g., 1 retry). |
 | **FR-9B** | Comprehensive Observability        | Implement all custom Prometheus metrics defined (e.g., `dws_*` counters, gauges) and the connection-duration histogram (buckets: 1m, 5m, 15m, 30m, 1h, 4h, 8h, 24h). Ensure `request_id` is consistently included in logs for tracing. |
 
 ### Phase 4: Stability & Operational Readiness
@@ -53,7 +53,7 @@ This section outlines the functional requirements, ordered by a suggested sequen
 | Ref         | Requirement                         | Acceptance Criteria                                                                                                                               |
 | ----------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **FR-ADMIN-1**| Admin WebSocket endpoint          | Accepts `GET /ws/admin?token=<AdminToken>&x-api-key=<K>`. Uses existing WebSocket library and `json.v1` sub-protocol. Admin token validated (e.g., specific claim or separate validation logic). |
-| **FR-ADMIN-2**| Agent table event subscription    | On admin connect, subscribe to NATS subject `wa.<company_id>.<agent_id>.agents` (published on `wa_stream` by `daisi-cdc-consumer-service`) using existing JetStream consumer logic (e.g., `ws_fanout` consumer configuration adapted for this additional subject). Payload is `EnrichedEventPayload` where `row_data` contains agent information. |
+| **FR-ADMIN-2**| Agent table event subscription    | On admin connect, subscribe to NATS subject `websocket.<company_id>.<agent_id>.agents` (published on `wa_stream` by `daisi-cdc-consumer-service`) using existing JetStream consumer logic (e.g., `ws_fanout` consumer configuration adapted for this additional subject). Payload is `EnrichedEventPayload` where `row_data` contains agent information. |
 | **FR-ADMIN-3**| Admin single-tab session          | Ensure one active socket per admin user (e.g., `AdminUserID` from token) via Redis `SETNX session:admin:<AdminUserID> <pod_id> EX 30s` and `session_kill:admin:<AdminUserID>` pub/sub. |
 
 ### Phase 6: Stability & Operational Readiness (Previously Phase 4)
@@ -61,7 +61,7 @@ This section outlines the functional requirements, ordered by a suggested sequen
 | Ref     | Requirement                         | Acceptance Criteria                                                                                           |
 | ------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | **FR-8**  | TTL refresh loop                   | Every 10s, pod extends expirations on its owned session keys (e.g., `session:<C>:<A>:<U>`, `session:admin:<AdminUserID>`) and active route keys (e.g., `route:<C>:<A>:chats`, `route:<C>:<A>:messages:<X>`) back to 30s. Refresh operations must only target keys specifically managed by the pod. |
-| **FR-10** | Graceful drain & back-pressure    | On `SIGTERM`, follow detailed shutdown sequence (see Section 5.3). Maintain JetStream lag ≤ 1s for the NATS consumer (e.g., `ws_fanout` on `wa_stream` which handles all relevant subjects including `wa.*.*.agents`). NATS JetStream consumer uses `AckPolicy=Explicit` and `MaxAckPending` (configurable). Messages are ACK'd after successful delivery to WebSocket client or successful gRPC forwarding. |
+| **FR-10** | Graceful drain & back-pressure    | On `SIGTERM`, follow detailed shutdown sequence (see Section 5.3). Maintain JetStream lag ≤ 1s for the NATS consumer (e.g., `ws_fanout` on `wa_stream` which handles all relevant subjects including `websocket.*.*.agents`). NATS JetStream consumer uses `AckPolicy=Explicit` and `MaxAckPending` (configurable). Messages are ACK'd after successful delivery to WebSocket client or successful gRPC forwarding. |
 
 ### Out of Scope
 
@@ -111,7 +111,7 @@ sequenceDiagram
     WS_A    ->> RED    : SREM route:<C>:<A>:msg:* podA
     WS_A    ->> RED    : SADD route:<C>:<A>:msg:123 podA EX 30s
     note over WS_A,WS_B: QueueSubscribe("", "ws_fanout")
-    JS_WA -->> WS_B    : wa.<C>.<A>.messages.123 {payload}
+    JS_WA -->> WS_B    : websocket.<C>.<A>.messages.123 {payload}
     alt WS_B owns socket
         WS_B -->> Browser : JSON frame
     else hop to owner
@@ -141,8 +141,8 @@ sequenceDiagram
     WS_A -->> AdminUI : {"type":"ready"}
     note over WS_A, AdminUI: Admin session established
 
-    note over WS_A: Subscribe to wa.<C>.<A>.agents on wa_stream
-    JS_WA -->> WS_A : wa.<C>.<A>.agents {EnrichedEventPayload for Agent}
+    note over WS_A: Subscribe to websocket.<C>.<A>.agents on wa_stream
+    JS_WA -->> WS_A : websocket.<C>.<A>.agents {EnrichedEventPayload for Agent}
     WS_A -->> AdminUI  : {"type":"event", "payload": {EnrichedEventPayload for Agent}}
 ```
 
@@ -156,7 +156,7 @@ sequenceDiagram
 | --------------------- | ------------------------------------------------- | ---------------------------------------------------------- |
 | Language & Build      | Go 1.23, CGO_ENABLED=0, multi-stage Docker (Bookworm-slim) | —                                                          |
 | WebSocket library     | `github.com/coder/websocket v1.8.13` with custom ping-pong       | Lightweight, context-aware. Ping interval 20s, 2 missed pongs timeout. |
-| Broker                | NATS JetStream (`wa_stream` consumer `ws_fanout`) | Push mode, `DeliverPolicy=All`, `AckPolicy=Explicit`. ACK after client/gRPC delivery. `wa_stream` handles subjects `wa.*.*.chats`, `wa.*.*.messages.*`, and `wa.*.*.agents` (for admin clients). |
+| Broker                | NATS JetStream (`wa_stream` consumer `ws_fanout`) | Push mode, `DeliverPolicy=All`, `AckPolicy=Explicit`. ACK after client/gRPC delivery. `wa_stream` handles subjects `websocket.*.*.chats`, `websocket.*.*.messages.*`, and `websocket.*.*.agents` (for admin clients). |
 | Cross-pod RPC         | gRPC over mTLS                                    | Forward events when non-owner pod receives message. Uses routable pod identifiers (e.g., Pod IP). Kubernetes headless service for discovery. |
 | Session store         | Redis 7 single-shard, LRU, maxmemory 200 MiB      | Keys expire 30 s. Use helper functions for key generation (see Section 5.2). Includes keys for admin sessions. |
 | Authentication & Authorization | API-key guard + AES-GCM token auth        | Handled by `AuthRequired` & `CheckTokenAuth` middleware (cached in Redis 30s). Admin tokens might have specific claims or use a dedicated validation path. |
@@ -254,13 +254,13 @@ func AdminSessionKey(adminUserID string) string { return fmt.Sprintf("session:ad
 
 ## 6. Data Model & Mapping
 
-The primary data payload received by `daisi-ws-service` from NATS JetStream (on subjects like `wa.<company_id>.<agent_id>.chats` and `wa.<company_id>.<agent_id>.messages.<chat_id>`) is the `EnrichedEventPayload`.
+The primary data payload received by `daisi-ws-service` from NATS JetStream (on subjects like `websocket.<company_id>.<agent_id>.chats` and `websocket.<company_id>.<agent_id>.messages.<chat_id>`) is the `EnrichedEventPayload`.
 
 Refer to the `daisi-cdc-consumer-service` documentation ([`cdc-service-docs/schemas.md`](./cdc-service-docs/schemas.md)) for the full JSON contract of `EnrichedEventPayload` and the NATS subject patterns published by the upstream service. `daisi-ws-service` consumes these exact subjects and payloads. Key upstream subjects consumed are:
 
-- **Chat list updates**: `wa.<company_id>.<agent_id>.chats` (on `wa_stream`)
-- **Specific message thread updates**: `wa.<company_id>.<agent_id>.messages.<chat_id>` (on `wa_stream`)
-- **Agent table events (for admin)**: `wa.<company_id>.<agent_id>.agents` (on `wa_stream`). The payload is `EnrichedEventPayload` where `row_data` contains agent information.
+- **Chat list updates**: `websocket.<company_id>.<agent_id>.chats` (on `wa_stream`)
+- **Specific message thread updates**: `websocket.<company_id>.<agent_id>.messages.<chat_id>` (on `wa_stream`)
+- **Agent table events (for admin)**: `websocket.<company_id>.<agent_id>.agents` (on `wa_stream`). The payload is `EnrichedEventPayload` where `row_data` contains agent information.
 
 ---
 

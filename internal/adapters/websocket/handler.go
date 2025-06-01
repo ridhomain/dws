@@ -20,14 +20,10 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 
 	"github.com/coder/websocket"
-	"github.com/nats-io/nats.go"
-	appnats "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/nats"
-	appredis "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/redis"
 
 	"runtime/debug"
 
 	"github.com/google/uuid"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 )
 
 // Handler handles WebSocket connections for the /ws endpoint.
@@ -297,19 +293,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The connCtx passed here is wsConnLifetimeCtx from ServeHTTP.
 // companyID, agentID, userID are authoritative, derived from the validated token.
 func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, companyID, agentID, userID string) {
-	// DO NOT add 'defer conn.Close(...)' here.
-	// manageConnection's context (connCtx) will be canceled externally (e.g., by ConnectionManager or if ServeHTTP fails post-goroutine start)
-	// or internally by conn.Close() if a read/write/ping error requires immediate shutdown.
-	// When connCtx is Done, this function will return, and the defer in ServeHTTP will handle DeregisterConnection.
-
-	// Use the authenticated IDs for logging here
 	h.logger.Info(connCtx, "WebSocket connection management started",
-		"subprotocol", conn.UnderlyingConn().Subprotocol(),
-		"remote_addr", conn.RemoteAddr(),
 		"company_id", companyID,
 		"agent_id", agentID,
 		"user_id", userID)
 
+	// Send ready message
 	readyMessage := domain.NewReadyMessage()
 	if err := conn.WriteJSON(readyMessage); err != nil {
 		h.logger.Error(connCtx, "Failed to send 'ready' message to client", "error", err.Error())
@@ -318,380 +307,33 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	metrics.IncrementMessagesSent(domain.MessageTypeReady)
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
 
-	// DIAGNOSTIC: Refined logging around the delay
-	h.logger.Debug(connCtx, "DIAGNOSTIC: Pre-sleep check. Context error (if any)", "error_before_sleep", fmt.Sprintf("%v", connCtx.Err()))
+	// NO MORE NATS SUBSCRIPTIONS HERE!
+	// The global consumer handles all NATS messages
 
-	time.Sleep(100 * time.Millisecond)
-
-	h.logger.Debug(connCtx, "DIAGNOSTIC: Post-sleep check. Context error (if any)", "error_after_sleep", fmt.Sprintf("%v", connCtx.Err()))
-
-	if connCtx.Err() != nil {
-		h.logger.Error(connCtx, "DIAGNOSTIC: Context WAS CANCELED during/after sleep period", "error", connCtx.Err())
-		// Use a more specific reason for CloseWithError if this path is taken
-		conn.CloseWithError(domain.NewErrorResponse(domain.ErrInternal, "Context canceled during diagnostic sleep", connCtx.Err().Error()), "context canceled (diag sleep)")
-		return
-	} else {
-		h.logger.Debug(connCtx, "DIAGNOSTIC: Context OK after sleep, proceeding to NATS.")
-	}
-
-	var generalSubscriptions []domain.NatsMessageSubscription   // For chat + agent events (always active)
-	var specificNatsSubscription domain.NatsMessageSubscription // For message events
-	var currentSpecificChatID string
-
-	// Combined handler for general events (chat + agent events)
-	// Initial subscription to general wa.C.A.chats topic
-	generalEventsNatsHandler := func(msg *nats.Msg) {
-		metrics.IncrementNatsMessagesReceived(msg.Subject)
-		defer func() {
-			if err := msg.Ack(); err != nil {
-				h.logger.Error(context.TODO(), "Failed to ACK general event NATS message", "subject", msg.Subject, "error", err)
-			}
-		}()
-
-		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
-		if natsRequestID == "" {
-			natsRequestID = uuid.NewString()
-		}
-		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
-
-		h.logger.Info(msgCtx, "Received general event from NATS", "subject", msg.Subject, "data_len", len(msg.Data))
-
-		var eventPayload domain.EnrichedEventPayload
-		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
-			h.logger.Error(msgCtx, "Failed to unmarshal general event payload", "subject", msg.Subject, "error", errUnmarshal.Error())
-			return
-		}
-
-		// Set event type based on NATS subject pattern
-		if strings.Contains(msg.Subject, ".chats") {
-			eventPayload.EventType = "chat"
-		} else if strings.Contains(msg.Subject, ".agents") {
-			eventPayload.EventType = "agent"
-		} else {
-			eventPayload.EventType = "unknown"
-			h.logger.Warn(msgCtx, "Unknown general event subject pattern", "subject", msg.Subject)
-		}
-
-		wsMessage := domain.NewEventMessage(eventPayload)
-		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
-			h.logger.Error(msgCtx, "Failed to forward general event to WebSocket client", "subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error())
-			return
-		}
-
-		metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-		// metrics.IncrementEventTypesSent(eventPayload.EventType)
-		h.logger.Debug(msgCtx, "Successfully delivered general NATS event to WebSocket client",
-			"subject", msg.Subject, "event_id", eventPayload.EventID, "event_type", eventPayload.EventType)
-
-		// Record session activity
-		if h.connManager != nil && h.connManager.SessionLocker() != nil {
-			sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-			adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
-			activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
-			if activityTTL <= 0 {
-				activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
-			}
-			if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
-				h.logger.Error(msgCtx, "Failed to record session activity after general NATS event write", "sessionKey", sessionKey, "error", errAct)
-			}
-		}
-	}
-
-	// Subscribe to general events (chat + agent) - always active
-	if h.natsAdapter != nil {
-		// Subscribe to chat events
-		chatSub, chatSubErr := h.natsAdapter.SubscribeToChats(connCtx, companyID, agentID, generalEventsNatsHandler)
-		if chatSubErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to NATS chats topic", "companyID", companyID, "agentID", agentID, "error", chatSubErr.Error())
-			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to chat updates", chatSubErr.Error())
-			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
-				h.logger.Error(connCtx, "Failed to send NATS subscription error to client", "error", sendErr.Error())
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeError)
-			}
-		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to NATS chats topic", "subject", chatSub.Subject())
-			generalSubscriptions = append(generalSubscriptions, chatSub)
-		}
-
-		// Subscribe to agent events
-		agentSub, agentSubErr := h.natsAdapter.SubscribeToAgentEvents(connCtx, companyID, agentID, generalEventsNatsHandler)
-		if agentSubErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events", "companyID", companyID, "agentID", agentID, "error", agentSubErr.Error())
-			h.logger.Warn(connCtx, "Continuing without agent events subscription")
-		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events", "subject", agentSub.Subject())
-			generalSubscriptions = append(generalSubscriptions, agentSub)
-		}
-	} else {
-		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to general events.")
-	}
-
-	// Renamed specificChatNatsMessageHandler from natsMessageHandler for clarity
-	specificChatNatsMessageHandler := func(msg *nats.Msg) {
-		metrics.IncrementNatsMessagesReceived(msg.Subject)
-
-		natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
-		if natsRequestID == "" {
-			natsRequestID = uuid.NewString()
-			h.logger.Debug(connCtx, "Generated new request_id for NATS message", "subject", msg.Subject, "new_request_id", natsRequestID)
-		} else {
-			h.logger.Debug(connCtx, "Using existing request_id from NATS message header", "subject", msg.Subject, "request_id", natsRequestID)
-		}
-		msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
-
-		msgCompanyID, msgAgentID, msgChatID, err := appnats.ParseNATSMessageSubject(msg.Subject)
-		if err != nil {
-			h.logger.Error(msgCtx, "Failed to parse NATS message subject", "subject", msg.Subject, "error", err.Error())
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(msgCtx, "Failed to ACK NATS message after subject parse error", "subject", msg.Subject, "error", ackErr.Error())
-			} else {
-				h.logger.Debug(msgCtx, "Successfully ACKed NATS message after subject parse error", "subject", msg.Subject)
-			}
-			return
-		}
-
-		h.logger.Debug(msgCtx, "Received NATS message",
-			"subject", msg.Subject,
-			"company_id", msgCompanyID,
-			"agent_id", msgAgentID,
-			"chat_id", msgChatID,
-			"data_size", len(msg.Data),
-			"operation", "NatsMessageHandler")
-
-		currentPodID := h.configProvider.Get().Server.PodID
-		if currentPodID == "" {
-			h.logger.Error(connCtx, "Current PodID is not configured, cannot determine message ownership.", "subject", msg.Subject)
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(connCtx, "Failed to ACK NATS message due to missing PodID config", "subject", msg.Subject, "error", ackErr.Error())
-			} else {
-				h.logger.Debug(connCtx, "Successfully ACKed NATS message due to missing PodID config", "subject", msg.Subject)
-			}
-			return
-		}
-
-		ownerPodID, err := h.routeRegistry.GetOwningPodForMessageRoute(connCtx, msgCompanyID, msgAgentID, msgChatID)
-		if err != nil {
-			if errors.Is(err, appredis.ErrNoOwningPod) {
-				h.logger.Warn(connCtx, "No owning pod found for message route in Redis, potential race or cleanup issue. NACKing message.", "subject", msg.Subject, "chat_id_from_subject", msgChatID)
-				if nakErr := msg.Nak(); nakErr != nil {
-					h.logger.Error(connCtx, "Failed to NACK NATS message for ErrNoOwningPod", "subject", msg.Subject, "error", nakErr.Error())
-					// If Nak fails, Ack to prevent redelivery loop
-					if ackErr := msg.Ack(); ackErr != nil {
-						h.logger.Error(connCtx, "Failed to ACK NATS message after failed NACK (ErrNoOwningPod)", "subject", msg.Subject, "error", ackErr.Error())
-					} else {
-						h.logger.Debug(connCtx, "Successfully ACKed NATS message after failed NACK (ErrNoOwningPod)", "subject", msg.Subject)
-					}
-				}
-				return // Message NAK'd (or ACK'd if NAK failed)
-			}
-			h.logger.Error(connCtx, "Failed to get owning pod for message route from Redis", "subject", msg.Subject, "error", err.Error())
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(connCtx, "Failed to ACK NATS message after Redis owner lookup error", "subject", msg.Subject, "error", ackErr.Error())
-			} else {
-				h.logger.Debug(connCtx, "Successfully ACKed NATS message after Redis owner lookup error", "subject", msg.Subject)
-			}
-			return
-		}
-
-		isOwner := ownerPodID == currentPodID
-
-		if !isOwner {
-			h.logger.Info(msgCtx, "This pod is NOT the owner of the message route. Attempting to forward.",
-				"subject", msg.Subject, "owner_pod_id", ownerPodID, "current_pod_id", currentPodID, "chat_id_from_subject", msgChatID)
-
-			var eventPayloadToForward domain.EnrichedEventPayload
-			if errUnmarshal := json.Unmarshal(msg.Data, &eventPayloadToForward); errUnmarshal != nil {
-				h.logger.Error(msgCtx, "Failed to unmarshal NATS message data for forwarding (non-owner)", "subject", msg.Subject, "error", errUnmarshal.Error())
-				// Ack since unmarshalling failed, message is likely malformed.
-				if ackErr := msg.Ack(); ackErr != nil {
-					h.logger.Error(msgCtx, "Failed to ACK NATS message after unmarshal error for forwarding (non-owner)", "subject", msg.Subject, "error", ackErr.Error())
-				} else {
-					h.logger.Debug(msgCtx, "Successfully ACKed NATS message after unmarshal error for forwarding (non-owner)", "subject", msg.Subject)
-				}
-				return
-			}
-
-			targetGRPCAddress := fmt.Sprintf("%s:%d", ownerPodID, h.configProvider.Get().Server.GRPCPort)
-			if errFwd := h.messageForwarder.ForwardEvent(msgCtx, targetGRPCAddress, &eventPayloadToForward, msgCompanyID, msgAgentID, msgChatID, currentPodID); errFwd != nil {
-				h.logger.Error(msgCtx, "Failed to forward NATS message to owner pod (non-owner). NACKing.",
-					"subject", msg.Subject, "owner_pod_id", ownerPodID, "target_grpc_address", targetGRPCAddress, "error", errFwd.Error())
-				if nakErr := msg.Nak(); nakErr != nil {
-					h.logger.Error(msgCtx, "Failed to NACK NATS message after forwarding error (non-owner)", "subject", msg.Subject, "error", nakErr.Error())
-					if ackErr := msg.Ack(); ackErr != nil {
-						h.logger.Error(connCtx, "Failed to ACK NATS message after failed NACK (non-owner, forwarding error)", "subject", msg.Subject, "error", ackErr.Error())
-					} else {
-						h.logger.Debug(connCtx, "Successfully ACKed NATS message after failed NACK (non-owner, forwarding error)", "subject", msg.Subject)
-					}
-				}
-			} else {
-				h.logger.Info(msgCtx, "Successfully forwarded NATS message to owner pod (non-owner). ACKed.",
-					"subject", msg.Subject, "owner_pod_id", ownerPodID, "target_grpc_address", targetGRPCAddress)
-				if ackErr := msg.Ack(); ackErr != nil {
-					h.logger.Error(msgCtx, "Failed to ACK NATS message after successful forwarding (non-owner)", "subject", msg.Subject, "error", ackErr.Error())
-				} else {
-					h.logger.Debug(msgCtx, "Successfully ACKed NATS message after successful forwarding (non-owner)", "subject", msg.Subject)
-				}
-			}
-			return // Message processed by non-owner (forwarded or NAK'd/ACK'd)
-		}
-
-		// This pod is the owner
-		h.logger.Info(msgCtx, "This pod is the owner of the message route. Processing NATS message.",
-			"subject", msg.Subject, "company_id", msgCompanyID, "agent_id", msgAgentID, "chat_id", msgChatID, "pod_id", currentPodID)
-
-		var eventPayload domain.EnrichedEventPayload
-		if errUnmarshal := json.Unmarshal(msg.Data, &eventPayload); errUnmarshal != nil {
-			h.logger.Error(msgCtx, "Failed to unmarshal NATS message payload (owner)",
-				"subject", msg.Subject, "chat_id_from_subject", msgChatID, "error", errUnmarshal.Error(),
-			)
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(msgCtx, "Failed to ACK NATS message after unmarshal error (owner)", "subject", msg.Subject, "error", ackErr.Error())
-			} else {
-				h.logger.Debug(msgCtx, "Successfully ACKed NATS message after unmarshal error (owner)", "subject", msg.Subject)
-			}
-			return
-		}
-
-		if conn == nil || connCtx.Err() != nil { // Check connection context for cancellation
-			h.logger.Warn(msgCtx, "WebSocket connection is closed, nil, or context cancelled. Cannot deliver NATS message. Acking.",
-				"subject", msg.Subject, "company_id", companyID, "agent_id", agentID, "user_id", userID, "chat_id_from_payload", eventPayload.ChatID)
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(msgCtx, "Failed to ACK NATS message for closed/nil/cancelled WebSocket connection (owner)", "subject", msg.Subject, "error", ackErr.Error())
-			} else {
-				h.logger.Debug(msgCtx, "Successfully ACKed NATS message for closed/nil/cancelled WebSocket connection (owner)", "subject", msg.Subject)
-			}
-			return
-		}
-
-		eventPayload.EventType = "message"
-		// metrics.IncrementEventTypesSent(eventPayload.EventType)
-
-		wsMessage := domain.NewEventMessage(eventPayload)
-		if errWrite := conn.WriteJSON(wsMessage); errWrite != nil {
-			h.logger.Error(msgCtx, "Failed to forward NATS message to WebSocket client (owner)",
-				"subject", msg.Subject, "event_id", eventPayload.EventID, "error", errWrite.Error(),
-			)
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(msgCtx, "Failed to ACK NATS message after WebSocket write error (owner)", "subject", msg.Subject, "error", ackErr.Error())
-			} else {
-				h.logger.Debug(msgCtx, "Successfully ACKed NATS message after WebSocket write error (owner)", "subject", msg.Subject)
-			}
-			return
-		}
-
-		metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-		h.logger.Debug(msgCtx, "Successfully delivered NATS message to WebSocket client",
-			"subject", msg.Subject,
-			"event_id", eventPayload.EventID,
-			"operation", "NatsMessageHandler")
-
-		if h.connManager != nil && h.connManager.SessionLocker() != nil {
-			sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-			adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
-			activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
-			if activityTTL <= 0 {
-				activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
-			}
-			if errAct := h.connManager.SessionLocker().RecordActivity(msgCtx, sessionKey, activityTTL); errAct != nil {
-				h.logger.Error(msgCtx, "Failed to record session activity after specific NATS event write", "sessionKey", sessionKey, "error", errAct)
-			} else {
-				h.logger.Debug(msgCtx, "Recorded session activity after message delivery",
-					"session_key", sessionKey,
-					"ttl", activityTTL.String(),
-					"operation", "NatsMessageHandler")
-			}
-		}
-		if h.routeRegistry != nil {
-			messageRouteKey := rediskeys.RouteKeyMessages(msgCompanyID, msgAgentID, msgChatID)
-			adaptiveMsgRouteCfg := h.configProvider.Get().AdaptiveTTL.MessageRoute
-			activityTTL := time.Duration(adaptiveMsgRouteCfg.MaxTTLSeconds) * time.Second
-			if activityTTL <= 0 {
-				activityTTL = time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second * 2
-			}
-			if errAct := h.routeRegistry.RecordActivity(msgCtx, messageRouteKey, activityTTL); errAct != nil {
-				h.logger.Error(msgCtx, "Failed to record message route activity",
-					"subject", msg.Subject, "company_id", msgCompanyID, "agent_id", msgAgentID, "chat_id", msgChatID, "error", errAct.Error(),
-				)
-			} else {
-				h.logger.Debug(msgCtx, "Recorded message route activity after message delivery by owner",
-					"message_route_key", messageRouteKey, "ttl", activityTTL.String())
-			}
-		}
-		if err := msg.Ack(); err != nil {
-			h.logger.Error(msgCtx, "Failed to ACK NATS message after successful processing (owner)", "subject", msg.Subject, "error", err.Error())
-		} else {
-			h.logger.Debug(msgCtx, "Successfully ACKed NATS message after successful processing (owner)", "subject", msg.Subject)
-		}
-	} // End of specificChatNatsMessageHandler
-
-	// Do NOT subscribe to specific chat messages initially with an empty chatID.
-	// Subscription to specific messages will happen within handleSelectChatMessage
-	// after a valid select_chat message is received from the client.
-	// currentSpecificChatID remains "" initially.
-	// specificNatsSubscription remains nil initially.
-
-	// Cleanup all subscriptions
-	defer func() {
-		// Cleanup all general subscriptions (chat + agent)
-		for i, sub := range generalSubscriptions {
-			if sub != nil && sub.IsValid() {
-				subType := "chat"
-				if i == 1 {
-					subType = "agent"
-				}
-				h.logger.Info(connCtx, "Draining general NATS subscription on connection close",
-					"subject", sub.Subject(), "type", subType)
-				if unsubErr := sub.Drain(); unsubErr != nil {
-					h.logger.Error(connCtx, "Error draining general NATS subscription on close",
-						"subject", sub.Subject(), "type", subType, "error", unsubErr.Error())
-				}
-			}
-		}
-
-		// Cleanup specific subscription
-		if specificNatsSubscription != nil && specificNatsSubscription.IsValid() {
-			h.logger.Info(connCtx, "Draining specific NATS subscription on connection close",
-				"subject", specificNatsSubscription.Subject(), "chatID", currentSpecificChatID)
-			if unsubErr := specificNatsSubscription.Drain(); unsubErr != nil {
-				h.logger.Error(connCtx, "Error draining specific NATS subscription on close",
-					"subject", specificNatsSubscription.Subject(), "error", unsubErr.Error())
-			}
-		}
-	}()
-
+	// Setup ping/pong handling (unchanged)
 	appCfg := conn.config
 	pingInterval := time.Duration(appCfg.PingIntervalSeconds) * time.Second
 	pongWaitDuration := time.Duration(appCfg.PongWaitSeconds) * time.Second
 	writeTimeout := time.Duration(appCfg.WriteTimeoutSeconds) * time.Second
 	if writeTimeout <= 0 {
-		writeTimeout = 10 * time.Second // Default write timeout
+		writeTimeout = 10 * time.Second
 	}
 
 	if pingInterval > 0 {
-		pinger := time.NewTicker(pingInterval)
-		defer pinger.Stop()
+		// Pinger goroutine (unchanged)
+		safego.Execute(connCtx, h.logger, fmt.Sprintf("WebSocketPinger-%s", conn.RemoteAddr()), func() {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
 
-		// Goroutine for sending pings periodically
-		safego.Execute(connCtx, conn.logger, fmt.Sprintf("WebSocketPinger-%s", conn.RemoteAddr()), func() {
 			for {
 				select {
-				case <-pinger.C:
-					// IMPLEMENTATION CHANGE: Don't use conn.Ping() as it doesn't seem to work consistently with received PONGs
-					// Instead, manually write a PING and rely on our OnPongReceived callback which updates LastPongTime()
-					// We've confirmed OnPongReceived works (logs show "Pong received via AcceptOptions callback")
-
-					// The old approach that doesn't work properly:
-					// pingOpCtx, pingOpCancel := context.WithTimeout(context.Background(), 70*time.Second)
-					// if err := conn.Ping(pingOpCtx); err != nil { ... }
-
-					// New approach: just write a PING frame directly
+				case <-connCtx.Done():
+					h.logger.Info(connCtx, "Connection context done in pinger, stopping pinger goroutine")
+					return
+				case <-ticker.C:
 					writeCtx, writeCancel := context.WithTimeout(connCtx, writeTimeout)
-
-					// Get the underlying *websocket.Conn and use it to send PING directly
 					wsConn := conn.UnderlyingConn()
-					err := wsConn.Ping(writeCtx) // Simple ping without waiting for PONG
-
+					err := wsConn.Ping(writeCtx)
 					writeCancel()
 					if err != nil {
 						h.logger.Error(connCtx, "Failed to send PING frame", "error", err.Error())
@@ -699,27 +341,20 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 						conn.CloseWithError(errResp, "Ping write failure")
 						return
 					}
+					h.logger.Debug(connCtx, "Sent ping frame")
 
-					h.logger.Debug(connCtx, "Sent ping frame manually") // Changed log to be more specific
-
-					// This check uses OUR lastPongTime, updated by OnPongReceived callback
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
-						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr(), "lastPong", conn.LastPongTime())
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received within the configured duration.")
+						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr())
+						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received")
 						conn.CloseWithError(errResp, "Pong timeout")
 						return
 					}
-				case <-connCtx.Done():
-					h.logger.Info(connCtx, "Connection context done in pinger, stopping pinger goroutine")
-					return
 				}
 			}
 		})
-	} else {
-		h.logger.Warn(connCtx, "Ping interval is not configured or invalid, server-initiated pings disabled.", "configured_interval_sec", appCfg.PingIntervalSeconds)
 	}
 
-	// Main read loop with pong timeout logic
+	// Main read loop - only handles client messages now
 	for {
 		var readCtx context.Context
 		var cancelRead context.CancelFunc
@@ -727,20 +362,19 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 		if pongWaitDuration > 0 {
 			readCtx, cancelRead = context.WithTimeout(connCtx, pongWaitDuration)
 		} else {
-			// If no pongWaitDuration, use the connection's main context without a specific read timeout
 			readCtx = connCtx
 		}
 
 		msgType, p, errRead := conn.ReadMessage(readCtx)
-		if cancelRead != nil { // Always call cancel if WithTimeout was used
+		if cancelRead != nil {
 			cancelRead()
 		}
 
 		if errRead != nil {
-			// Check if the error is due to the readCtx timeout (pong timeout)
+			// Error handling (unchanged)
 			if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
-				h.logger.Warn(connCtx, "Pong timeout: No message received within pongWaitDuration. Closing connection.", "pong_wait_duration", pongWaitDuration)
-				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received within the configured timeout period.")
+				h.logger.Warn(connCtx, "Pong timeout: No message received within pongWaitDuration")
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No message received")
 				conn.CloseWithError(errResp, "Pong timeout")
 				return
 			}
@@ -749,245 +383,127 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 			if closeStatus == websocket.StatusNormalClosure || closeStatus == websocket.StatusGoingAway {
 				h.logger.Info(connCtx, "WebSocket connection closed by peer", "status_code", closeStatus)
 			} else if errors.Is(errRead, context.Canceled) || connCtx.Err() == context.Canceled {
-				h.logger.Info(connCtx, "WebSocket connection context canceled. Exiting manageConnection loop.")
-			} else if closeStatus == -1 && (strings.Contains(strings.ToLower(errRead.Error()), "eof") || strings.Contains(strings.ToLower(errRead.Error()), "closed")) {
-				// More robust check for abrupt closure or already closed connection
-				h.logger.Info(connCtx, "WebSocket connection read EOF or already closed. Peer likely disconnected abruptly.", "error", errRead.Error())
+				h.logger.Info(connCtx, "WebSocket connection context canceled")
 			} else {
-				h.logger.Error(connCtx, "Error reading from WebSocket", "error", errRead.Error(), "close_status_code", closeStatus)
+				h.logger.Error(connCtx, "Error reading from WebSocket", "error", errRead.Error())
 			}
-			return // Exit loop on any error or client close
+			return
 		}
-		h.logger.Debug(connCtx, "Received message from WebSocket",
-			"type", msgType.String(),
-			"payload_len", len(p),
-		)
-		// This is where you would unmarshal `p` into a BaseMessage, then switch on Type.
+
 		if msgType == websocket.MessageText {
 			var baseMsg domain.BaseMessage
 			if err := json.Unmarshal(p, &baseMsg); err != nil {
-				h.logger.Error(connCtx, "Failed to unmarshal incoming message into BaseMessage", "error", err.Error())
+				h.logger.Error(connCtx, "Failed to unmarshal incoming message", "error", err.Error())
 				errResp := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid message format", err.Error())
 				if sendErr := conn.WriteJSON(domain.NewErrorMessage(errResp)); sendErr != nil {
-					h.logger.Error(connCtx, "Failed to send error message to client for invalid format", "error", sendErr.Error())
+					h.logger.Error(connCtx, "Failed to send error message to client", "error", sendErr.Error())
 				} else {
 					metrics.IncrementMessagesSent(domain.MessageTypeError)
 				}
-				metrics.IncrementMessagesReceived("invalid_json") // Or a more specific type if type cannot be parsed
+				metrics.IncrementMessagesReceived("invalid_json")
 				continue
 			}
-			metrics.IncrementMessagesReceived(baseMsg.Type) // Increment after successful unmarshal and type identification
+			metrics.IncrementMessagesReceived(baseMsg.Type)
 
 			switch baseMsg.Type {
 			case domain.MessageTypeSelectChat:
 				h.logger.Info(connCtx, "Handling select_chat message type")
-				// Pass the natsMessageHandler and a way to update currentNatsSubscription
-				newSub, newChatID, err := h.handleSelectChatMessage(connCtx, conn, companyID, agentID, userID, baseMsg.Payload, specificChatNatsMessageHandler, specificNatsSubscription, currentSpecificChatID)
-				if err != nil {
+				if err := h.handleSelectChatMessage(connCtx, conn, companyID, agentID, userID, baseMsg.Payload); err != nil {
 					h.logger.Error(connCtx, "Error handling select_chat message", "error", err.Error())
 					errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to process chat selection", err.Error())
 					if sendErr := conn.WriteJSON(domain.NewErrorMessage(errResp)); sendErr != nil {
-						h.logger.Error(connCtx, "Failed to send error to client for select_chat failure", "error", sendErr.Error())
+						h.logger.Error(connCtx, "Failed to send error to client", "error", sendErr.Error())
 					} else {
 						metrics.IncrementMessagesSent(domain.MessageTypeError)
 					}
-				} else {
-					specificNatsSubscription = newSub
-					currentSpecificChatID = newChatID
-					// Record session activity after successful chat selection
-					if h.connManager != nil && h.connManager.SessionLocker() != nil {
-						sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
-						adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
-						activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
-						if activityTTL <= 0 { // Fallback if MaxTTLSeconds is not set or zero
-							activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2 // Default to 2x base session TTL
-						}
-						if errAct := h.connManager.SessionLocker().RecordActivity(connCtx, sessionKey, activityTTL); errAct != nil {
-							h.logger.Error(connCtx, "Failed to record session activity after select_chat", "sessionKey", sessionKey, "error", errAct)
-						} else {
-							h.logger.Debug(connCtx, "Recorded session activity after select_chat", "sessionKey", sessionKey, "activityTTL", activityTTL.String())
-						}
-					}
 				}
 			case domain.MessageTypeReady:
-				h.logger.Info(connCtx, "Received 'ready' message from client. Echoing back.", "type", baseMsg.Type, "payload", baseMsg.Payload)
-				// Echo the received ready message (type and payload) back to the client
+				h.logger.Info(connCtx, "Received 'ready' message from client. Echoing back.")
 				if err := conn.WriteJSON(baseMsg); err != nil {
 					h.logger.Error(connCtx, "Failed to echo 'ready' message to client", "error", err.Error())
 				} else {
 					metrics.IncrementMessagesSent(domain.MessageTypeReady)
-					h.logger.Info(connCtx, "Successfully echoed 'ready' message to client")
 				}
 			default:
-				h.logger.Warn(connCtx, "Handling unknown message type", "type", baseMsg.Type)
+				h.logger.Warn(connCtx, "Received unhandled message type", "type", baseMsg.Type)
 				h.handleUnknownMessage(connCtx, conn, baseMsg)
 			}
-		} else if msgType == websocket.MessageBinary {
-			h.logger.Info(connCtx, "Received binary message, currently unhandled.")
-			// Handle binary messages if necessary for your protocol
 		}
 	}
 }
 
-// handleSelectChatMessage processes incoming messages of type MessageTypeSelectChat.
-// It now accepts the already unmarshalled payload to avoid double unmarshalling.
-// It also takes the NATS message handler and the current NATS subscription to manage transitions.
+// Simplified handleSelectChatMessage - no NATS subscription management
 func (h *Handler) handleSelectChatMessage(
 	connCtx context.Context,
 	conn *Connection,
 	companyID, agentID, userID string,
 	payloadData interface{},
-	specificChatNatsMsgHandler domain.NatsMessageHandler,
-	currentSpecificSub domain.NatsMessageSubscription,
-	currentSpecificSubChatID string,
-) (domain.NatsMessageSubscription, string, error) {
-
+) error {
 	payloadMap, ok := payloadData.(map[string]interface{})
 	if !ok {
-		h.logger.Error(connCtx, "Invalid payload structure for select_chat after initial unmarshal", "type_received", fmt.Sprintf("%T", payloadData))
-		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload structure", "Expected a JSON object as payload.")
+		h.logger.Error(connCtx, "Invalid payload structure for select_chat")
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload structure", "Expected a JSON object")
 		if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for select_chat structure", "error", sendErr.Error())
+			h.logger.Error(connCtx, "Failed to send error message to client", "error", sendErr.Error())
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("invalid payload structure") // Return current sub and old chatID on error
+		return fmt.Errorf("invalid payload structure")
 	}
 
 	chatIDInterface, found := payloadMap["chat_id"]
 	if !found {
-		h.logger.Error(connCtx, "chat_id missing from select_chat payload map", "company", companyID, "agent", agentID, "user", userID)
-		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", "chat_id is missing.")
+		h.logger.Error(connCtx, "chat_id missing from select_chat payload")
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", "chat_id is missing")
 		if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for missing chat_id", "error", sendErr.Error())
+			h.logger.Error(connCtx, "Failed to send error message to client", "error", sendErr.Error())
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("chat_id missing from payload") // Return current sub and old chatID on error
+		return fmt.Errorf("chat_id missing from payload")
 	}
 
 	chatID, ok := chatIDInterface.(string)
 	if !ok || chatID == "" {
-		h.logger.Error(connCtx, "Invalid chat_id type or empty in select_chat payload", "type_received", fmt.Sprintf("%T", chatIDInterface), "value", chatIDInterface, "company", companyID, "agent", agentID, "user", userID)
-		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", "chat_id must be a non-empty string.")
+		h.logger.Error(connCtx, "Invalid chat_id type or empty")
+		errorResponse := domain.NewErrorResponse(domain.ErrBadRequest, "Invalid select_chat payload", "chat_id must be a non-empty string")
 		if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for invalid chat_id type", "error", sendErr.Error())
+			h.logger.Error(connCtx, "Failed to send error message to client", "error", sendErr.Error())
 		} else {
 			metrics.IncrementMessagesSent(domain.MessageTypeError)
 		}
-		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("invalid chat_id type or empty") // Return current sub and old chatID on error
+		return fmt.Errorf("invalid chat_id type or empty")
 	}
 
 	h.logger.Info(connCtx, "Client selected chat", "chat_id", chatID, "company", companyID, "agent", agentID, "user", userID)
 
-	cfg := h.configProvider.Get()
-	podID := cfg.Server.PodID
-	routeTTL := time.Duration(cfg.App.RouteTTLSeconds) * time.Second
-	if routeTTL <= 0 {
-		routeTTL = 30 * time.Second // Default if not configured
-		h.logger.Warn(connCtx, "RouteTTLSeconds not configured or zero, using default 30s for message route registration", "newChatID", chatID)
-	}
-
-	if podID == "" {
-		h.logger.Error(connCtx, "PodID is not configured. Cannot manage message routes.", "newChatID", chatID)
-		// Optionally send an error back to the client
-		errorResponse := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Cannot process chat selection due to server misconfiguration.")
-		if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for podID config error", "error", sendErr.Error())
-		} else {
-			metrics.IncrementMessagesSent(domain.MessageTypeError)
-		}
-		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("podID is not configured") // Return current sub and old chatID on error
-	}
-
-	routeReg := h.connManager.RouteRegistrar()
-	if routeReg == nil {
-		h.logger.Error(connCtx, "RouteRegistry is not available in ConnectionManager. Cannot manage message routes.", "newChatID", chatID)
-		// Optionally send an error back to the client
-		errorResponse := domain.NewErrorResponse(domain.ErrInternal, "Server error", "Cannot process chat selection due to server error.")
-		if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for RouteRegistry nil error", "error", sendErr.Error())
-		} else {
-			metrics.IncrementMessagesSent(domain.MessageTypeError)
-		}
-		return currentSpecificSub, conn.GetCurrentChatID(), fmt.Errorf("routeRegistry is nil") // Return current sub and old chatID on error
-	}
-
 	oldChatID := conn.GetCurrentChatID()
-
 	if oldChatID == chatID {
-		h.logger.Info(connCtx, "Client selected the same chat_id, no changes to routes or NATS subscription needed.", "chatID", chatID)
-		return currentSpecificSub, chatID, nil // No change
+		h.logger.Info(connCtx, "Client selected the same chat_id, no changes needed", "chatID", chatID)
+		return nil
 	}
 
-	// Unregister Old Message Route
-	if oldChatID != "" {
-		h.logger.Info(connCtx, "Unregistering old message route", "oldChatID", oldChatID, "podID", podID)
-		if err := routeReg.UnregisterMessageRoute(connCtx, companyID, agentID, oldChatID, podID); err != nil {
-			h.logger.Error(connCtx, "Failed to unregister old message route",
-				"oldChatID", oldChatID, "podID", podID, "error", err.Error(),
-			)
-			// Continue to register the new one, but log the error
-		} else {
-			h.logger.Info(connCtx, "Successfully unregistered old message route", "oldChatID", oldChatID)
-		}
-	}
-
-	// Register New Message Route
-	h.logger.Info(connCtx, "Registering new message route", "newChatID", chatID, "podID", podID, "ttl", routeTTL.String())
-	if err := routeReg.RegisterMessageRoute(connCtx, companyID, agentID, chatID, podID, routeTTL); err != nil {
-		h.logger.Error(connCtx, "Failed to register new message route",
-			"newChatID", chatID, "podID", podID, "error", err.Error(),
-		)
-		errorResponse := domain.NewErrorResponse(domain.ErrInternal, "Failed to select chat", "Could not update message subscription.")
-		if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-			h.logger.Error(connCtx, "Failed to send error message to client for new route registration failure", "error", sendErr.Error())
-		} else {
-			metrics.IncrementMessagesSent(domain.MessageTypeError)
-		}
-		return currentSpecificSub, oldChatID, fmt.Errorf("failed to register new message route: %w", err) // Return current sub and old chatID
-	}
-	h.logger.Info(connCtx, "Successfully registered new message route", "newChatID", chatID)
-
-	// Manage NATS Subscription
-
-	// 1. Drain old specific subscription if it exists and is for a different chat
-	if currentSpecificSub != nil && currentSpecificSub.IsValid() && currentSpecificSubChatID != "" && currentSpecificSubChatID != chatID { // Added IsValid check
-		h.logger.Info(connCtx, "Draining previous NATS subscription for specific chat messages", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject())
-		if err := currentSpecificSub.Drain(); err != nil {
-			h.logger.Error(connCtx, "Failed to drain old specific NATS subscription", "old_chat_id", currentSpecificSubChatID, "subject", currentSpecificSub.Subject(), "error", err.Error())
-			// Log and continue, attempt to subscribe to new one
-		}
-	}
-
-	// 2. Subscribe to new chat message subject
-	var newSpecificSubscription domain.NatsMessageSubscription // Changed type
-	var newSubErr error
-	if h.natsAdapter != nil {
-		h.logger.Info(connCtx, "Subscribing to NATS for new chat_id", "companyID", companyID, "agentID", agentID, "new_chat_id", chatID)
-		newSpecificSubscription, newSubErr = h.natsAdapter.SubscribeToChatMessages(connCtx, companyID, agentID, chatID, specificChatNatsMsgHandler)
-		if newSubErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to NATS for new chat messages",
-				"companyID", companyID, "agentID", agentID, "new_chat_id", chatID, "error", newSubErr.Error(),
-			)
-			errorResponse := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to new chat events.", newSubErr.Error())
-			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorResponse)); sendErr != nil {
-				h.logger.Error(connCtx, "Failed to send error to client for NATS sub failure", "error", sendErr.Error())
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeError)
-			}
-			conn.SetCurrentChatID(oldChatID) // Revert to old chat ID if new subscription fails
-			return currentSpecificSub, oldChatID, fmt.Errorf("failed to subscribe to NATS for chat %s: %w", chatID, newSubErr)
-		}
-		h.logger.Info(connCtx, "Successfully subscribed to NATS for new chat messages", "new_chat_id", chatID, "subject", newSpecificSubscription.Subject())
-	} else {
-		h.logger.Warn(connCtx, "NATS adapter not available, cannot subscribe to new chat messages.", "new_chat_id", chatID)
-	}
-
+	// Update the connection's current chat ID
 	conn.SetCurrentChatID(chatID)
-	h.logger.Info(connCtx, "Updated current chat ID for connection", "newChatID", chatID)
+	h.logger.Info(connCtx, "Updated current chat ID for connection", "newChatID", chatID, "oldChatID", oldChatID)
 
-	return newSpecificSubscription, chatID, nil
+	// NO MORE NATS SUBSCRIPTION CHANGES!
+	// The global consumer will filter messages based on GetCurrentChatID()
+
+	// Record activity
+	if h.connManager != nil && h.connManager.SessionLocker() != nil {
+		sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+		adaptiveSessionCfg := h.configProvider.Get().AdaptiveTTL.SessionLock
+		activityTTL := time.Duration(adaptiveSessionCfg.MaxTTLSeconds) * time.Second
+		if activityTTL <= 0 {
+			activityTTL = time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second * 2
+		}
+		if errAct := h.connManager.SessionLocker().RecordActivity(connCtx, sessionKey, activityTTL); errAct != nil {
+			h.logger.Error(connCtx, "Failed to record session activity after select_chat", "sessionKey", sessionKey, "error", errAct)
+		}
+	}
+
+	return nil
 }
 
 // handleUnknownMessage processes incoming messages of an unknown type.

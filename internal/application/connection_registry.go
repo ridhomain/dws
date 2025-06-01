@@ -2,8 +2,6 @@ package application
 
 import (
 	"context"
-	"fmt"
-	"time"
 
 	"github.com/coder/websocket"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
@@ -11,137 +9,126 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
 )
 
-// RegisterConnection stores the managed connection and registers its initial chat route.
+// RegisterConnection stores the managed connection and registers it with the global consumer
 func (cm *ConnectionManager) RegisterConnection(sessionKey string, conn domain.ManagedConnection, companyID, agentID string) {
-	debugRegCompanyID, _ := conn.Context().Value(contextkeys.CompanyIDKey).(string)
-	debugRegAgentID, _ := conn.Context().Value(contextkeys.AgentIDKey).(string)
-	cm.logger.Debug(conn.Context(), "DEBUG: Inside RegisterConnection context check",
-		"debug_reg_company_id", debugRegCompanyID,
-		"debug_reg_agent_id", debugRegAgentID,
-		"passed_company_id_param", companyID, // companyID param passed to function
-		"passed_agent_id_param", agentID, // agentID param passed to function
-		"sessionKey", sessionKey)
-
+	// Store in local map (keeping existing functionality)
 	cm.activeConnections.Store(sessionKey, conn)
 	metrics.IncrementActiveConnections()
-	cm.logger.Info(conn.Context(), "WebSocket connection registered with ConnectionManager", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr())
 
-	// Register initial chat route for this connection
-	cfg := cm.configProvider.Get()
-	podID := cfg.Server.PodID
-	routeTTL := time.Duration(cfg.App.RouteTTLSeconds) * time.Second
-	if routeTTL <= 0 {
-		routeTTL = 30 * time.Second // Default if not configured
-		cm.logger.Warn(conn.Context(), "RouteTTLSeconds not configured or zero, using default 30s for chat route registration", "sessionKey", sessionKey)
+	// Register with global consumer for efficient message routing
+	if cm.globalConsumer != nil {
+		cm.globalConsumer.RegisterConnection(sessionKey, companyID, agentID, conn)
 	}
 
-	if podID == "" {
-		cm.logger.Error(conn.Context(), "PodID is not configured. Cannot register chat route.", "sessionKey", sessionKey)
-		return
-	}
+	cm.logger.Info(conn.Context(), "WebSocket connection registered",
+		"sessionKey", sessionKey,
+		"companyID", companyID,
+		"agentID", agentID,
+		"remoteAddr", conn.RemoteAddr())
 
-	if cm.routeRegistry != nil {
-		err := cm.routeRegistry.RegisterChatRoute(conn.Context(), companyID, agentID, podID, routeTTL)
-		if err != nil {
-			cm.logger.Error(conn.Context(), "Failed to register chat route on connection registration",
-				"sessionKey", sessionKey, "companyID", companyID, "agentID", agentID, "podID", podID, "error", err.Error(),
-			)
-		} else {
-			cm.logger.Info(conn.Context(), "Successfully registered chat route on connection registration",
-				"sessionKey", sessionKey, "companyID", companyID, "agentID", agentID, "podID", podID, "ttl", routeTTL.String(),
-			)
-		}
-	} else {
-		cm.logger.Error(conn.Context(), "RouteRegistry is nil in ConnectionManager. Cannot register chat route.", "sessionKey", sessionKey)
+	// Log global consumer stats
+	if cm.globalConsumer != nil {
+		stats := cm.globalConsumer.GetStats()
+		cm.logger.Debug(conn.Context(), "Global consumer stats after registration",
+			"total_connections", stats["total_connections"],
+			"company_count", stats["company_count"])
 	}
 }
 
-// DeregisterConnection removes an active connection from management and attempts to release its session lock.
+// DeregisterConnection removes a connection from management and global consumer
 func (cm *ConnectionManager) DeregisterConnection(sessionKey string) {
 	connVal, loaded := cm.activeConnections.LoadAndDelete(sessionKey)
-	logCtx := context.Background() // Base context if connection-specific context is not available
+	logCtx := context.Background()
 
 	if loaded {
 		metrics.DecrementActiveConnections()
 		if managedConn, ok := connVal.(domain.ManagedConnection); ok {
-			logCtx = managedConn.Context() // Use connection's context if available
-			cm.logger.Info(logCtx, "WebSocket connection deregistered from ConnectionManager", "sessionKey", sessionKey, "remoteAddr", managedConn.RemoteAddr())
-		} else {
-			cm.logger.Warn(logCtx, "Deregistered a non-ManagedConnection connection from map", "sessionKey", sessionKey)
+			logCtx = managedConn.Context()
+			cm.logger.Info(logCtx, "WebSocket connection deregistered",
+				"sessionKey", sessionKey,
+				"remoteAddr", managedConn.RemoteAddr())
 		}
 
-		// Attempt to release the session lock associated with this connection
+		// Deregister from global consumer
+		if cm.globalConsumer != nil {
+			cm.globalConsumer.DeregisterConnection(sessionKey)
+		}
+
+		// Release session lock (existing logic)
 		podID := cm.configProvider.Get().Server.PodID
 		if podID != "" {
-			// Create a new detached context for ReleaseLock operation to prevent context cancellation issues
-			// This ensures that ReleaseLock can still complete even if the connection context was cancelled
 			releaseCtx := context.Background()
-
-			// Inherit request_id from the original context if possible
 			if reqID, ok := logCtx.Value(contextkeys.RequestIDKey).(string); ok && reqID != "" {
 				releaseCtx = context.WithValue(releaseCtx, contextkeys.RequestIDKey, reqID)
 			}
 
 			released, err := cm.sessionLocker.ReleaseLock(releaseCtx, sessionKey, podID)
 			if err != nil {
-				cm.logger.Error(logCtx, "Failed to release session lock on deregister", "sessionKey", sessionKey, "podID", podID, "error", err.Error())
+				cm.logger.Error(logCtx, "Failed to release session lock on deregister",
+					"sessionKey", sessionKey, "podID", podID, "error", err.Error())
 			} else if released {
-				cm.logger.Info(logCtx, "Successfully released session lock on deregister", "sessionKey", sessionKey, "podID", podID)
-			} else {
-				cm.logger.Warn(logCtx, "Could not release session lock on deregister (may not exist or not owned by this pod)", "sessionKey", sessionKey, "podID", podID)
+				cm.logger.Info(logCtx, "Successfully released session lock on deregister",
+					"sessionKey", sessionKey, "podID", podID)
 			}
-		} else {
-			cm.logger.Error(logCtx, "PodID is not configured. Cannot release session lock on deregister.", "sessionKey", sessionKey)
 		}
+	}
 
-	} else {
-		cm.logger.Debug(logCtx, "Attempted to deregister a connection not found in map", "sessionKey", sessionKey)
+	// Log global consumer stats
+	if cm.globalConsumer != nil {
+		stats := cm.globalConsumer.GetStats()
+		cm.logger.Debug(logCtx, "Global consumer stats after deregistration",
+			"total_connections", stats["total_connections"],
+			"company_count", stats["company_count"])
 	}
 }
 
-// GracefullyCloseAllConnections sends a graceful close frame to all active WebSocket connections.
-// This is typically called during a controlled service shutdown.
+// GracefullyCloseAllConnections updated to work with global consumer
 func (cm *ConnectionManager) GracefullyCloseAllConnections(closeCode websocket.StatusCode, reason string) {
-	cm.logger.Info(context.Background(), "Initiating graceful closure of all active WebSocket connections...", "code", closeCode, "reason", reason)
-	closedCount := 0
+	cm.logger.Info(context.Background(), "Initiating graceful closure of all active WebSocket connections...",
+		"code", closeCode, "reason", reason)
 
-	// Create a standard error response for graceful shutdown
+	closedCount := 0
 	errResp := domain.NewErrorResponse(domain.ErrInternal, "Service shutting down", "The WebSocket service is being gracefully terminated.")
 
+	// Close regular connections
 	cm.activeConnections.Range(func(key, value interface{}) bool {
 		sessionKey, okSessionKey := key.(string)
 		conn, okConn := value.(domain.ManagedConnection)
 		if !okSessionKey || !okConn {
-			cm.logger.Error(context.Background(), "Invalid type in activeConnections map during graceful shutdown", "key_type", fmt.Sprintf("%T", key), "value_type", fmt.Sprintf("%T", value))
-			return true // Continue to next item
+			cm.logger.Error(context.Background(), "Invalid type in activeConnections map during graceful shutdown")
+			return true
 		}
 
-		cm.logger.Info(conn.Context(), "Sending close frame to WebSocket connection", "sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+		cm.logger.Info(conn.Context(), "Sending close frame to WebSocket connection",
+			"sessionKey", sessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+
 		if err := conn.CloseWithError(errResp, reason); err != nil {
-			// Log error, but underlying connection context cancellation should ensure cleanup via DeregisterConnection later if not already.
-			cm.logger.Warn(conn.Context(), "Error sending close frame during graceful shutdown (will be forcibly closed)", "sessionKey", sessionKey, "error", err.Error())
+			cm.logger.Warn(conn.Context(), "Error sending close frame during graceful shutdown",
+				"sessionKey", sessionKey, "error", err.Error())
 		}
 		closedCount++
-		return true // Continue to next item
+		return true
 	})
 
-	// Also close any admin connections
+	// Close admin connections
 	cm.activeAdminConnections.Range(func(key, value interface{}) bool {
 		adminSessionKey, okSessionKey := key.(string)
 		conn, okConn := value.(domain.ManagedConnection)
 		if !okSessionKey || !okConn {
-			cm.logger.Error(context.Background(), "Invalid type in activeAdminConnections map during graceful shutdown", "key_type", fmt.Sprintf("%T", key), "value_type", fmt.Sprintf("%T", value))
-			return true // Continue to next item
+			cm.logger.Error(context.Background(), "Invalid type in activeAdminConnections map during graceful shutdown")
+			return true
 		}
 
-		cm.logger.Info(conn.Context(), "Sending close frame to admin WebSocket connection", "adminSessionKey", adminSessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+		cm.logger.Info(conn.Context(), "Sending close frame to admin WebSocket connection",
+			"adminSessionKey", adminSessionKey, "remoteAddr", conn.RemoteAddr(), "code", closeCode)
+
 		if err := conn.CloseWithError(errResp, reason); err != nil {
-			cm.logger.Warn(conn.Context(), "Error sending close frame to admin connection during graceful shutdown (will be forcibly closed)", "adminSessionKey", adminSessionKey, "error", err.Error())
+			cm.logger.Warn(conn.Context(), "Error sending close frame to admin connection during graceful shutdown",
+				"adminSessionKey", adminSessionKey, "error", err.Error())
 		}
 		closedCount++
-		return true // Continue to next item
+		return true
 	})
 
 	cm.logger.Info(context.Background(), "Graceful close frames sent to active connections", "count", closedCount)
-	// The actual deregistration and lock release happens when each connection's manageConnection goroutine exits due to context cancellation from conn.Close().
 }
