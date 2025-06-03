@@ -1,0 +1,98 @@
+# Server Configuration
+server:
+  http_port: 8080
+  grpc_port: 50051 # Corresponds to GRPC_PORT ENV
+  pod_id: "" # This should be set via ENV (e.g., POD_IP via Downward API)
+  enable_reflection: false # Default to false for production
+
+# NATS Configuration
+nats:
+  url: "nats://nats:4222" # Corresponds to NATS_URL ENV
+  stream_name: "wa_stream"
+  consumer_name: "ws_fanout"
+  connect_timeout_seconds: 5    # Default NATS client connection timeout
+  reconnect_wait_seconds: 2   # Default NATS client reconnect wait
+  max_reconnects: 5           # Default NATS client max reconnects (-1 for infinite)
+  ping_interval_seconds: 120  # NATS client default is 2 minutes
+  max_pings_out: 2            # NATS client default
+  retry_on_failed_connect: true # NATS client default
+
+# Redis Configuration
+redis:
+  address: "redis:6379" # Corresponds to REDIS_ADDR ENV
+  # password: "" # If needed
+  # db: 0       # If needed
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
+
+# Logging Configuration
+log:
+  level: "info" # Corresponds to LOG_LEVEL ENV
+
+# Authentication Configuration
+auth:
+  secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE" # General API Key
+  token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE" # For company token encryption
+  admin_secret_token: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE" # Admin API Key
+  token_cache_ttl_seconds: 30
+  admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
+  admin_token_cache_ttl_seconds: 60
+
+# Application Specific
+app:
+  service_name: "daisi-ws-service"
+  version: "1.0.0"
+  ping_interval_seconds: 20
+  shutdown_timeout_seconds: 30
+  pong_wait_seconds: 60 # Increased from any previous implicit/default values
+  write_timeout_seconds: 30
+  max_missed_pongs: 2
+  session_ttl_seconds: 3600
+  route_ttl_seconds: 3600
+  ttl_refresh_interval_seconds: 10
+  nats_max_ack_pending: 5000
+  session_lock_retry_delay_ms: 250
+  nats_ack_wait_seconds: 30
+  grpc_client_forward_timeout_seconds: 5 # Default to 5 seconds
+  read_timeout_seconds: 10    # Added for HTTP server
+  idle_timeout_seconds: 60    # Added for HTTP server
+  websocket_compression_mode: "disabled"  # Options: disabled, context_takeover, no_context_takeover
+  websocket_compression_threshold: 1024   # Bytes, applies if mode is not disabled. 0 means no threshold.
+  websocket_development_insecure_skip_verify: true # Set to true for local dev with self-signed certs ONLY
+  # New gRPC Client Pool and Circuit Breaker settings
+  grpc_pool_idle_timeout_seconds: 300             # 5 minutes
+  grpc_pool_health_check_interval_seconds: 60   # 1 minute (for proactive checks, if implemented)
+  grpc_circuitbreaker_fail_threshold: 5           # After 5 consecutive failures
+  grpc_circuitbreaker_open_duration_seconds: 30 # Circuit stays open for 30 seconds
+  # New WebSocket Backpressure settings
+  websocket_message_buffer_size: 100 # Number of messages that can be buffered per connection before blocking or dropping
+  websocket_backpressure_drop_policy: "drop_oldest" # "drop_oldest" or "block". What to do when buffer is full.
+  websocket_slow_client_latency_ms: 5000 # Threshold for considering a client's send buffer processing as slow.
+  websocket_slow_client_disconnect_threshold_ms: 30000 # Duration for which a client can be slow before being disconnected.
+
+# Adaptive TTL Configuration
+adaptive_ttl:
+  session_lock:
+    enabled: false
+    min_ttl_seconds: 30
+    max_ttl_seconds: 3600
+    activity_threshold_seconds: 3600
+    active_ttl_seconds: 3600
+    inactive_ttl_seconds: 3600
+  message_route:
+    enabled: true
+    min_ttl_seconds: 300
+    max_ttl_seconds: 900
+    activity_threshold_seconds: 600
+    active_ttl_seconds: 900
+    inactive_ttl_seconds: 300
+  chat_route:
+    enabled: false # Kept simple for now, uses fixed TTL from app.route_ttl_seconds
+    min_ttl_seconds: 1800
+    max_ttl_seconds: 7200
+    activity_threshold_seconds: 3600 
+    active_ttl_seconds: 3600
+    inactive_ttl_seconds: 1800
+
+# Config holds all configuration for the application. 
