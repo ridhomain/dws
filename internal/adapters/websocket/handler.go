@@ -28,23 +28,21 @@ import (
 
 // Handler handles WebSocket connections for the /ws endpoint.
 type Handler struct {
-	logger           domain.Logger
-	configProvider   config.Provider
-	connManager      *application.ConnectionManager
-	natsAdapter      domain.NatsConsumer
-	routeRegistry    domain.RouteRegistry
-	messageForwarder domain.MessageForwarder
+	logger         domain.Logger
+	configProvider config.Provider
+	connManager    *application.ConnectionManager
+	natsAdapter    domain.NatsConsumer
+	routeRegistry  domain.RouteRegistry
 }
 
 // NewHandler creates a new WebSocket handler.
-func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *Handler {
+func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry) *Handler {
 	return &Handler{
-		logger:           logger,
-		configProvider:   cfgProvider,
-		connManager:      connManager,
-		natsAdapter:      natsAdapter,
-		routeRegistry:    routeRegistry,
-		messageForwarder: messageForwarder,
+		logger:         logger,
+		configProvider: cfgProvider,
+		connManager:    connManager,
+		natsAdapter:    natsAdapter,
+		routeRegistry:  routeRegistry,
 	}
 }
 

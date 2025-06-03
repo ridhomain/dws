@@ -1,3 +1,5 @@
+// internal/adapters/nats/global_consumer.go - Updated for new subject format
+
 package nats
 
 import (
@@ -71,16 +73,14 @@ func (h *GlobalConsumerHandler) Start(ctx context.Context) error {
 	}
 
 	cfg := h.configProvider.Get()
-	queueGroup := "ws-service-group"
+	// queueGroup := "ws-service-group"
 
-	// Subscribe to all websocket.* events with queue group for load balancing
-	sub, err := h.js.QueueSubscribe(
-		"websocket.>", // Subscribe to all wa events
-		queueGroup,    // Queue group for load balancing across replicas
+	sub, err := h.js.Subscribe(
+		"websocket.>",
 		h.handleMessage,
-		nats.Durable("ws-global-consumer"),
-		nats.DeliverNew(), // Only new messages, no replay
-		nats.ManualAck(),  // Manual acknowledgment
+		nats.Durable(fmt.Sprintf("ws-global-consumer-%s", cfg.Server.PodID)),
+		nats.DeliverNew(),
+		nats.ManualAck(),
 		nats.AckWait(time.Duration(cfg.App.NatsAckWaitSeconds)*time.Second),
 		nats.MaxAckPending(cfg.App.NATSMaxAckPending),
 	)
@@ -91,10 +91,10 @@ func (h *GlobalConsumerHandler) Start(ctx context.Context) error {
 	}
 
 	h.subscription = sub
-	h.logger.Info(ctx, "Global NATS consumer started successfully",
+	h.logger.Info(ctx, "Global NATS consumer started successfully (no queue group)",
 		"subject", "websocket.>",
-		"queue_group", queueGroup,
-		"durable_name", "ws-global-consumer")
+		"durable_name", fmt.Sprintf("ws-global-consumer-%s", cfg.Server.PodID),
+		"pod_id", cfg.Server.PodID)
 
 	return nil
 }
@@ -120,7 +120,7 @@ func (h *GlobalConsumerHandler) Stop() error {
 	return nil
 }
 
-// handleMessage processes incoming NATS messages
+// handleMessage processes incoming NATS messages with new subject format
 func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 	startTime := time.Now()
 	metrics.IncrementNatsMessagesReceived(msg.Subject)
@@ -135,36 +135,33 @@ func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 		"subject", msg.Subject,
 		"data_size", len(msg.Data))
 
-	// Parse subject to determine routing
-	parts := strings.Split(msg.Subject, ".")
-	if len(parts) < 4 {
+	// Parse the new subject format: websocket.{company}.{agent}.{table}.{action}
+	// or websocket.{company}.{agent}.messages.{chatId}.{action}
+	subjectInfo := h.parseSubject(msg.Subject)
+	if !subjectInfo.IsValid {
 		h.logger.Error(ctx, "Invalid subject format", "subject", msg.Subject)
 		msg.Ack() // ACK invalid messages to prevent redelivery
 		return
 	}
 
-	// websocket.{company}.{agent}.{eventType}[.{additional}]
-	companyID := parts[1]
-	agentID := parts[2]
-	eventType := parts[3]
-
 	// Get relevant connections for this company/agent
-	connections := h.connRegistry.GetConnections(companyID, agentID)
+	connections := h.connRegistry.GetConnections(subjectInfo.CompanyID, subjectInfo.AgentID)
 
 	if len(connections) == 0 {
 		// No local connections for this company/agent, ACK and skip
 		h.logger.Debug(ctx, "No local connections for company/agent, skipping",
-			"company", companyID,
-			"agent", agentID,
+			"company", subjectInfo.CompanyID,
+			"agent", subjectInfo.AgentID,
 			"subject", msg.Subject)
 		msg.Ack()
 		return
 	}
 
 	h.logger.Info(ctx, "Broadcasting message to local connections",
-		"company", companyID,
-		"agent", agentID,
-		"event_type", eventType,
+		"company", subjectInfo.CompanyID,
+		"agent", subjectInfo.AgentID,
+		"table", subjectInfo.TableName,
+		"action", subjectInfo.Action,
 		"connection_count", len(connections))
 
 	// Parse event payload
@@ -177,30 +174,14 @@ func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 		return
 	}
 
-	// Set event type based on subject
-	switch eventType {
-	case "chats":
-		eventPayload.EventType = "chat"
-	case "agents":
-		eventPayload.EventType = "agent"
-	case "messages":
-		eventPayload.EventType = "message"
-		// For messages, we need to check if the connection has selected this chat
-		if len(parts) >= 5 {
-			chatID := parts[4]
-			connections = h.filterConnectionsByChat(connections, chatID)
-		}
-	case "contacts":
-		eventPayload.EventType = "contact"
-	default:
-		eventPayload.EventType = eventType
-	}
+	// Filter connections based on event type and chat selection
+	filteredConnections := h.filterConnectionsForEvent(connections, &eventPayload, subjectInfo)
 
 	// Broadcast to all relevant connections
 	successCount := 0
 	failCount := 0
 
-	for sessionKey, conn := range connections {
+	for sessionKey, conn := range filteredConnections {
 		// Check if connection context is still valid
 		if conn.Context().Err() != nil {
 			h.logger.Debug(ctx, "Skipping closed connection", "session_key", sessionKey)
@@ -224,6 +205,7 @@ func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 
 	h.logger.Info(ctx, "Message broadcast completed",
 		"subject", msg.Subject,
+		"event_type", eventPayload.EventType,
 		"success_count", successCount,
 		"fail_count", failCount,
 		"duration_ms", time.Since(startTime).Milliseconds())
@@ -234,12 +216,80 @@ func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 	}
 }
 
-// filterConnectionsByChat filters connections that have selected the specific chat
-func (h *GlobalConsumerHandler) filterConnectionsByChat(connections map[string]domain.ManagedConnection, chatID string) map[string]domain.ManagedConnection {
+// SubjectInfo holds parsed subject information
+type SubjectInfo struct {
+	CompanyID string
+	AgentID   string
+	TableName string
+	ChatID    string // Only for message events
+	Action    string
+	IsValid   bool
+}
+
+// parseSubject parses the new NATS subject format
+func (h *GlobalConsumerHandler) parseSubject(subject string) SubjectInfo {
+	parts := strings.Split(subject, ".")
+
+	// Minimum: websocket.{company}.{agent}.{table}.{action} = 5 parts
+	// Message format: websocket.{company}.{agent}.messages.{chatId}.{action} = 6 parts
+	if len(parts) < 5 {
+		return SubjectInfo{IsValid: false}
+	}
+
+	if parts[0] != "websocket" {
+		return SubjectInfo{IsValid: false}
+	}
+
+	info := SubjectInfo{
+		CompanyID: parts[1],
+		AgentID:   parts[2],
+		TableName: parts[3],
+		IsValid:   true,
+	}
+
+	// Handle message events with chat ID
+	if info.TableName == "messages" && len(parts) == 6 {
+		info.ChatID = parts[4]
+		info.Action = parts[5]
+	} else if len(parts) == 5 {
+		info.Action = parts[4]
+	} else {
+		return SubjectInfo{IsValid: false}
+	}
+
+	return info
+}
+
+// filterConnectionsForEvent filters connections based on event type and chat selection
+func (h *GlobalConsumerHandler) filterConnectionsForEvent(connections map[string]domain.ManagedConnection, eventPayload *domain.EnrichedEventPayload, subjectInfo SubjectInfo) map[string]domain.ManagedConnection {
 	filtered := make(map[string]domain.ManagedConnection)
 
 	for sessionKey, conn := range connections {
-		if conn.GetCurrentChatID() == chatID {
+		shouldInclude := false
+
+		switch subjectInfo.TableName {
+		case "messages":
+			// For message events, only send to connections that have selected this chat
+			if conn.GetCurrentChatID() == eventPayload.ChatID {
+				shouldInclude = true
+			}
+		case "chats":
+			// Chat events go to all connections for the company/agent
+			shouldInclude = true
+		case "agents":
+			// Agent events go to all connections for the company/agent
+			shouldInclude = true
+		case "contacts":
+			// Contact events go to all connections for the company/agent
+			shouldInclude = true
+		default:
+			// Unknown table, skip
+			h.logger.Warn(context.Background(), "Unknown table in subject",
+				"table", subjectInfo.TableName,
+				"subject", fmt.Sprintf("websocket.%s.%s.%s", subjectInfo.CompanyID, subjectInfo.AgentID, subjectInfo.TableName))
+		}
+
+		if shouldInclude {
 			filtered[sessionKey] = conn
 		}
 	}
