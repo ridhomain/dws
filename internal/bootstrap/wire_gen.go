@@ -32,11 +32,18 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	serveMux := HTTPServeMuxProvider()
 	server := HTTPGracefulServerProvider(provider, serveMux)
+	companyUserTokenGenerateHandler := GenerateTokenHandlerProvider(provider, domainLogger)
+	adminUserTokenGenerateHandler := GenerateAdminTokenHandlerProvider(provider, domainLogger)
+	adminAPIKeyMiddleware := AdminAPIKeyAuthMiddlewareProvider(provider, domainLogger)
+	clientAPIKeyMiddleware := ClientAPIKeyAuthMiddlewareProvider(provider, domainLogger)
 	client, cleanup2, err := RedisClientProvider(provider, domainLogger)
 	if err != nil {
 		cleanup()
 		return nil, nil, err
 	}
+	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
+	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
+	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
 	sessionLockManager := SessionLockManagerProvider(client, domainLogger)
 	killSwitchPubSubAdapter := KillSwitchPubSubAdapterProvider(client, domainLogger)
 	routeRegistry := RouteRegistryProvider(client, domainLogger)
@@ -48,28 +55,12 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	}
 	globalConsumerHandler := GlobalConsumerProvider(domainLogger, provider, natsConsumer)
 	connectionManager := ConnectionManagerProvider(domainLogger, provider, sessionLockManager, killSwitchPubSubAdapter, killSwitchPubSubAdapter, routeRegistry, client, globalConsumerHandler)
-	grpcMessageHandler := GRPCMessageHandlerProvider(domainLogger, connectionManager, provider)
-	grpcServer, err := GRPCServerProvider(ctx, domainLogger, provider, grpcMessageHandler)
-	if err != nil {
-		cleanup3()
-		cleanup2()
-		cleanup()
-		return nil, nil, err
-	}
-	companyUserTokenGenerateHandler := GenerateTokenHandlerProvider(provider, domainLogger)
-	adminUserTokenGenerateHandler := GenerateAdminTokenHandlerProvider(provider, domainLogger)
-	adminAPIKeyMiddleware := AdminAPIKeyAuthMiddlewareProvider(provider, domainLogger)
-	clientAPIKeyMiddleware := ClientAPIKeyAuthMiddlewareProvider(provider, domainLogger)
-	tokenCacheStore := TokenCacheStoreProvider(client, domainLogger)
-	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
-	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
-	messageForwarder := MessageForwarderProvider(ctx, domainLogger, provider)
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, routeRegistry, messageForwarder)
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, routeRegistry)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
 	conn := NatsConnectionProvider(natsConsumer)
-	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, adminAPIKeyMiddleware, clientAPIKeyMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
+	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, adminAPIKeyMiddleware, clientAPIKeyMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client)
 	if err != nil {
 		cleanup3()
 		cleanup2()

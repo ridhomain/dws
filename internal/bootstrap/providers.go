@@ -14,7 +14,6 @@ import (
 	"go.uber.org/zap"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
-	appgrpc "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/grpc" // Added for gRPC Server
 	apphttp "gitlab.com/timkado/api/daisi-ws-service/internal/adapters/http"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/logger"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
@@ -79,7 +78,6 @@ type App struct {
 	logger                    domain.Logger
 	httpServeMux              *http.ServeMux
 	httpServer                *http.Server
-	grpcServer                *appgrpc.Server                 // Added gRPC Server
 	generateTokenHandler      CompanyUserTokenGenerateHandler // Updated type
 	generateAdminTokenHandler AdminUserTokenGenerateHandler   // Updated type
 	adminAPIKeyMiddleware     AdminAPIKeyMiddleware           // This is a type alias already func(http.Handler) http.Handler
@@ -101,7 +99,6 @@ func NewApp(
 	appLogger domain.Logger,
 	mux *http.ServeMux,
 	server *http.Server,
-	grpcSrv *appgrpc.Server, // Added gRPC Server
 	genTokenHandler CompanyUserTokenGenerateHandler, // Updated type
 	genAdminTokenHandler AdminUserTokenGenerateHandler, // Updated type
 	adminAPIKeyMiddleware AdminAPIKeyMiddleware,
@@ -119,7 +116,6 @@ func NewApp(
 		logger:                    appLogger,
 		httpServeMux:              mux,
 		httpServer:                server,
-		grpcServer:                grpcSrv,              // Added gRPC Server
 		generateTokenHandler:      genTokenHandler,      // Use updated type
 		generateAdminTokenHandler: genAdminTokenHandler, // Use updated type
 		adminAPIKeyMiddleware:     adminAPIKeyMiddleware,
@@ -145,10 +141,6 @@ func NewApp(
 			// Brief pause to allow graceful shutdown - reduced since we now have proper synchronization
 			// Redis client cleanup happens after this in Wire's cleanup chain
 			time.Sleep(50 * time.Millisecond)
-		}
-		if app.grpcServer != nil {
-			app.logger.Info(context.Background(), "Stopping gRPC server during app cleanup...")
-			app.grpcServer.GracefulStop() // Or app.grpcServer.Stop() if immediate is needed
 		}
 	}
 	return app, cleanup, nil
@@ -239,11 +231,9 @@ func WebsocketHandlerProvider(
 	logger domain.Logger,
 	cfgProvider config.Provider,
 	connManager *application.ConnectionManager,
-	// Remove natsAdapter parameter - no longer needed
 	routeRegistry domain.RouteRegistry,
-	messageForwarder domain.MessageForwarder,
 ) *wsadapter.Handler {
-	return wsadapter.NewHandler(logger, cfgProvider, connManager, nil, routeRegistry, messageForwarder)
+	return wsadapter.NewHandler(logger, cfgProvider, connManager, nil, routeRegistry)
 }
 
 // WebsocketRouterProvider provides the websocket router.
@@ -334,26 +324,12 @@ func RouteRegistryProvider(redisClient *redis.Client, logger domain.Logger) doma
 	return appredis.NewRouteRegistryAdapter(redisClient, logger)
 }
 
-// Provider for GRPCMessageHandler
-func GRPCMessageHandlerProvider(logger domain.Logger, connManager *application.ConnectionManager, cfgProvider config.Provider) *application.GRPCMessageHandler {
-	return application.NewGRPCMessageHandler(logger, connManager, cfgProvider)
-}
-
-// Provider for gRPC Server
-func GRPCServerProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider, grpcHandler *application.GRPCMessageHandler) (*appgrpc.Server, error) {
-	return appgrpc.NewServer(appCtx, logger, cfgProvider, grpcHandler)
-}
-
 // Provider for *nats.Conn from NatsConsumerAdapter
 func NatsConnectionProvider(adapter domain.NatsConsumer) *nats.Conn {
 	if adapter == nil {
 		return nil
 	}
 	return adapter.NatsConn()
-}
-
-func MessageForwarderProvider(appCtx context.Context, logger domain.Logger, cfgProvider config.Provider) domain.MessageForwarder {
-	return appgrpc.NewForwarderAdapter(appCtx, logger, cfgProvider)
 }
 
 // ProviderSet is the Wire provider set for the entire application.
@@ -394,13 +370,10 @@ var ProviderSet = wire.NewSet(
 	// Application Services
 	AuthServiceProvider, // This is the one to keep
 	ConnectionManagerProvider,
-	GRPCMessageHandlerProvider,    // Added gRPC Message Handler Provider
-	GRPCServerProvider,            // Added gRPC Server Provider
 	AdminAuthMiddlewareProvider,   // Added for admin auth
 	AdminWebsocketHandlerProvider, // Added for admin websocket
 	AdminTokenCacheStoreProvider,  // Added for admin token caching
 	RouteRegistryProvider,         // Added RouteRegistryProvider
-	MessageForwarderProvider,      // Added MessageForwarderProvider
 	NewApp,
 	GlobalConsumerProvider,
 	NatsConsumerAdapterProvider,

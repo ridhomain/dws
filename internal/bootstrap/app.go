@@ -13,9 +13,6 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/health/grpc_health_v1"
 
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
@@ -87,40 +84,6 @@ func (a *App) Run(ctx context.Context) error {
 			a.logger.Warn(r.Context(), "Readiness check failed: Redis client not configured in App struct")
 		}
 
-		// Check gRPC server health
-		if a.grpcServer != nil && a.configProvider.Get().Server.GRPCPort > 0 {
-			grpcTarget := fmt.Sprintf("localhost:%d", a.configProvider.Get().Server.GRPCPort)
-			conn, err := grpc.DialContext(r.Context(), grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-			if err != nil {
-				dependenciesStatus["grpc"] = "dial_error"
-				ready = false
-				a.logger.Warn(r.Context(), "Readiness check failed: gRPC server dial error", "target", grpcTarget, "error", err.Error())
-			} else {
-				healthClient := grpc_health_v1.NewHealthClient(conn)
-				healthResp, err := healthClient.Check(r.Context(), &grpc_health_v1.HealthCheckRequest{Service: ""}) // Check overall server health
-				if err != nil {
-					dependenciesStatus["grpc"] = "health_check_error"
-					ready = false
-					a.logger.Warn(r.Context(), "Readiness check failed: gRPC health check error", "target", grpcTarget, "error", err.Error())
-				} else if healthResp.GetStatus() != grpc_health_v1.HealthCheckResponse_SERVING {
-					dependenciesStatus["grpc"] = "not_serving"
-					ready = false
-					a.logger.Warn(r.Context(), "Readiness check failed: gRPC server not serving", "target", grpcTarget, "status", healthResp.GetStatus().String())
-				} else {
-					dependenciesStatus["grpc"] = "serving"
-				}
-				conn.Close()
-			}
-		} else {
-			dependenciesStatus["grpc"] = "not_configured_or_running"
-			// If gRPC is optional or not started, it might not affect overall readiness
-			// For now, let's assume if it's configured to run, it should be healthy.
-			if a.configProvider.Get().Server.GRPCPort > 0 { // Only consider it a failure if it was supposed to run
-				ready = false
-				a.logger.Warn(r.Context(), "Readiness check: gRPC server not configured or not running but GRPCPort > 0")
-			}
-		}
-
 		response := struct {
 			Status       string            `json:"status"`
 			Dependencies map[string]string `json:"dependencies"`
@@ -183,19 +146,6 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	// NATS related providers in `providers.go` were temporarily commented out to isolate and resolve DI issues for the HTTP endpoint. These will need to be revisited.
-
-	// Start gRPC Server if available
-	if a.grpcServer != nil {
-		if err := a.grpcServer.Start(); err != nil {
-			a.logger.Error(ctx, "Failed to start gRPC server", "error", err.Error())
-			// Depending on policy, this might be a fatal error for the app
-			// For now, log and continue HTTP server startup
-		} else {
-			a.logger.Info(ctx, "gRPC server started successfully.")
-		}
-	} else {
-		a.logger.Warn(ctx, "gRPC server is not initialized. gRPC services will not be available.")
-	}
 
 	if a.connectionManager != nil {
 		// Start global NATS consumer BEFORE other background services
@@ -267,8 +217,6 @@ func (a *App) Run(ctx context.Context) error {
 		if err := a.httpServer.Shutdown(shutdownCtx); err != nil {
 			a.logger.Error(context.Background(), "HTTP server graceful shutdown failed", "error", err.Error())
 		}
-		// gRPC server shutdown is handled by its own context watcher initiated in its Start method
-		// or can be explicitly called if needed: if a.grpcServer != nil { a.grpcServer.GracefulStop() }
 		a.logger.Info(context.Background(), "HTTP server shut down.")
 	})
 
