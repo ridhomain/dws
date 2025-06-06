@@ -2,7 +2,6 @@ package websocket
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,10 +12,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
-	"github.com/nats-io/nats.go"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/config"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/metrics"
-	"gitlab.com/timkado/api/daisi-ws-service/internal/adapters/middleware"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
@@ -209,110 +206,6 @@ func (h *AdminHandler) manageAdminConnection(connCtx context.Context, conn *Conn
 	}
 	metrics.IncrementMessagesSent(domain.MessageTypeReady) // Sent to admin
 	h.logger.Info(connCtx, "Sent 'ready' message to admin client", "admin_id", adminInfo.AdminID)
-
-	var natsSubscription domain.NatsMessageSubscription
-	if h.natsAdapter != nil {
-		companyPattern := adminInfo.SubscribedCompanyID
-		agentPattern := adminInfo.SubscribedAgentID
-
-		if companyPattern == "" {
-			companyPattern = "*"
-		} // Default to wildcard if not specified
-		if agentPattern == "" {
-			agentPattern = "*"
-		} // Default to wildcard if not specified
-
-		natsMsgHandler := func(msg *nats.Msg) {
-			metrics.IncrementNatsMessagesReceived(msg.Subject) // Increment NATS received metric for admin
-
-			// Start: request_id handling for NATS message
-			natsRequestID := msg.Header.Get(middleware.XRequestIDHeader)
-			if natsRequestID == "" {
-				natsRequestID = uuid.NewString()
-				h.logger.Debug(connCtx, "Generated new request_id for Admin NATS message", "subject", msg.Subject, "new_request_id", natsRequestID, "admin_id", adminInfo.AdminID)
-			} else {
-				h.logger.Debug(connCtx, "Using existing request_id from Admin NATS message header", "subject", msg.Subject, "request_id", natsRequestID, "admin_id", adminInfo.AdminID)
-			}
-			msgCtx := context.WithValue(connCtx, contextkeys.RequestIDKey, natsRequestID)
-			// End: request_id handling for NATS message
-
-			h.logger.Info(msgCtx, "Admin NATS: Received message on agent events subject",
-				"subject", msg.Subject, "data_len", len(msg.Data), "admin_id", adminInfo.AdminID,
-			)
-
-			h.logger.Debug(msgCtx, "Processing admin NATS message",
-				"subject", msg.Subject,
-				"data_size", len(msg.Data),
-				"admin_id", adminInfo.AdminID,
-				"operation", "AdminNatsMessageHandler")
-
-			var eventPayload domain.EnrichedEventPayload
-			if err := json.Unmarshal(msg.Data, &eventPayload); err != nil {
-				h.logger.Error(msgCtx, "Admin NATS: Failed to unmarshal agent event payload", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-				_ = msg.Ack()
-				return
-			}
-
-			wsMessage := domain.NewEventMessage(eventPayload)
-			if err := conn.WriteJSON(wsMessage); err != nil {
-				h.logger.Error(msgCtx, "Admin NATS: Failed to forward agent event to WebSocket", "subject", msg.Subject, "error", err.Error(), "admin_id", adminInfo.AdminID)
-				// Don't ACK the message if WebSocket write failed - this allows for redelivery
-				return
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeEvent)
-				h.logger.Debug(msgCtx, "Successfully delivered admin NATS message to WebSocket",
-					"subject", msg.Subject,
-					"event_id", eventPayload.EventID,
-					"admin_id", adminInfo.AdminID,
-					"operation", "AdminNatsMessageHandler")
-			}
-
-			// Only ACK the message after successful WebSocket delivery
-			if ackErr := msg.Ack(); ackErr != nil {
-				h.logger.Error(msgCtx, "Failed to ACK admin NATS message",
-					"subject", msg.Subject,
-					"error", ackErr.Error(),
-					"admin_id", adminInfo.AdminID)
-			} else {
-				h.logger.Debug(msgCtx, "Successfully ACKed admin NATS message",
-					"subject", msg.Subject,
-					"event_id", eventPayload.EventID,
-					"admin_id", adminInfo.AdminID,
-					"operation", "AdminNatsMessageHandler")
-			}
-		}
-
-		var subErr error
-		natsSubscription, subErr = h.natsAdapter.SubscribeToAgentEvents(connCtx, companyPattern, agentPattern, natsMsgHandler)
-		if subErr != nil {
-			h.logger.Error(connCtx, "Failed to subscribe to NATS agent events for admin",
-				"companyPattern", companyPattern, "agentPattern", agentPattern, "error", subErr.Error(), "admin_id", adminInfo.AdminID,
-			)
-			// Optionally send error to client and close
-			errorMsg := domain.NewErrorResponse(domain.ErrSubscriptionFailure, "Could not subscribe to agent events", subErr.Error())
-			if sendErr := conn.WriteJSON(domain.NewErrorMessage(errorMsg)); sendErr != nil {
-				h.logger.Error(connCtx, "Failed to send NATS subscription error to admin client", "error", sendErr.Error())
-			} else {
-				metrics.IncrementMessagesSent(domain.MessageTypeError) // Error sent to admin
-			}
-			// conn.Close(websocket.StatusInternalError, "NATS subscription failure")
-			// return // For now, let it run without NATS if sub fails, but log error.
-		} else {
-			h.logger.Info(connCtx, "Successfully subscribed to NATS agent events for admin",
-				"companyPattern", companyPattern, "agentPattern", agentPattern, "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID,
-			)
-			defer func() {
-				if natsSubscription != nil {
-					h.logger.Info(connCtx, "Unsubscribing from NATS agent events for admin", "subject", natsSubscription.Subject, "admin_id", adminInfo.AdminID)
-					if unsubErr := natsSubscription.Drain(); unsubErr != nil {
-						h.logger.Error(connCtx, "Error draining NATS admin subscription", "subject", natsSubscription.Subject, "error", unsubErr.Error())
-					}
-				}
-			}()
-		}
-	} else {
-		h.logger.Warn(connCtx, "NATS adapter not available for admin handler, cannot subscribe to agent events.", "admin_id", adminInfo.AdminID)
-	}
 
 	// Ping/Pong and Read Loop (similar to user's manageConnection)
 	appCfg := conn.config
