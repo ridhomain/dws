@@ -146,12 +146,18 @@ func (a *App) Run(ctx context.Context) error {
 	a.httpServeMux.Handle("GET /metrics", middleware.RequestIDMiddleware(promhttp.Handler()))
 	a.logger.Info(ctx, "Prometheus metrics endpoint registered at /metrics")
 
-	if a.wsRouter != nil {
-		a.wsRouter.RegisterRoutes(ctx, a.httpServeMux)
-	} else {
-		a.logger.Warn(ctx, "WebSocket router is not initialized. WebSocket routes will not be available.")
-	}
+	useMelody := a.configProvider.Get().App.UseMelodyWebsocket
 
+	if useMelody {
+		// Create Melody handler (you'll need to add melodyHandler to App struct)
+		a.logger.Info(ctx, "Using Melody WebSocket implementation")
+		// You need to wire melodyHandler - see step 6
+	} else {
+		a.logger.Info(ctx, "Using original WebSocket implementation")
+		if a.wsRouter != nil {
+			a.wsRouter.RegisterRoutes(ctx, a.httpServeMux)
+		}
+	}
 	if a.generateTokenHandler != nil && a.clientApiKeyMiddleware != nil {
 		handlerToWrap := http.HandlerFunc(a.generateTokenHandler)
 		finalGenerateTokenHandler := middleware.RequestIDMiddleware(a.clientApiKeyMiddleware(handlerToWrap))
