@@ -149,9 +149,8 @@ func (a *App) Run(ctx context.Context) error {
 	useMelody := a.configProvider.Get().App.UseMelodyWebsocket
 
 	if useMelody {
-		// Create Melody handler (you'll need to add melodyHandler to App struct)
 		a.logger.Info(ctx, "Using Melody WebSocket implementation")
-		// You need to wire melodyHandler - see step 6
+		a.httpServeMux.Handle("GET /ws/", middleware.RequestIDMiddleware(a.melodyHandler))
 	} else {
 		a.logger.Info(ctx, "Using original WebSocket implementation")
 		if a.wsRouter != nil {
