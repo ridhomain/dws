@@ -35,8 +35,8 @@ auth:
   secret_token: "YOUR_32_CHAR_DAISI_WS_SERVICE_SECRET_TOKEN_HERE" # General API Key
   token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_TOKENS_HERE" # For company token encryption
   admin_secret_token: "YOUR_32_CHAR_DEDICATED_TOKEN_GENERATION_ADMIN_KEY_HERE" # Admin API Key
-  token_cache_ttl_seconds: 30
   admin_token_aes_key: "YOUR_64_CHAR_HEX_ENCODED_AES256_KEY_FOR_ADMIN_TOKENS_HERE"
+  token_cache_ttl_seconds: 30
   admin_token_cache_ttl_seconds: 60
   
 app:
@@ -75,7 +75,7 @@ app:
   grpc_circuitbreaker_open_duration_seconds: 30
   
   # Backpressure Settings
-  websocket_message_buffer_size: 100
+  websocket_message_buffer_size: 1000
   websocket_backpressure_drop_policy: "drop_oldest"
   websocket_slow_client_latency_ms: 5000
   websocket_slow_client_disconnect_threshold_ms: 30000

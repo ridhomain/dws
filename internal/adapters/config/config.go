@@ -58,8 +58,8 @@ type AuthConfig struct {
 	SecretToken               string `mapstructure:"secret_token"`  // Should primarily come from ENV
 	TokenAESKey               string `mapstructure:"token_aes_key"` // Should primarily come from ENV
 	AdminSecretToken          string `mapstructure:"admin_secret_token"`
+	AdminTokenAESKey          string `mapstructure:"admin_token_aes_key"` // For admin token encryption
 	TokenCacheTTLSeconds      int    `mapstructure:"token_cache_ttl_seconds"`
-	AdminTokenAESKey          string `mapstructure:"admin_token_aes_key"`           // For admin token encryption
 	AdminTokenCacheTTLSeconds int    `mapstructure:"admin_token_cache_ttl_seconds"` // TTL for cached admin tokens
 }
 

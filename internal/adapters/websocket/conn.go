@@ -106,12 +106,15 @@ func (c *Connection) startWriter() {
 	safego.Execute(c.connCtx, c.logger, fmt.Sprintf("WebSocketWriter-%s", c.sessionKey), func() {
 		defer c.writerWg.Done()
 		c.logger.Info(c.connCtx, "WebSocket writer goroutine started", "sessionKey", c.sessionKey)
+
+		// Track consecutive write failures for circuit breaking
+		consecutiveFailures := 0
+		maxConsecutiveFailures := 5
+
 		for {
 			select {
 			case <-c.connCtx.Done():
 				c.logger.Info(c.connCtx, "Connection context done, stopping WebSocket writer.", "sessionKey", c.sessionKey)
-				// Drain any remaining messages in the buffer upon graceful shutdown if desired
-				// For now, we just exit. wsConn.Close() will be handled by the manageConnection defer.
 				return
 			case msgBytes, ok := <-c.messageBuffer:
 				if !ok {
@@ -121,18 +124,14 @@ func (c *Connection) startWriter() {
 
 				metrics.SetWebsocketBufferUsed(c.sessionKey, float64(len(c.messageBuffer)))
 
-				// Try to extract message type and ID for better logging
+				// Parse message for logging (existing code)
 				var messageType string = "unknown"
 				var messageID string = ""
-
-				// Attempt to parse the message to extract type and ID (best effort)
 				var parsedMsg map[string]interface{}
 				if jsonErr := json.Unmarshal(msgBytes, &parsedMsg); jsonErr == nil {
 					if msgType, ok := parsedMsg["type"].(string); ok {
 						messageType = msgType
 					}
-
-					// Try to extract event_id from payload if this is an event message
 					if messageType == domain.MessageTypeEvent {
 						if payload, ok := parsedMsg["payload"].(map[string]interface{}); ok {
 							if evID, ok := payload["event_id"].(string); ok {
@@ -142,76 +141,132 @@ func (c *Connection) startWriter() {
 					}
 				}
 
-				// Debug log before actual WebSocket write
-				c.logger.Debug(c.connCtx, "Attempting to write message from buffer to WebSocket",
-					"message_type", messageType,
-					"message_id", messageID,
-					"message_bytes", len(msgBytes),
-					"session_key", c.sessionKey,
-					"operation", "WebSocketWrite")
-
-				// Create a separate context for write operations that's independent of connection cancellations
+				// Set write timeout
 				writeTimeout := time.Duration(c.writeTimeoutSeconds) * time.Second
 				if writeTimeout <= 0 {
-					writeTimeout = 10 * time.Second // Default if not configured
+					writeTimeout = 10 * time.Second
 				}
 
-				// Use a background context for the write operation instead of the connection context
-				// This ensures we can complete the write even if the connection context is canceled
-				ctxToWrite, cancel := context.WithTimeout(context.Background(), writeTimeout)
+				// CRITICAL FIX: Use background context for write operations
+				// This prevents the write from being cancelled when connection is closing
+				writeCtx, writeCancel := context.WithTimeout(context.Background(), writeTimeout)
 
-				c.mu.Lock() // Protects wsConn
-				var err error
-				// Check if the connection context is already done before attempting to write
-				select {
-				case <-c.connCtx.Done():
-					c.logger.Info(ctxToWrite, "Connection context already done before write attempt, skipping write",
-						"session_key", c.sessionKey,
-						"message_type", messageType,
-						"message_id", messageID)
-					err = c.connCtx.Err()
-				default:
-					// Connection context is still valid, attempt the write
-					writeStartTime := time.Now()
-					err = c.wsConn.Write(ctxToWrite, websocket.MessageText, msgBytes)
-					writeEndTime := time.Now()
+				c.mu.Lock()
 
-					if err == nil {
-						// Successfully wrote message
-						c.logger.Debug(c.connCtx, "Successfully wrote message to WebSocket",
-							"message_type", messageType,
-							"message_id", messageID,
-							"message_bytes", len(msgBytes),
-							"write_duration_ms", writeEndTime.Sub(writeStartTime).Milliseconds(),
-							"session_key", c.sessionKey,
-							"operation", "WebSocketWrite")
-					}
+				// Check if connection is valid
+				if c.wsConn == nil {
+					c.mu.Unlock()
+					writeCancel()
+					c.logger.Warn(c.connCtx, "WebSocket connection is nil, stopping writer",
+						"session_key", c.sessionKey)
+					return
 				}
+
+				// Attempt write
+				writeStartTime := time.Now()
+				err := c.wsConn.Write(writeCtx, websocket.MessageText, msgBytes)
+				writeDuration := time.Since(writeStartTime)
+
 				c.mu.Unlock()
-				cancel()
+				writeCancel()
 
 				if err != nil {
-					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						c.logger.Info(c.connCtx, "WebSocket write canceled or timed out, connection likely closing",
+					consecutiveFailures++
+
+					// Determine error severity
+					isFatal := false
+					errorType := "unknown"
+
+					if errors.Is(err, context.DeadlineExceeded) {
+						errorType = "timeout"
+						c.logger.Warn(c.connCtx, "WebSocket write timeout",
+							"error", err.Error(),
+							"session_key", c.sessionKey,
+							"message_type", messageType,
+							"message_id", messageID,
+							"write_duration_ms", writeDuration.Milliseconds(),
+							"consecutive_failures", consecutiveFailures)
+					} else if errors.Is(err, context.Canceled) {
+						errorType = "canceled"
+						// Write context was cancelled, but check if connection is closing
+						select {
+						case <-c.connCtx.Done():
+							// Connection is closing, this is expected
+							c.logger.Info(c.connCtx, "Write cancelled due to connection closing",
+								"session_key", c.sessionKey)
+							return
+						default:
+							// Just the write was cancelled, continue
+							c.logger.Debug(c.connCtx, "Write context cancelled but connection still active",
+								"session_key", c.sessionKey)
+						}
+					} else if websocket.CloseStatus(err) != -1 {
+						// This is a WebSocket close error
+						errorType = "websocket_closed"
+						isFatal = true
+						c.logger.Error(c.connCtx, "WebSocket closed with status",
+							"error", err.Error(),
+							"close_status", websocket.CloseStatus(err),
+							"session_key", c.sessionKey,
+							"message_type", messageType,
+							"message_id", messageID)
+					} else if strings.Contains(err.Error(), "use of closed network connection") ||
+						strings.Contains(err.Error(), "broken pipe") ||
+						strings.Contains(err.Error(), "connection reset by peer") {
+						errorType = "network_closed"
+						isFatal = true
+						c.logger.Error(c.connCtx, "Network connection closed",
 							"error", err.Error(),
 							"session_key", c.sessionKey,
 							"message_type", messageType,
 							"message_id", messageID)
 					} else {
-						c.logger.Error(c.connCtx, "Failed to write message from buffer to WebSocket",
+						// Other errors - might be temporary
+						errorType = "other"
+						c.logger.Error(c.connCtx, "WebSocket write error",
 							"error", err.Error(),
+							"error_type", fmt.Sprintf("%T", err),
 							"session_key", c.sessionKey,
 							"message_type", messageType,
-							"message_id", messageID)
+							"message_id", messageID,
+							"consecutive_failures", consecutiveFailures)
 					}
 
-					// Don't immediately cancel the connection context on every write error
-					// Only do it for non-context related errors that indicate connection problems
-					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-						// Signal manageConnection to clean up for serious connection errors
-						c.cancelConnCtxFunc()
+					// Only close connection for fatal errors or too many consecutive failures
+					if isFatal || consecutiveFailures >= maxConsecutiveFailures {
+						c.logger.Error(c.connCtx, "Stopping writer due to fatal error or too many failures",
+							"fatal", isFatal,
+							"consecutive_failures", consecutiveFailures,
+							"error_type", errorType,
+							"session_key", c.sessionKey)
+
+						// DON'T immediately cancel connection context
+						// Instead, let the read loop detect the closed connection
+						// This prevents race conditions and abnormal closures
+
+						// Just exit the writer goroutine
+						return
 					}
-					return
+
+					// For non-fatal errors, continue after a small backoff
+					backoffMs := min(100*consecutiveFailures, 1000) // Max 1 second
+					time.Sleep(time.Duration(backoffMs) * time.Millisecond)
+
+				} else {
+					// Success - reset failure counter
+					if consecutiveFailures > 0 {
+						c.logger.Info(c.connCtx, "WebSocket write recovered after failures",
+							"previous_failures", consecutiveFailures,
+							"session_key", c.sessionKey)
+						consecutiveFailures = 0
+					}
+
+					c.logger.Debug(c.connCtx, "Successfully wrote message to WebSocket",
+						"message_type", messageType,
+						"message_id", messageID,
+						"message_bytes", len(msgBytes),
+						"write_duration_ms", writeDuration.Milliseconds(),
+						"session_key", c.sessionKey)
 				}
 			}
 		}
@@ -223,38 +278,64 @@ func (c *Connection) Context() context.Context {
 	return c.connCtx
 }
 
+// Helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // Close attempts to close the WebSocket connection with a specified status code and reason.
 // It also ensures the writer goroutine is stopped.
+// Also fix the Close method to be more graceful
 func (c *Connection) Close(statusCode websocket.StatusCode, reason string) error {
-	c.logger.Info(c.connCtx, "Connection.Close called", "statusCode", statusCode, "reason", reason, "sessionKey", c.sessionKey)
+	c.logger.Info(c.connCtx, "Connection.Close called",
+		"statusCode", statusCode,
+		"reason", reason,
+		"sessionKey", c.sessionKey)
 
-	// Signal writer to stop and wait for it
+	// First, close the message buffer to stop accepting new messages
 	c.writerMu.Lock()
-	if c.isWriterRunning {
-		if c.messageBuffer != nil {
-			close(c.messageBuffer) // Close buffer to unblock writer if it's waiting
-		}
+	if c.isWriterRunning && c.messageBuffer != nil {
+		close(c.messageBuffer)
 		c.isWriterRunning = false
 	}
 	c.writerMu.Unlock()
-	c.writerWg.Wait() // Wait for writer goroutine to finish
 
-	c.mu.Lock() // Protects wsConn and cancelConnCtxFunc
-	defer c.mu.Unlock()
+	// Give writer goroutine a moment to process remaining messages
+	done := make(chan struct{})
+	go func() {
+		c.writerWg.Wait()
+		close(done)
+	}()
 
-	// Cancel the connection's context if not already done
-	if c.cancelConnCtxFunc != nil {
-		currentCancelFunc := c.cancelConnCtxFunc
-		c.cancelConnCtxFunc = nil // Prevent multiple calls
-		currentCancelFunc()
+	select {
+	case <-done:
+		// Writer finished gracefully
+	case <-time.After(2 * time.Second):
+		// Timeout waiting for writer
+		c.logger.Warn(c.connCtx, "Timeout waiting for writer to finish", "sessionKey", c.sessionKey)
 	}
+
+	// Now close the WebSocket connection
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if c.wsConn == nil {
 		return errors.New("WebSocket connection is already nil")
 	}
 
+	// Send close frame to client
 	err := c.wsConn.Close(statusCode, reason)
-	c.wsConn = nil // Nullify to prevent reuse
+	c.wsConn = nil
+
+	// Finally cancel the context
+	if c.cancelConnCtxFunc != nil {
+		c.cancelConnCtxFunc()
+		c.cancelConnCtxFunc = nil
+	}
+
 	return err
 }
 
@@ -316,6 +397,22 @@ func (c *Connection) WriteJSON(v interface{}) error {
 			"message_type", messageTypeForMetric,
 			"message_id", messageID)
 		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	// Validate JSON before sending
+	if !json.Valid(msgBytes) {
+		c.logger.Error(c.connCtx, "Invalid JSON being sent!",
+			"type", fmt.Sprintf("%T", v),
+			"session_key", c.sessionKey)
+	}
+
+	// Log message size if it's large
+	if len(msgBytes) > 10000 { // 10KB
+		c.logger.Warn(c.connCtx, "Large message being sent",
+			"size_bytes", len(msgBytes),
+			"size_kb", len(msgBytes)/1024,
+			"message_type", messageTypeForMetric,
+			"session_key", c.sessionKey)
 	}
 
 	select {
