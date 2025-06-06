@@ -104,7 +104,18 @@ func (c *Connection) startWriter() {
 
 	c.writerWg.Add(1)
 	safego.Execute(c.connCtx, c.logger, fmt.Sprintf("WebSocketWriter-%s", c.sessionKey), func() {
-		defer c.writerWg.Done()
+		defer func() {
+			c.writerWg.Done()
+
+			// ADD THESE LINES
+			// Mark writer as not running
+			c.writerMu.Lock()
+			c.isWriterRunning = false
+			c.writerMu.Unlock()
+
+			c.logger.Warn(c.connCtx, "WebSocket writer goroutine exiting",
+				"sessionKey", c.sessionKey)
+		}()
 		c.logger.Info(c.connCtx, "WebSocket writer goroutine started", "sessionKey", c.sessionKey)
 
 		// Track consecutive write failures for circuit breaking
@@ -342,20 +353,38 @@ func (c *Connection) Close(statusCode websocket.StatusCode, reason string) error
 // CloseWithError sends an error message to the client and then closes the WebSocket connection
 // with the appropriate close code derived from the error response.
 func (c *Connection) CloseWithError(errResp domain.ErrorResponse, reason string) error {
-	c.logger.Warn(c.connCtx, "Closing connection with error", "code", errResp.Code, "message", errResp.Message, "details", errResp.Details, "reason", reason, "sessionKey", c.sessionKey)
-	// First try to send the error message to the client via the buffer
-	errorMsgPayload := domain.NewErrorMessage(errResp)
-	if err := c.WriteJSON(errorMsgPayload); err != nil { // This will use the buffer
-		c.logger.Error(c.connCtx, "Failed to queue error message before closing connection",
-			"error", err.Error(),
-			"error_code", string(errResp.Code),
-			"message", errResp.Message,
-			"sessionKey", c.sessionKey)
+	c.logger.Warn(c.connCtx, "Closing connection with error",
+		"code", errResp.Code,
+		"message", errResp.Message,
+		"details", errResp.Details,
+		"reason", reason,
+		"sessionKey", c.sessionKey)
+
+	// Check if writer is running before trying to send error
+	c.writerMu.Lock()
+	writerRunning := c.isWriterRunning
+	c.writerMu.Unlock()
+
+	if writerRunning {
+		// Try to send the error message to the client via the buffer
+		errorMsgPayload := domain.NewErrorMessage(errResp)
+		if err := c.WriteJSON(errorMsgPayload); err != nil {
+			c.logger.Error(c.connCtx, "Failed to queue error message before closing connection",
+				"error", err.Error(),
+				"error_code", string(errResp.Code),
+				"message", errResp.Message,
+				"sessionKey", c.sessionKey)
+		}
+		// Give writer a moment to send the error
+		time.Sleep(100 * time.Millisecond)
 	} else {
-		// Metric for sent error message is handled in WriteJSON logic if successful
+		c.logger.Warn(c.connCtx, "Writer not running, cannot send error message to client",
+			"error_code", string(errResp.Code),
+			"sessionKey", c.sessionKey)
 	}
+
 	closeCode := errResp.ToWebSocketCloseCode()
-	return c.Close(closeCode, reason) // This will handle stopping writer and closing wsConn
+	return c.Close(closeCode, reason)
 }
 
 // WriteJSON marshals the value to JSON and attempts to send it to the message buffer.
@@ -693,4 +722,10 @@ func (c *Connection) SetCurrentChatID(chatID string) {
 // GetSessionKey returns the session key associated with this connection.
 func (c *Connection) GetSessionKey() string {
 	return c.sessionKey
+}
+
+func (c *Connection) IsWriterRunning() bool {
+	c.writerMu.Lock()
+	defer c.writerMu.Unlock()
+	return c.isWriterRunning
 }
