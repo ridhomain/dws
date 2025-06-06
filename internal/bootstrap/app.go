@@ -171,15 +171,15 @@ func (a *App) Run(ctx context.Context) error {
 		a.logger.Error(ctx, "GenerateAdminTokenHandler or adminAPIKeyMiddleware not initialized. /admin/generate-token endpoint will not be available.")
 	}
 
-	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.configProvider != nil { // Check configProvider for APIKeyAuth
-		apiKeyAuth := middleware.APIKeyAuthMiddleware(a.configProvider, a.logger)
+	if a.adminWsHandler != nil && a.adminAuthMiddleware != nil && a.adminAPIKeyMiddleware != nil {
+		// Use admin-specific API key middleware instead of general API key middleware
 		adminAuthedHandler := a.adminAuthMiddleware(a.adminWsHandler)
-		chainedAdminHandler := apiKeyAuth(adminAuthedHandler)
+		chainedAdminHandler := a.adminAPIKeyMiddleware(adminAuthedHandler)
 		finalAdminWsHandler := middleware.RequestIDMiddleware(chainedAdminHandler)
 		a.httpServeMux.Handle("GET /ws/admin", finalAdminWsHandler)
-		a.logger.Info(ctx, "/ws/admin endpoint registered")
+		a.logger.Info(ctx, "/ws/admin endpoint registered with admin-specific authentication")
 	} else {
-		a.logger.Error(ctx, "AdminWsHandler, AdminAuthMiddleware, or ConfigProvider not initialized. /ws/admin endpoint will not be available.")
+		a.logger.Error(ctx, "AdminWsHandler, AdminAuthMiddleware, or AdminAPIKeyMiddleware not initialized. /ws/admin endpoint will not be available.")
 	}
 
 	// NATS related providers in `providers.go` were temporarily commented out to isolate and resolve DI issues for the HTTP endpoint. These will need to be revisited.

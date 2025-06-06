@@ -22,29 +22,34 @@ func AdminAPIKeyAuthMiddleware(cfgProvider config.Provider, logger domain.Logger
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			adminApiKey := r.Header.Get(apiKeyHeaderName) // Re-use constant from auth.go
 
+			// Add query parameter fallback for WebSocket connections
+			if adminApiKey == "" {
+				adminApiKey = r.URL.Query().Get(apiKeyQueryParam) // "x-api-key"
+			}
+
 			cfg := cfgProvider.Get()
 			if cfg == nil || cfg.Auth.AdminSecretToken == "" {
-				logger.Error(r.Context(), "Token generation auth failed: AdminSecretToken not configured", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Token generation auth cannot be performed.")
+				logger.Error(r.Context(), "Admin auth failed: AdminSecretToken not configured", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Admin auth cannot be performed.")
 				errResp.WriteJSON(w, http.StatusInternalServerError)
 				return
 			}
 
 			if adminApiKey == "" {
-				logger.Warn(r.Context(), "Token generation auth failed: Admin key missing", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrUnauthorized, "Admin API key is required", "Provide admin API key in X-API-Key header.") // Assuming ErrUnauthorized exists
+				logger.Warn(r.Context(), "Admin auth failed: Admin key missing", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrUnauthorized, "Admin API key is required", "Provide admin API key in X-API-Key header or x-api-key query parameter.")
 				errResp.WriteJSON(w, http.StatusUnauthorized)
 				return
 			}
 
 			if adminApiKey != cfg.Auth.AdminSecretToken {
-				logger.Warn(r.Context(), "Token generation auth failed: Invalid admin key", "path", r.URL.Path)
-				errResp := domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.") // Assuming ErrForbidden exists for this
+				logger.Warn(r.Context(), "Admin auth failed: Invalid admin key", "path", r.URL.Path)
+				errResp := domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.")
 				errResp.WriteJSON(w, http.StatusForbidden)
 				return
 			}
 
-			logger.Debug(r.Context(), "Token generation admin key authentication successful", "path", r.URL.Path)
+			logger.Debug(r.Context(), "Admin API key authentication successful", "path", r.URL.Path)
 			next.ServeHTTP(w, r)
 		})
 	}
