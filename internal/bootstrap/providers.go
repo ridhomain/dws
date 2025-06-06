@@ -164,6 +164,7 @@ func MelodyHandlerProvider(
 	natsAdapter domain.NatsConsumer,
 	redisClient *redis.Client,
 	messageForwarder domain.MessageForwarder,
+	authService *application.AuthService,
 ) *wsadapter.MelodyHandler {
 	return wsadapter.NewMelodyHandler(
 		logger,
@@ -172,6 +173,7 @@ func MelodyHandlerProvider(
 		natsAdapter,
 		redisClient,
 		messageForwarder,
+		authService,
 	)
 }
 

@@ -3,6 +3,7 @@ package websocket
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/internal/application"
 	"gitlab.com/timkado/api/daisi-ws-service/internal/domain"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/contextkeys"
+	"gitlab.com/timkado/api/daisi-ws-service/pkg/crypto"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 )
 
@@ -40,6 +42,7 @@ type MelodyHandler struct {
 	melody           *melody.Melody
 	redisClient      *redis.Client
 	messageForwarder domain.MessageForwarder
+	authService      *application.AuthService
 }
 
 // NewMelodyHandler creates a new Melody-based WebSocket handler
@@ -50,6 +53,7 @@ func NewMelodyHandler(
 	natsAdapter domain.NatsConsumer,
 	redisClient *redis.Client,
 	messageForwarder domain.MessageForwarder,
+	authService *application.AuthService,
 ) *MelodyHandler {
 	// Create Melody instance with custom config
 	m := melody.New()
@@ -83,6 +87,7 @@ func NewMelodyHandler(
 		melody:           m,
 		redisClient:      redisClient,
 		messageForwarder: messageForwarder,
+		authService:      authService,
 	}
 
 	// Set up Melody event handlers
@@ -222,72 +227,210 @@ func (h *MelodyHandler) setupMelodyHandlers() {
 
 // ServeHTTP implements http.Handler interface
 func (h *MelodyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Get path parameters
-	// pathCompany := r.PathValue("company")
-	// pathAgent := r.PathValue("agent")
+	path := strings.TrimPrefix(r.URL.Path, "/ws/")
+	isAdmin := strings.HasPrefix(path, "admin") && (path == "admin" || strings.HasPrefix(path, "admin/"))
 
-	// Get authenticated user context (from middleware)
-	authCtx, ok := r.Context().Value(contextkeys.AuthUserContextKey).(*domain.AuthenticatedUserContext)
-	if !ok || authCtx == nil {
-		h.logger.Error(r.Context(), "No auth context found")
-		errResp := domain.NewErrorResponse(
-			domain.ErrInternal,
-			"Authentication context missing",
-			"Server configuration error",
-		)
-		errResp.WriteJSON(w, http.StatusInternalServerError)
+	cfg := h.configProvider.Get()
+	ctx := r.Context() // Start with original context
+
+	// 1. --- API KEY AUTH ---
+	apiKey := r.Header.Get("X-API-Key")
+	if apiKey == "" {
+		apiKey = r.URL.Query().Get("x-api-key")
+	}
+
+	if cfg == nil {
+		h.logger.Error(ctx, "Config not available", "path", r.URL.Path)
+		domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "API authentication cannot be performed.").WriteJSON(w, http.StatusInternalServerError)
 		return
 	}
 
-	// Session lock acquisition
-	lockCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
+	// --- Admin Mode ---
+	if isAdmin {
+		if cfg.Auth.AdminSecretToken == "" {
+			h.logger.Error(ctx, "AdminSecretToken not configured", "path", r.URL.Path)
+			domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "Admin auth cannot be performed.").WriteJSON(w, http.StatusInternalServerError)
+			return
+		}
+		if apiKey == "" {
+			h.logger.Warn(ctx, "Admin API key missing", "path", r.URL.Path)
+			domain.NewErrorResponse(domain.ErrUnauthorized, "Admin API key is required", "Provide admin API key in X-API-Key header or x-api-key query parameter.").WriteJSON(w, http.StatusUnauthorized)
+			return
+		}
+		if apiKey != cfg.Auth.AdminSecretToken {
+			h.logger.Warn(ctx, "Invalid admin API key", "path", r.URL.Path)
+			domain.NewErrorResponse(domain.ErrForbidden, "Invalid admin API key", "The provided admin API key is not valid.").WriteJSON(w, http.StatusForbidden)
+			return
+		}
 
-	acquired, err := h.connManager.AcquireSessionLockOrNotify(lockCtx, authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
+		// --- Admin token ---
+		tokenValue := r.URL.Query().Get("token")
+		if tokenValue == "" {
+			h.logger.Warn(ctx, "Admin token missing", "path", r.URL.Path)
+			domain.NewErrorResponse(domain.ErrInvalidToken, "Admin token is required", "Provide 'token' in query parameter.").WriteJSON(w, http.StatusForbidden)
+			return
+		}
+		adminCtx, err := h.authService.ProcessAdminToken(ctx, tokenValue)
+		if err != nil {
+			// (Same error mapping as your middleware)
+			httpStatus := http.StatusForbidden
+			errCode := domain.ErrInvalidToken
+			errMsg := "Invalid admin token"
+			errDetails := err.Error()
+			if errors.Is(err, application.ErrTokenExpired) {
+				errMsg = "Admin token has expired."
+			} else if errors.Is(err, crypto.ErrTokenDecryptionFailed) || errors.Is(err, application.ErrTokenPayloadInvalid) ||
+				errors.Is(err, crypto.ErrInvalidTokenFormat) || errors.Is(err, crypto.ErrCiphertextTooShort) {
+				errMsg = "Admin token is invalid or malformed."
+				errDetails = "Token format or content error."
+			} else if errors.Is(err, crypto.ErrInvalidAESKeySize) || strings.Contains(err.Error(), "application not configured for admin token decryption") {
+				httpStatus = http.StatusInternalServerError
+				errCode = domain.ErrInternal
+				errMsg = "Server configuration error processing admin token."
+				errDetails = "Internal server error."
+			} else {
+				httpStatus = http.StatusInternalServerError
+				errCode = domain.ErrInternal
+				errMsg = "An unexpected error occurred while processing admin token."
+				errDetails = "Internal server error."
+			}
+			domain.NewErrorResponse(errCode, errMsg, errDetails).WriteJSON(w, httpStatus)
+			return
+		}
+
+		// Build context with admin info
+		ctx = context.WithValue(ctx, contextkeys.AdminUserContextKey, adminCtx)
+		ctx = context.WithValue(ctx, contextkeys.UserIDKey, adminCtx.AdminID)
+		// For compatibility with rest of handler, you may also want:
+		// ctx = context.WithValue(ctx, contextkeys.CompanyIDKey, adminCtx.CompanyIDRestriction)
+
+		// --- Session key: use adminCtx.AdminID and maybe adminCtx.CompanyIDRestriction ---
+		sessionKey := rediskeys.SessionKey(adminCtx.CompanyIDRestriction, "admin", adminCtx.AdminID)
+		sessionData := &sessionData{
+			CompanyID:  adminCtx.CompanyIDRestriction,
+			AgentID:    "admin",
+			UserID:     adminCtx.AdminID,
+			SessionKey: sessionKey,
+		}
+
+		keys := map[string]interface{}{
+			"session_data": sessionData,
+			"request_id":   ctx.Value(contextkeys.RequestIDKey),
+		}
+
+		// Skip session lock for admin if not needed, else use similar logic
+		metrics.IncrementConnectionsTotal()
+		if err := h.melody.HandleRequestWithKeys(w, r.WithContext(ctx), keys); err != nil {
+			h.logger.Error(ctx, "Failed to handle WebSocket upgrade (admin)", "error", err.Error())
+		}
+		return
+	}
+
+	// --- USER MODE ---
+	// (Normal /ws/{company}/{agent})
+	if cfg.Auth.SecretToken == "" {
+		h.logger.Error(ctx, "SecretToken not configured", "path", r.URL.Path)
+		domain.NewErrorResponse(domain.ErrInternal, "Server configuration error", "API authentication cannot be performed.").WriteJSON(w, http.StatusInternalServerError)
+		return
+	}
+	if apiKey == "" {
+		h.logger.Warn(ctx, "API key missing", "path", r.URL.Path)
+		domain.NewErrorResponse(domain.ErrInvalidAPIKey, "API key is required", "Provide API key in X-API-Key header or x-api-key query parameter.").WriteJSON(w, http.StatusUnauthorized)
+		return
+	}
+	if apiKey != cfg.Auth.SecretToken {
+		h.logger.Warn(ctx, "Invalid API key", "path", r.URL.Path)
+		domain.NewErrorResponse(domain.ErrInvalidAPIKey, "Invalid API key", "The provided API key is not valid.").WriteJSON(w, http.StatusUnauthorized)
+		return
+	}
+
+	// --- Company token ---
+	tokenValue := r.URL.Query().Get("token")
+	if tokenValue == "" {
+		h.logger.Warn(ctx, "Company token missing", "path", r.URL.Path)
+		domain.NewErrorResponse(domain.ErrInvalidToken, "Company token is required", "Provide 'token' in query parameter.").WriteJSON(w, http.StatusForbidden)
+		return
+	}
+	authCtx, err := h.authService.ProcessToken(ctx, tokenValue)
 	if err != nil {
-		h.logger.Error(r.Context(), "Failed to acquire session lock", "error", err.Error())
+		httpStatus := http.StatusForbidden
+		errCode := domain.ErrInvalidToken
+		errMsg := "Invalid company token"
+		errDetails := err.Error()
+		if errors.Is(err, application.ErrTokenExpired) {
+			errMsg = "Company token has expired."
+		} else if errors.Is(err, crypto.ErrTokenDecryptionFailed) || errors.Is(err, application.ErrTokenPayloadInvalid) ||
+			errors.Is(err, crypto.ErrInvalidTokenFormat) || errors.Is(err, crypto.ErrCiphertextTooShort) {
+			errMsg = "Company token is invalid or malformed."
+			errDetails = "Token format or content error."
+		} else if errors.Is(err, crypto.ErrInvalidAESKeySize) || errors.New("application not configured for token decryption").Error() == err.Error() {
+			httpStatus = http.StatusInternalServerError
+			errCode = domain.ErrInternal
+			errMsg = "Server configuration error processing token."
+			errDetails = "Internal server error."
+		} else {
+			httpStatus = http.StatusInternalServerError
+			errCode = domain.ErrInternal
+			errMsg = "An unexpected error occurred."
+			errDetails = "Internal server error."
+		}
+		domain.NewErrorResponse(errCode, errMsg, errDetails).WriteJSON(w, httpStatus)
+		return
+	}
+
+	// Extract company and agent from path
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	companyID := parts[0]
+	agentID := parts[1]
+
+	ctx = context.WithValue(ctx, contextkeys.AuthUserContextKey, authCtx)
+	ctx = context.WithValue(ctx, contextkeys.CompanyIDKey, authCtx.CompanyID)
+	ctx = context.WithValue(ctx, contextkeys.AgentIDKey, authCtx.AgentID)
+	ctx = context.WithValue(ctx, contextkeys.UserIDKey, authCtx.UserID)
+
+	lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	acquired, err := h.connManager.AcquireSessionLockOrNotify(lockCtx, companyID, agentID, authCtx.UserID)
+	if err != nil {
+		h.logger.Error(ctx, "Failed to acquire session lock", "error", err.Error())
 		domain.NewErrorResponse(domain.ErrInternal, "Failed to process session", err.Error()).WriteJSON(w, http.StatusInternalServerError)
 		return
 	}
 	if !acquired {
-		h.logger.Warn(r.Context(), "Session lock not acquired (conflict)")
+		h.logger.Warn(ctx, "Session lock not acquired (conflict)")
 		metrics.IncrementSessionConflicts("user")
 		domain.NewErrorResponse(domain.ErrSessionConflict, "Session already active elsewhere", "").WriteJSON(w, http.StatusConflict)
 		return
 	}
 
-	sessionKey := rediskeys.SessionKey(authCtx.CompanyID, authCtx.AgentID, authCtx.UserID)
-	h.logger.Info(r.Context(), "Session lock acquired", "session_key", sessionKey)
-
-	// Create session data
 	sessionData := &sessionData{
-		CompanyID:  authCtx.CompanyID,
-		AgentID:    authCtx.AgentID,
+		CompanyID:  companyID,
+		AgentID:    agentID,
 		UserID:     authCtx.UserID,
-		SessionKey: sessionKey,
+		SessionKey: rediskeys.SessionKey(companyID, agentID, authCtx.UserID),
 	}
 
-	// Store data in melody session Keys
 	keys := map[string]interface{}{
 		"session_data": sessionData,
-		"request_id":   r.Context().Value(contextkeys.RequestIDKey),
+		"request_id":   ctx.Value(contextkeys.RequestIDKey),
 	}
 
 	metrics.IncrementConnectionsTotal()
 
-	// Handle the WebSocket upgrade
-	if err := h.melody.HandleRequestWithKeys(w, r, keys); err != nil {
-		h.logger.Error(r.Context(), "Failed to handle WebSocket upgrade", "error", err.Error())
-		// Release lock on failure
+	if err := h.melody.HandleRequestWithKeys(w, r.WithContext(ctx), keys); err != nil {
+		h.logger.Error(ctx, "Failed to handle WebSocket upgrade", "error", err.Error())
 		if h.connManager != nil && h.connManager.SessionLocker() != nil {
 			podID := h.configProvider.Get().Server.PodID
-			h.connManager.SessionLocker().ReleaseLock(context.Background(), sessionKey, podID)
+			h.connManager.SessionLocker().ReleaseLock(context.Background(), sessionData.SessionKey, podID)
 		}
 	}
 }
 
 // Helper methods
-
 func (h *MelodyHandler) getSessionData(s *melody.Session) *sessionData {
 	if val, exists := s.Keys["session_data"]; exists {
 		if data, ok := val.(*sessionData); ok {

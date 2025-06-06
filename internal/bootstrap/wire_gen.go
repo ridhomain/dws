@@ -69,7 +69,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
 	conn := NatsConnectionProvider(natsConsumer)
-	melodyHandler := MelodyHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, client, messageForwarder)
+	melodyHandler := MelodyHandlerProvider(domainLogger, provider, connectionManager, natsConsumer, client, messageForwarder, authService)
 	app, cleanup4, err := NewApp(provider, domainLogger, serveMux, server, grpcServer, companyUserTokenGenerateHandler, adminUserTokenGenerateHandler, adminAPIKeyMiddleware, clientAPIKeyMiddleware, router, connectionManager, natsConsumer, adminAuthMiddleware, adminHandler, conn, client, melodyHandler)
 	if err != nil {
 		cleanup3()
