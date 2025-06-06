@@ -517,6 +517,11 @@ func (h *MelodyHandler) handleNatsMessage(s *melody.Session, data *sessionData, 
 		data.mu.Unlock()
 
 		if currentChatID != chatID {
+			h.logger.Info(ctx, "Skipping NATS message: user has not selected this chat",
+				"currentChatID", currentChatID,
+				"incomingChatID", chatID,
+				"subject", msg.Subject)
+
 			// User hasn't selected this chat, skip
 			return
 		}
