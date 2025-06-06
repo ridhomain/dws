@@ -239,11 +239,20 @@ func WebsocketHandlerProvider(
 	logger domain.Logger,
 	cfgProvider config.Provider,
 	connManager *application.ConnectionManager,
-	// Remove natsAdapter parameter - no longer needed
 	routeRegistry domain.RouteRegistry,
 	messageForwarder domain.MessageForwarder,
+	redisClient *redis.Client,
 ) *wsadapter.Handler {
-	return wsadapter.NewHandler(logger, cfgProvider, connManager, nil, routeRegistry, messageForwarder)
+	// All 7 parameters in correct order:
+	return wsadapter.NewHandler(
+		logger,
+		cfgProvider,
+		connManager,
+		nil,
+		routeRegistry,
+		messageForwarder,
+		redisClient,
+	)
 }
 
 // WebsocketRouterProvider provides the websocket router.

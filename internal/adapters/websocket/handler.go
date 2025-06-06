@@ -19,9 +19,10 @@ import (
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/rediskeys"
 	"gitlab.com/timkado/api/daisi-ws-service/pkg/safego"
 
-	"github.com/coder/websocket"
-
 	"runtime/debug"
+
+	"github.com/coder/websocket"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/google/uuid"
 )
@@ -34,10 +35,11 @@ type Handler struct {
 	natsAdapter      domain.NatsConsumer
 	routeRegistry    domain.RouteRegistry
 	messageForwarder domain.MessageForwarder
+	redisClient      *redis.Client
 }
 
 // NewHandler creates a new WebSocket handler.
-func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder) *Handler {
+func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *application.ConnectionManager, natsAdapter domain.NatsConsumer, routeRegistry domain.RouteRegistry, messageForwarder domain.MessageForwarder, redisClient *redis.Client) *Handler {
 	return &Handler{
 		logger:           logger,
 		configProvider:   cfgProvider,
@@ -45,6 +47,7 @@ func NewHandler(logger domain.Logger, cfgProvider config.Provider, connManager *
 		natsAdapter:      natsAdapter,
 		routeRegistry:    routeRegistry,
 		messageForwarder: messageForwarder,
+		redisClient:      redisClient,
 	}
 }
 
@@ -307,6 +310,38 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	metrics.IncrementMessagesSent(domain.MessageTypeReady)
 	h.logger.Info(connCtx, "Sent 'ready' message to client")
 
+	if h.redisClient != nil {
+		sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+		chatSelectionKey := fmt.Sprintf("%s:selected_chat", sessionKey)
+
+		if savedChatID, err := h.redisClient.Get(connCtx, chatSelectionKey).Result(); err == nil && savedChatID != "" {
+			conn.SetCurrentChatID(savedChatID)
+			h.logger.Info(connCtx, "Restored previous chat selection from Redis",
+				"chat_id", savedChatID,
+				"user_id", userID)
+
+			// Also register the message route for this chat
+			if h.routeRegistry != nil {
+				podID := h.configProvider.Get().Server.PodID
+				routeTTL := time.Duration(h.configProvider.Get().App.RouteTTLSeconds) * time.Second
+
+				if err := h.routeRegistry.RegisterMessageRoute(connCtx, companyID, agentID, savedChatID, podID, routeTTL); err != nil {
+					h.logger.Error(connCtx, "Failed to register message route for restored chat",
+						"error", err.Error(),
+						"chat_id", savedChatID)
+				} else {
+					h.logger.Debug(connCtx, "Registered message route for restored chat",
+						"chat_id", savedChatID,
+						"route_ttl", routeTTL)
+				}
+			}
+		} else if err != redis.Nil {
+			h.logger.Debug(connCtx, "No previous chat selection found",
+				"error", err,
+				"key", chatSelectionKey)
+		}
+	}
+
 	// NO MORE NATS SUBSCRIPTIONS HERE!
 	// The global consumer handles all NATS messages
 
@@ -486,6 +521,26 @@ func (h *Handler) handleSelectChatMessage(
 	// Update the connection's current chat ID
 	conn.SetCurrentChatID(chatID)
 	h.logger.Info(connCtx, "Updated current chat ID for connection", "newChatID", chatID, "oldChatID", oldChatID)
+
+	if h.redisClient != nil {
+		sessionKey := rediskeys.SessionKey(companyID, agentID, userID)
+		chatSelectionKey := fmt.Sprintf("%s:selected_chat", sessionKey)
+
+		// Use same TTL as session
+		sessionTTL := time.Duration(h.configProvider.Get().App.SessionTTLSeconds) * time.Second
+
+		if err := h.redisClient.Set(connCtx, chatSelectionKey, chatID, sessionTTL).Err(); err != nil {
+			h.logger.Error(connCtx, "Failed to persist chat selection in Redis",
+				"key", chatSelectionKey,
+				"chat_id", chatID,
+				"error", err.Error())
+		} else {
+			h.logger.Debug(connCtx, "Persisted chat selection to Redis",
+				"key", chatSelectionKey,
+				"chat_id", chatID,
+				"ttl", sessionTTL)
+		}
+	}
 
 	// NO MORE NATS SUBSCRIPTION CHANGES!
 	// The global consumer will filter messages based on GetCurrentChatID()

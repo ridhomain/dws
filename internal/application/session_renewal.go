@@ -174,6 +174,19 @@ func (cm *ConnectionManager) StartResourceRenewalLoop(appCtx context.Context) {
 						cm.logger.Debug(connCtx, "Skipping session lock renewal (not configured, TTL is zero, or adaptive TTL resulted in zero)", "sessionKey", sessionKey)
 					}
 
+					chatSelectionKey := fmt.Sprintf("%s:selected_chat", sessionKey)
+					if exists, err := cm.redisClient.Exists(renewalOpCtx, chatSelectionKey).Result(); err == nil && exists > 0 {
+						if err := cm.redisClient.Expire(renewalOpCtx, chatSelectionKey, actualSessionTTL).Err(); err != nil {
+							cm.logger.Error(connCtx, "Failed to refresh chat selection TTL",
+								"key", chatSelectionKey,
+								"error", err.Error())
+						} else {
+							cm.logger.Debug(connCtx, "Refreshed chat selection TTL",
+								"key", chatSelectionKey,
+								"ttl", actualSessionTTL)
+						}
+					}
+
 					// --- Route Renewal ---
 					if cm.routeRegistry != nil && defaultRouteTTL > 0 {
 						companyID, _ := connCtx.Value(contextkeys.CompanyIDKey).(string)

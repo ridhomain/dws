@@ -64,7 +64,7 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	adminTokenCacheStore := AdminTokenCacheStoreProvider(client, domainLogger)
 	authService := AuthServiceProvider(domainLogger, provider, tokenCacheStore, adminTokenCacheStore)
 	messageForwarder := MessageForwarderProvider(ctx, domainLogger, provider)
-	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, routeRegistry, messageForwarder)
+	handler := WebsocketHandlerProvider(domainLogger, provider, connectionManager, routeRegistry, messageForwarder, client)
 	router := WebsocketRouterProvider(domainLogger, provider, authService, handler)
 	adminAuthMiddleware := AdminAuthMiddlewareProvider(authService, domainLogger)
 	adminHandler := AdminWebsocketHandlerProvider(domainLogger, provider, connectionManager, natsConsumer)
