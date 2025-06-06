@@ -173,6 +173,7 @@ func (h *MelodyHandler) setupMelodyHandlers() {
 			if err := data.NatsSub.Drain(); err != nil {
 				h.logger.Error(ctx, "Error draining NATS subscription", "error", err.Error())
 			}
+			data.NatsSub = nil
 		}
 
 		// Deregister from connection manager
