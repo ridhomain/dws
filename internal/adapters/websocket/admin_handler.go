@@ -101,12 +101,17 @@ func (h *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var wrappedConn *Connection
 	startTime := time.Now() // For connection duration metric
 
+	// Create a pointer to the pointer for the callback closure
+	var wrappedConnPtr **Connection = &wrappedConn
+
 	opts := websocket.AcceptOptions{
 		Subprotocols: []string{"json.v1"},
 		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
-			if wrappedConn != nil {
-				h.logger.Debug(wrappedConn.Context(), "Admin Pong received")
-				wrappedConn.UpdateLastPongTime()
+			if *wrappedConnPtr != nil {
+				h.logger.Debug((*wrappedConnPtr).Context(), "Admin Pong received")
+				(*wrappedConnPtr).UpdateLastPongTime()
+			} else {
+				h.logger.Warn(ctx, "Admin Pong received but wrappedConn not yet initialized")
 			}
 		},
 	}

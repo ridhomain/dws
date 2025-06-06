@@ -164,13 +164,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	appSpecificConfig := h.configProvider.Get().App
 
+	var wrappedConnPtr **Connection = &wrappedConn
+
 	opts := websocket.AcceptOptions{
 		Subprotocols:       []string{"json.v1"},
 		InsecureSkipVerify: appSpecificConfig.WebsocketDevelopmentInsecureSkipVerify,
 		OnPongReceived: func(ctx context.Context, pongPayload []byte) {
-			if wrappedConn != nil {
-				h.logger.Debug(wrappedConn.Context(), "Pong received via AcceptOptions callback")
-				wrappedConn.UpdateLastPongTime()
+			if *wrappedConnPtr != nil {
+				h.logger.Debug((*wrappedConnPtr).Context(), "Pong received via AcceptOptions callback")
+				(*wrappedConnPtr).UpdateLastPongTime()
+			} else {
+				h.logger.Warn(ctx, "Pong received but wrappedConn not yet initialized")
 			}
 		},
 	}
