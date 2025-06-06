@@ -355,7 +355,6 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 	}
 
 	if pingInterval > 0 {
-		// Pinger goroutine (unchanged)
 		safego.Execute(connCtx, h.logger, fmt.Sprintf("WebSocketPinger-%s", conn.RemoteAddr()), func() {
 			ticker := time.NewTicker(pingInterval)
 			defer ticker.Stop()
@@ -366,22 +365,39 @@ func (h *Handler) manageConnection(connCtx context.Context, conn *Connection, co
 					h.logger.Info(connCtx, "Connection context done in pinger, stopping pinger goroutine")
 					return
 				case <-ticker.C:
-					writeCtx, writeCancel := context.WithTimeout(connCtx, writeTimeout)
-					wsConn := conn.UnderlyingConn()
-					err := wsConn.Ping(writeCtx)
-					writeCancel()
-					if err != nil {
-						h.logger.Error(connCtx, "Failed to send PING frame", "error", err.Error())
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
-						conn.CloseWithError(errResp, "Ping write failure")
+					// Check if writer is still running before attempting ping
+					if !conn.IsWriterRunning() {
+						h.logger.Warn(connCtx, "Writer not running, stopping pinger", "remoteAddr", conn.RemoteAddr())
 						return
 					}
+
+					writeCtx, writeCancel := context.WithTimeout(connCtx, writeTimeout)
+					err := conn.Ping(writeCtx)
+					writeCancel()
+
+					if err != nil {
+						h.logger.Error(connCtx, "Failed to send PING frame", "error", err.Error())
+						// Don't try to send error message if writer is not running
+						if conn.IsWriterRunning() {
+							errResp := domain.NewErrorResponse(domain.ErrInternal, "Failed to send ping", err.Error())
+							conn.CloseWithError(errResp, "Ping write failure")
+						} else {
+							// Just close the connection directly
+							conn.Close(websocket.StatusInternalError, "Ping failure")
+						}
+						return
+					}
+
 					h.logger.Debug(connCtx, "Sent ping frame")
 
 					if time.Since(conn.LastPongTime()) > pongWaitDuration {
 						h.logger.Warn(connCtx, "Pong timeout. Closing connection.", "remoteAddr", conn.RemoteAddr())
-						errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received")
-						conn.CloseWithError(errResp, "Pong timeout")
+						if conn.IsWriterRunning() {
+							errResp := domain.NewErrorResponse(domain.ErrInternal, "Pong timeout", "No pong responses received")
+							conn.CloseWithError(errResp, "Pong timeout")
+						} else {
+							conn.Close(websocket.StatusGoingAway, "Pong timeout")
+						}
 						return
 					}
 				}
