@@ -42,6 +42,7 @@ auth:
 app:
   service_name: "daisi-ws-service"
   version: "1.0.0"
+  use_melody_websocket: true
   
   # WebSocket Health Checks
   ping_interval_seconds: 30      # Every 30s (was 20s)

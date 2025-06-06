@@ -91,6 +91,7 @@ type App struct {
 	adminWsHandler            *wsadapter.AdminHandler // Handler for /ws/admin
 	natsConn                  *nats.Conn              // Added for readiness check
 	redisClient               *redis.Client           // Added for readiness check
+	melodyHandler             *wsadapter.MelodyHandler
 	// natsCleanup            func() // Temporarily commented out
 }
 
@@ -113,6 +114,7 @@ func NewApp(
 	adminHandler *wsadapter.AdminHandler, // Added AdminHandler
 	natsConn *nats.Conn, // Added for readiness check
 	redisClient *redis.Client, // Added for readiness check
+	melodyHandler *wsadapter.MelodyHandler,
 ) (*App, func(), error) { // Assuming a top-level cleanup for App
 	app := &App{
 		configProvider:            cfgProvider,
@@ -131,6 +133,7 @@ func NewApp(
 		adminWsHandler:            adminHandler,
 		natsConn:                  natsConn,    // Initialize
 		redisClient:               redisClient, // Initialize
+		melodyHandler:             melodyHandler,
 	}
 
 	// Consolidated cleanup function for the App
@@ -152,6 +155,24 @@ func NewApp(
 		}
 	}
 	return app, cleanup, nil
+}
+
+func MelodyHandlerProvider(
+	logger domain.Logger,
+	cfgProvider config.Provider,
+	connManager *application.ConnectionManager,
+	natsAdapter domain.NatsConsumer,
+	redisClient *redis.Client,
+	messageForwarder domain.MessageForwarder,
+) *wsadapter.MelodyHandler {
+	return wsadapter.NewMelodyHandler(
+		logger,
+		cfgProvider,
+		connManager,
+		natsAdapter,
+		redisClient,
+		messageForwarder,
+	)
 }
 
 // ConfigProvider provides the application configuration.
@@ -414,4 +435,7 @@ var ProviderSet = wire.NewSet(
 	GlobalConsumerProvider,
 	NatsConsumerAdapterProvider,
 	NatsConnectionProvider, // Added NatsConnectionProvider
+
+	// New Melody
+	MelodyHandlerProvider,
 )

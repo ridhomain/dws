@@ -67,6 +67,7 @@ type AuthConfig struct {
 type AppConfig struct {
 	ServiceName                              string `mapstructure:"service_name"`
 	Version                                  string `mapstructure:"version"`
+	UseMelodyWebsocket                       bool   `mapstructure:"use_melody_websocket"`
 	PingIntervalSeconds                      int    `mapstructure:"ping_interval_seconds"`
 	ShutdownTimeoutSeconds                   int    `mapstructure:"shutdown_timeout_seconds"`
 	PongWaitSeconds                          int    `mapstructure:"pong_wait_seconds"`
