@@ -63,8 +63,9 @@ func NewGlobalConsumerHandler(
 // NewLocalConnectionRegistry creates a new connection registry
 func NewLocalConnectionRegistry() *LocalConnectionRegistry {
 	return &LocalConnectionRegistry{
-		connections:    make(map[string]map[string]map[string]domain.ManagedConnection),
-		sessionMapping: make(map[string]connectionInfo),
+		connections:      make(map[string]map[string]map[string]domain.ManagedConnection),
+		sessionMapping:   make(map[string]connectionInfo),
+		adminConnections: make(map[string]adminConnection),
 	}
 }
 
@@ -222,8 +223,27 @@ func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 			continue
 		}
 
-		// TODO: Add assigned_to filtering here for non-admin users
-		// This will be implemented based on the token's admin status
+		h.logger.Debug(ctx, "About to send message to WebSocket",
+			"session_key", sessionKey,
+			"event_type", eventPayload.EventType,
+			"event_id", eventPayload.EventID,
+			"company_id", eventPayload.CompanyID,
+			"agent_id", eventPayload.AgentID,
+			"payload_size", len(msg.Data),
+			"row_data_type", fmt.Sprintf("%T", eventPayload.RowData))
+
+		// Check if RowData is properly converted
+		if rowData, ok := eventPayload.RowData.(map[string]interface{}); ok {
+			h.logger.Debug(ctx, "RowData structure",
+				"fields", len(rowData),
+				"keys", func() []string {
+					keys := make([]string, 0, len(rowData))
+					for k := range rowData {
+						keys = append(keys, k)
+					}
+					return keys
+				}())
+		}
 
 		wsMessage := domain.NewEventMessage(eventPayload)
 		if err := conn.WriteJSON(wsMessage); err != nil {
@@ -317,6 +337,13 @@ func (h *GlobalConsumerHandler) RegisterConnection(sessionKey, companyID, agentI
 func (h *GlobalConsumerHandler) DeregisterConnection(sessionKey string) {
 	h.connRegistry.mu.Lock()
 	defer h.connRegistry.mu.Unlock()
+
+	if _, isAdmin := h.connRegistry.adminConnections[sessionKey]; isAdmin {
+		delete(h.connRegistry.adminConnections, sessionKey)
+		h.logger.Info(context.Background(), "Admin connection deregistered from global consumer",
+			"session_key", sessionKey)
+		return
+	}
 
 	// Get connection info
 	info, exists := h.connRegistry.sessionMapping[sessionKey]
