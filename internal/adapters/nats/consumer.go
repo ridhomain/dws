@@ -265,7 +265,7 @@ func (a *ConsumerAdapter) SubscribeToChatMessages(ctx context.Context, companyID
 func ParseNATSMessageSubject(subject string) (companyID, agentID, chatID string, err error) {
 	parts := strings.Split(subject, ".")
 	// Expected: "wa", "<companyID>", "<agentID>", "messages", "<chatID>"
-	if len(parts) != 5 || parts[0] != "wa" || parts[3] != "messages" {
+	if len(parts) != 5 || parts[0] != "websocket" || parts[3] != "messages" {
 		err = fmt.Errorf("invalid NATS message subject format: %s", subject)
 		return
 	}

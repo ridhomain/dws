@@ -30,8 +30,15 @@ type LocalConnectionRegistry struct {
 	// company -> agent -> sessionKey -> connection
 	connections map[string]map[string]map[string]domain.ManagedConnection
 	// sessionKey -> company/agent mapping for quick lookup during deregistration
-	sessionMapping map[string]connectionInfo
-	mu             sync.RWMutex
+	sessionMapping   map[string]connectionInfo
+	adminConnections map[string]adminConnection
+	mu               sync.RWMutex
+}
+
+type adminConnection struct {
+	conn                domain.ManagedConnection
+	subscribedCompanyID string // "*" or specific company
+	subscribedAgentID   string // "*" or specific agent
 }
 
 type connectionInfo struct {
@@ -151,6 +158,14 @@ func (h *GlobalConsumerHandler) handleMessage(msg *nats.Msg) {
 	// Get relevant connections for this company/agent
 	connections := h.connRegistry.GetConnections(companyID, agentID)
 
+	if eventType == "agents" {
+		adminConns := h.getAdminConnectionsForAgentEvent(companyID, agentID)
+		// Merge admin connections into the broadcast list
+		for sessionKey, conn := range adminConns {
+			connections[sessionKey] = conn
+		}
+	}
+
 	if len(connections) == 0 {
 		// No local connections for this company/agent, ACK and skip
 		h.logger.Debug(ctx, "No local connections for company/agent, skipping",
@@ -252,6 +267,27 @@ func (h *GlobalConsumerHandler) RegisterConnection(sessionKey, companyID, agentI
 	h.connRegistry.mu.Lock()
 	defer h.connRegistry.mu.Unlock()
 
+	// Check if this is an admin connection (empty company/agent IDs)
+	if companyID == "" && agentID == "" {
+		// This is an admin connection
+		// For now, we'll store it in a special "admin" company/agent
+		if h.connRegistry.connections["_admin"] == nil {
+			h.connRegistry.connections["_admin"] = make(map[string]map[string]domain.ManagedConnection)
+		}
+		if h.connRegistry.connections["_admin"]["_admin"] == nil {
+			h.connRegistry.connections["_admin"]["_admin"] = make(map[string]domain.ManagedConnection)
+		}
+
+		h.connRegistry.connections["_admin"]["_admin"][sessionKey] = conn
+
+		// Note: We'll need to parse the sessionKey to get admin info for filtering
+		// sessionKey format: "session:admin:{adminID}"
+
+		h.logger.Info(context.Background(), "Admin connection registered in global consumer",
+			"session_key", sessionKey)
+		return
+	}
+
 	// Ensure company map exists
 	if h.connRegistry.connections[companyID] == nil {
 		h.connRegistry.connections[companyID] = make(map[string]map[string]domain.ManagedConnection)
@@ -327,6 +363,25 @@ func (r *LocalConnectionRegistry) GetConnections(companyID, agentID string) map[
 			for k, v := range agentConns {
 				result[k] = v
 			}
+		}
+	}
+
+	return result
+}
+
+func (h *GlobalConsumerHandler) getAdminConnectionsForAgentEvent(companyID, agentID string) map[string]domain.ManagedConnection {
+	h.connRegistry.mu.RLock()
+	defer h.connRegistry.mu.RUnlock()
+
+	result := make(map[string]domain.ManagedConnection)
+
+	for sessionKey, adminConn := range h.connRegistry.adminConnections {
+		// Check if admin subscription pattern matches
+		companyMatch := adminConn.subscribedCompanyID == "*" || adminConn.subscribedCompanyID == companyID
+		agentMatch := adminConn.subscribedAgentID == "*" || adminConn.subscribedAgentID == agentID
+
+		if companyMatch && agentMatch {
+			result[sessionKey] = adminConn.conn
 		}
 	}
 
